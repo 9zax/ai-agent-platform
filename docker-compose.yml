@@ -10,8 +10,10 @@ services:
       - agent-data:/data
     environment:
       - DATABASE_URL=sqlite:///./data/platform.db
-      - ZAI_API_KEY=${ZAI_API_KEY:-}
-      - ZAI_BASE_URL=${ZAI_BASE_URL:-https://api.z.ai/api/anthropic}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_BASE_URL=${AI_BASE_URL:-}
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
     restart: unless-stopped
     networks:
       - agent-net

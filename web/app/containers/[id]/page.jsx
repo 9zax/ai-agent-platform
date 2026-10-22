@@ -57,7 +57,7 @@ export default function ContainerDetail() {
 
   useEffect(() => {
     authFetch(`${API}/agent/status`).then(r => r.json()).then(s => setAgentModel(s.model || '')).catch(() => {})
-    authFetch(`${API}/config`).then(r => r.json()).then(c => setAdminGate(!!c.admin_password_set)).catch(() => {})
+    authFetch(`${API}/config`).then(r => r.json()).then(c => setAuthRequired(!!c.auth_required)).catch(() => {})
   }, [])
 
   // Live stats polling (every 5s) — only meaningful while running

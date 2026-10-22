@@ -49,8 +49,13 @@ StartupNotify=true
 EOF
 chmod +x /root/Desktop/*.desktop
 
-vncserver :1 -geometry 1280x800 -depth 24 -localhost
+# Access is gated by the platform's web login — run Xvnc directly with NO -rfbauth
+# (the vncserver wrapper insists on a password; Xvnc itself starts authless without it)
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
+Xvnc :1 -geometry 1280x800 -depth 24 -localhost -rfbport 5901 &
+sleep 2
+DISPLAY=:1 startxfce4 &
 websockify --web=/usr/share/novnc 6080 localhost:5901 &
 
-echo "noVNC ready at http://localhost:6080 (password: $VNC_PASSWORD)"
+echo "noVNC ready at http://localhost:6080 (gated by platform login)"
 tail -f /dev/null

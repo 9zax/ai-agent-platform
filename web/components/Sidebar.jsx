@@ -56,8 +56,8 @@ export default function Sidebar() {
           <Bot className="h-4 w-4" />
         </div>
         <div>
-          <div className="text-[15px] font-bold tracking-tight">AI Orchestrator</div>
-          <div className="text-[10.5px] text-muted-foreground/70">Control. Scale. Automate.</div>
+          <div className="text-[15px] font-bold tracking-tight">AI Agent Platform</div>
+          <div className="text-[10.5px] text-muted-foreground/70">ทุก AI agent ทำงานด้วยกัน</div>
         </div>
       </div>
 

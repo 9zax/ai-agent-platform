@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -10,16 +11,17 @@ use axum::{Json, Router};
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions,
 };
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::query_parameters::{
     InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     RestartContainerOptions, StartContainerOptions, StatsOptionsBuilder, StopContainerOptions,
 };
 use bollard::Docker;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 const SERVICE_NAME: &str = "AI Agent Platform Orchestrator";
 const MANAGED_LABEL: &str = "managed-by";
@@ -196,16 +198,50 @@ impl Default for AiConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Team runs — dispatch one task through the whole project team
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+struct RunStep {
+    role: String,
+    name: String,
+    title: String,
+    /// pending | working | done | error
+    status: String,
+    output: String,
+    /// container the deliverable was written into (real work), if the agent has one running
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<String>,
+    /// workspace file path inside the container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deliverable: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct Run {
+    id: String,
+    project_id: String,
+    project_name: String,
+    task: String,
+    /// running | done | error
+    status: String,
+    steps: Vec<RunStep>,
+    created_at: u64,
+}
+
 struct Store {
     personas: Vec<Persona>,
     tasks: Vec<Task>,
     skills: Vec<Skill>,
     projects: Vec<Project>,
+    runs: Vec<Run>,
     config: AiConfig,
     /// login sessions: token → username (web UI auth, ADMIN_USER/ADMIN_PASSWORD from env)
     sessions: HashMap<String, String>,
     task_counter: usize,
     project_counter: usize,
+    run_counter: usize,
 }
 
 impl Default for Store {
@@ -222,10 +258,12 @@ impl Default for Store {
                 Skill { id: "image-analysis".into(), name: "Image Analysis".into(), description: "Inspect and describe images".into(), enabled: false },
             ],
             projects: Vec::new(),
+            runs: Vec::new(),
             config: AiConfig::default(),
             sessions: HashMap::new(),
             task_counter: 0,
             project_counter: 0,
+            run_counter: 0,
         }
     }
 }
@@ -387,6 +425,24 @@ impl App {
         c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_else(|| "unknown".into())
     }
 
+    /// Find this platform's running container for a persona role → (id, name)
+    async fn agent_container(&self, role: &str) -> Option<(String, String)> {
+        let docker = self.docker.as_ref()?;
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![
+            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
+            format!("role={role}"),
+        ]);
+        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
+        let list = docker.list_containers(Some(opts)).await.ok()?;
+        list.into_iter()
+            .find(|c| c.state.as_ref().map(|s| s.to_string() == "running").unwrap_or(false))
+            .map(|c| (
+                c.id.clone().unwrap_or_default(),
+                c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
+            ))
+    }
+
     async fn exec_in(&self, container_id: &str, command: &str) -> Result<(i64, String), ApiError> {
         let exec = self.docker()?
             .create_exec(container_id, CreateExecOptions::<&str> {
@@ -424,15 +480,20 @@ impl App {
     }
 
     fn ai_credentials(&self) -> (String, String, &'static ProviderTemplate) {
-        let env_key = std::env::var("ZAI_API_KEY").unwrap_or_default();
+        let env_key = std::env::var("AI_API_KEY").unwrap_or_default();
         let cfg = self.store.lock().unwrap().config.clone();
         let template = provider_template(&cfg.ai_provider).unwrap_or(&PROVIDERS[0]);
         let key = if cfg.ai_api_key.is_empty() { env_key } else { cfg.ai_api_key };
-        let base = if cfg.ai_base_url.is_empty() { template.base_url.to_string() } else { cfg.ai_base_url.clone() };
+        let env_base = std::env::var("AI_BASE_URL").unwrap_or_default();
+        let base = if !cfg.ai_base_url.is_empty() { cfg.ai_base_url.clone() } else if !env_base.is_empty() { env_base } else { template.base_url.to_string() };
         (key, base, template)
     }
 
     async fn llm(&self, system: &str, user_text: &str) -> Result<String, ApiError> {
+        self.llm_max(system, user_text, 400).await
+    }
+
+    async fn llm_max(&self, system: &str, user_text: &str, max_tokens: u32) -> Result<String, ApiError> {
         let (api_key, base, template) = self.ai_credentials();
         if api_key.is_empty() && !template.local {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "No API key configured — set one in AI Config"));
@@ -450,7 +511,7 @@ impl App {
                 .bearer_auth(&api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
-                    "model": model, "max_tokens": 400, "system": system,
+                    "model": model, "max_tokens": max_tokens, "system": system,
                     "messages": [{ "role": "user", "content": user_text }],
                 }))
                 .send().await
@@ -459,7 +520,7 @@ impl App {
             client.post(url)
                 .bearer_auth(&api_key)
                 .json(&json!({
-                    "model": model, "max_tokens": 400,
+                    "model": model, "max_tokens": max_tokens,
                     "messages": [
                         { "role": "system", "content": system },
                         { "role": "user", "content": user_text },
@@ -645,6 +706,137 @@ async fn exec_command(State(app): State<App>, headers: axum::http::HeaderMap, Pa
     }
     let (exit_code, output) = app.exec_in(managed.id.as_deref().unwrap_or_default(), &req.command).await?;
     Ok(json_ok(json!({ "exit_code": exit_code, "output": output })))
+}
+
+// ---------------------------------------------------------------------------
+// Interactive terminal — WebSocket ↔ Docker exec TTY bridge
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TerminalParams {
+    token: Option<String>, // sessions can't travel in headers on a WS handshake
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+async fn terminal_ws(
+    State(app): State<App>,
+    ws: WebSocketUpgrade,
+    Path(ident): Path<String>,
+    Query(params): Query<TerminalParams>,
+) -> Response {
+    if auth_enabled() {
+        let token = params.token.clone().unwrap_or_default();
+        let valid = app.store.lock().unwrap().sessions.contains_key(&token);
+        if !valid {
+            return (StatusCode::UNAUTHORIZED, "Login required").into_response();
+        }
+    }
+    let managed = match app.inspect_managed(&ident).await {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let status = App::status_of(&managed);
+    if status != "running" {
+        return (StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")).into_response();
+    }
+    let container_id = managed.id.unwrap_or_default();
+    let initial = (params.cols.unwrap_or(80), params.rows.unwrap_or(24));
+    ws.on_upgrade(move |socket| terminal_session(app, socket, container_id, initial))
+}
+
+/// Pick the best interactive shell available inside the container.
+async fn pick_shell(app: &App, container_id: &str) -> &'static str {
+    if let Ok((_, out)) = app.exec_in(container_id, "command -v bash").await {
+        if out.trim().contains("bash") {
+            return "/bin/bash";
+        }
+    }
+    "/bin/sh"
+}
+
+/// Bridge a browser terminal to a real PTY-backed shell via `docker exec`.
+/// Binary frames carry terminal bytes both ways; text frames are control
+/// messages (`{"resize":{"cols":n,"rows":r}}`).
+async fn terminal_session(app: App, socket: WebSocket, container_id: String, (cols, rows): (u16, u16)) {
+    let mut socket = socket;
+    let docker = match app.docker() {
+        Ok(d) => d.clone(),
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("docker unavailable: {e}\r\n").into())).await;
+            return;
+        }
+    };
+
+    let shell = pick_shell(&app, &container_id).await;
+    let exec = match docker.create_exec(&container_id, CreateExecOptions::<&str> {
+        cmd: Some(vec![shell, "-l"]),
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(true),
+        env: Some(vec!["TERM=xterm-256color"]),
+        ..Default::default()
+    }).await {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("failed to start shell: {e}\r\n").into())).await;
+            return;
+        }
+    };
+
+    let (mut input, output) = match docker.start_exec(&exec.id, None).await {
+        Ok(StartExecResults::Attached { input, output }) => (input, output),
+        Ok(_) => {
+            let _ = socket.send(Message::Text("shell detached unexpectedly\r\n".into())).await;
+            return;
+        }
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("failed to attach shell: {e}\r\n").into())).await;
+            return;
+        }
+    };
+
+    // Match the PTY to the browser terminal size before the first prompt renders
+    let _ = docker.resize_exec(&exec.id, ResizeExecOptions { width: cols, height: rows }).await;
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let exec_id = exec.id.clone();
+
+    // Container → browser
+    let pump = tokio::spawn(async move {
+        let mut output = output;
+        while let Some(Ok(frame)) = output.next().await {
+            if ws_tx.send(Message::Binary(frame.into_bytes().into())).await.is_err() {
+                break;
+            }
+        }
+        // Shell exited — close the socket so the UI can offer reconnect
+        let _ = ws_tx.send(Message::Close(None)).await;
+    });
+
+    // Browser → container
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Binary(data) => {
+                if input.write_all(&data).await.is_err() {
+                    break;
+                }
+                let _ = input.flush().await;
+            }
+            Message::Text(txt) => {
+                if let Some(sz) = serde_json::from_str::<Value>(txt.as_str()).ok().and_then(|v| v.get("resize").cloned()) {
+                    let c = sz.get("cols").and_then(|x| x.as_u64()).unwrap_or(80) as u16;
+                    let r = sz.get("rows").and_then(|x| x.as_u64()).unwrap_or(24) as u16;
+                    let _ = docker.resize_exec(&exec_id, ResizeExecOptions { width: c, height: r }).await;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    pump.abort();
+    let _ = input.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,7 +1273,199 @@ async fn delete_project(State(app): State<App>, Path(id): Path<String>) -> ApiRe
     if store.projects.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
     }
+    store.runs.retain(|r| r.project_id != id);
     Ok(json_ok(json!({ "deleted": id })))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — team runs (dispatch one task through the project team)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RunRequest {
+    task: String,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Write a text deliverable into the agent's container workspace via a quoted heredoc.
+async fn write_deliverable(app: &App, container_id: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
+    let clean = output.replace('\r', "");
+    let path = format!("/workspace/{run_id}-{role}.md");
+    let script = format!(
+        "mkdir -p /workspace && cat > '{path}' << 'AAP_EOF_9Z'\n{clean}\nAAP_EOF_9Z\n",
+    );
+    let (exit_code, out) = app.exec_in(container_id, &script).await?;
+    if exit_code != 0 {
+        return Err(err(StatusCode::BAD_GATEWAY, format!("writing deliverable failed (exit {exit_code}): {out}")));
+    }
+    Ok(path)
+}
+
+/// Sequentially walk the team: each persona produces its piece of work, sees what
+/// earlier teammates produced, and (when it has a running container) writes its
+/// deliverable into that container as a real file.
+async fn execute_run(app: App, run_id: String) {
+    let (project_name, task, roles) = {
+        let store = app.store.lock().unwrap();
+        let run = match store.runs.iter().find(|r| r.id == run_id) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        (run.project_name, run.task, run.steps.iter().map(|s| (s.role.clone(), s.name.clone(), s.title.clone())).collect::<Vec<_>>())
+    };
+
+    for (role, name, title) in roles {
+        // step → working
+        {
+            let mut store = app.store.lock().unwrap();
+            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                step.status = "working".into();
+            }
+        }
+
+        let rules = {
+            let store = app.store.lock().unwrap();
+            store.personas.iter().find(|p| p.role == role).map(|p| p.rules_md.clone()).unwrap_or_default()
+        };
+
+        // Handoff context: what earlier teammates already produced
+        let mut handoff = String::new();
+        {
+            let store = app.store.lock().unwrap();
+            if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
+                for s in run.steps.iter().take_while(|s| s.role != role) {
+                    if s.status == "done" && !s.output.is_empty() {
+                        let brief: String = s.output.chars().take(1400).collect();
+                        handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
+                    }
+                }
+            }
+        }
+
+        let system = format!(
+            "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
+The user gave the team ONE task. Each teammate answers in turn, in their own specialty, and later teammates see earlier answers. \
+Do YOUR part only — do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
+Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies). \
+Answer in the same language the task is written in. Keep it under ~450 words.",
+        );
+        let user = if handoff.is_empty() {
+            format!("## Task from the user\n{task}\n\nYou are the first teammate to answer. Deliver your part.")
+        } else {
+            format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+        };
+
+        let result = app.llm_max(&system, &user, 1400).await;
+        match result {
+            Ok(output) if !output.is_empty() => {
+                // Real work: persist the deliverable into the agent's container when it has one
+                let (container, deliverable) = match app.agent_container(&role).await {
+                    Some((cid, cname)) => match write_deliverable(&app, &cid, &run_id, &role, &output).await {
+                        Ok(path) => (Some(cname), Some(path)),
+                        Err(_) => (Some(cname), None),
+                    },
+                    None => (None, None),
+                };
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                    step.status = "done".into();
+                    step.output = output;
+                    step.container = container;
+                    step.deliverable = deliverable;
+                }
+            }
+            Ok(_) => {
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                    step.status = "error".into();
+                    step.output = "Model returned an empty answer".into();
+                }
+            }
+            Err(e) => {
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                    step.status = "error".into();
+                    step.output = e.1;
+                }
+            }
+        }
+    }
+
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = if run.steps.iter().all(|s| s.status == "error") { "error".into() } else { "done".into() };
+    }
+}
+
+async fn run_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<RunRequest>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let task = req.task.trim().to_string();
+    if task.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "task is required"));
+    }
+    let (project_name, agents) = {
+        let store = app.store.lock().unwrap();
+        let p = store.projects.iter().find(|p| p.id == id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")))?;
+        (p.name.clone(), p.agents.clone())
+    };
+    if agents.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Project has no team — add agents on the flow first"));
+    }
+
+    let (run_id, run) = {
+        let mut store = app.store.lock().unwrap();
+        let personas = store.personas.clone();
+        let steps = agents.iter()
+            .filter_map(|role| personas.iter().find(|p| p.role == *role).map(|p| RunStep {
+                role: p.role.clone(), name: p.name.clone(), title: p.title.clone(),
+                status: "pending".into(), output: String::new(),
+                container: None, deliverable: None,
+            }))
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return Err(err(StatusCode::BAD_REQUEST, "None of the project's agents exist as personas"));
+        }
+        store.run_counter += 1;
+        let run = Run {
+            id: format!("run-{:03}", store.run_counter),
+            project_id: id.clone(),
+            project_name,
+            task: task.clone(),
+            status: "running".into(),
+            steps,
+            created_at: now_secs(),
+        };
+        let run_id = run.id.clone();
+        store.runs.push(run.clone());
+        (run_id, run)
+    };
+
+    // Heavy lifting happens in the background; the UI polls GET /runs/{id}
+    let bg_app = app.clone();
+    tokio::spawn(async move { execute_run(bg_app, run_id).await });
+
+    Ok(json_ok(serde_json::to_value(run).unwrap()))
+}
+
+async fn list_runs(State(app): State<App>) -> Json<Vec<Run>> {
+    let mut runs = app.store.lock().unwrap().runs.clone();
+    runs.reverse();
+    Json(runs)
+}
+
+async fn get_run(State(app): State<App>, Path(run_id): Path<String>) -> ApiResult {
+    let run = app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).cloned();
+    match run {
+        Some(r) => Ok(json_ok(serde_json::to_value(r).unwrap())),
+        None => Err(err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1570,7 @@ async fn main() {
         .route("/containers/{ident}", delete(delete_container))
         .route("/containers/{ident}/{action}", post(container_action))
         .route("/containers/{ident}/exec", post(exec_command))
+        .route("/containers/{ident}/terminal/ws", get(terminal_ws))
         .route("/containers/{ident}/agent", post(agent_command))
         .route("/containers/{ident}/stats", get(container_stats))
         .route("/containers/{ident}/inspect", get(container_inspect))
@@ -1197,6 +1582,9 @@ async fn main() {
         .route("/tasks/{task_id}", delete(delete_task))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).put(update_project).delete(delete_project))
+        .route("/projects/{id}/run", post(run_project))
+        .route("/runs", get(list_runs))
+        .route("/runs/{run_id}", get(get_run))
         .route("/config", get(get_config).put(update_config))
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/{skill_id}", put(update_skill).delete(delete_skill))

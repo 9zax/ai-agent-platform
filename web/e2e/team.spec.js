@@ -35,18 +35,16 @@ test.describe('AI Team', () => {
   test('start PO agent, consult the persona, then clean up', async ({ page }) => {
     test.setTimeout(150_000)
 
-    // Clean slate for the PO role
-    const existing = await page.evaluate(async url => {
-      const res = await fetch(`${url}/agents`)
-      return (await res.json()).find(a => a.role === 'po')?.container?.name
-    }, API)
-    if (existing) {
-      await page.evaluate(async ([url, name]) => {
-        await fetch(`${url}/containers/${name}`, { method: 'DELETE' })
-      }, [API, existing])
-    }
-
+    // Clean slate for the PO role (authenticated fetch — container APIs need the session token)
     await page.goto('/team')
+    await page.evaluate(async url => {
+      const token = localStorage.getItem('aap_token') || ''
+      const res = await fetch(`${url}/agents`)
+      const po = (await res.json()).find(a => a.role === 'po')?.container?.name
+      if (po) await fetch(`${url}/containers/${po}`, { method: 'DELETE', headers: { 'x-session-token': token } })
+    }, API)
+    await page.reload()
+
     await expect(page.getByTestId('agent-status-po')).toHaveText('Offline')
     await page.getByTestId('agent-start-po').click()
     await expect(page.getByTestId('agent-status-po')).toHaveText('Running', { timeout: 30000 })
@@ -63,7 +61,8 @@ test.describe('AI Team', () => {
 
     // Cleanup
     await page.evaluate(async url => {
-      await fetch(`${url}/containers/agent-po`, { method: 'DELETE' })
+      const token = localStorage.getItem('aap_token') || ''
+      await fetch(`${url}/containers/agent-po`, { method: 'DELETE', headers: { 'x-session-token': token } })
     }, API)
   })
 })

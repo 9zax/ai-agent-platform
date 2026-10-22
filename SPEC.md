@@ -41,11 +41,11 @@
 - [x] Repository: https://github.com/9zax/ai-agent-platform
 
 ### สิ่งที่ยังไม่ได้ทำ
-- [ ] ระบบ Task Queue + Assignment อัตโนมัติของ Orchestrator (ตอนนี้เป็น board แบบ manual)
 - [ ] Vision / Screenshot capability
 - [ ] GitHub OAuth + Permission approval flow
-- [ ] Persistent storage สำหรับ AI memory และ config (ตอนนี้ config/tasks เก็บในหน่วยความจำ)
-- [ ] ระบบ Roles ที่ชัดเจน (PO, Backend, Frontend, QA, DevOps)
+- [ ] Persistent storage สำหรับ AI memory และ config (ตอนนี้ config/tasks/runs เก็บในหน่วยความจำ)
+- [x] ~~ระบบ Task Queue + Assignment อัตโนมัติของ Orchestrator~~ → **Team Run engine** (2026-10-22): `POST /projects/{id}/run` สั่งงานเดียวผ่านทีมทั้งโปรเจกต์ — agent แต่ละตัวทำงานตามลำดับ เห็นงานของคนก่อน (handoff) และเขียน deliverable ลง container จริง (`/workspace/run-xxx-{role}.md`); UI หน้า project มี Mission Control + timeline สด (poll `GET /runs/{id}`)
+- [x] ~~ระบบ Roles ที่ชัดเจน~~ → personas 6 บทบาท (PO, Research, FE, BE, UX/UI, QA) แก้ได้จากหน้า AI Team
 
 ## 3. Architecture
 
@@ -145,8 +145,8 @@
 git clone https://github.com/9zax/ai-agent-platform.git
 cd ai-agent-platform
 
-# ZAI API key (อ่านจาก ~/.claude.json ของเครื่องที่ config ไว้)
-cp /dev/null .env   # แล้วใส่: ZAI_API_KEY=... ZAI_BASE_URL=https://api.z.ai/api/anthropic
+# API key ของ AI provider ที่จะใช้ (เว้นว่าง = ไปตั้งในหน้า AI Config บนเว็บ)
+cp /dev/null .env   # แล้วใส่: AI_API_KEY=... (ถ้าใช้ endpoint ที่ไม่ใช่ค่า default ของ provider ให้ใส่ AI_BASE_URL=... ด้วย)
 
 docker compose up --build -d
 
@@ -165,7 +165,7 @@ docker compose --profile example up -d agent-example
 ## 9. Notes for Future AI / Developers
 
 - Backend เป็น **Rust binary** (Axum + bollard) — compile ครั้งเดียวรันได้ทุกที่ที่มี Docker socket ไม่ต้องมี Python
-- การเก็บ API Key และ GitHub Token ต้องทำอย่างปลอดภัย (อย่าเก็บ plain text ใน container) — ZAI key ผ่าน `.env` (gitignored)
+- การเก็บ API Key และ GitHub Token ต้องทำอย่างปลอดภัย (อย่าเก็บ plain text ใน container) — API key ของ provider ผ่าน `.env` (gitignored)
 - เปลี่ยนโมเดล AI ได้จากหน้า **AI Config** (provider templates: Z.ai GLM / Anthropic / OpenAI / OpenRouter / Groq / DeepSeek / Ollama local / Custom)
 - Login: ตั้ง `ADMIN_USER`/`ADMIN_PASSWORD` ใน `.env` → เปิดระบบ login → container endpoints ทั้งหมด (exec/AI/lifecycle/VNC console) ต้อง login ก่อน; เว้น `ADMIN_PASSWORD` ว่าง = ปิด auth
 - Dashboard แสดงเฉพาะ container ของ platform (label `managed-by`) โดย default — กด "All containers" เพื่อดูทั้งเครื่อง
