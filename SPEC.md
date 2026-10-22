@@ -16,28 +16,36 @@
 - ผู้ใช้สั่งงานและอนุมัติ Permission ผ่าน Web ได้
 - เชื่อมต่อ GitHub ได้ (ผู้ใช้ Auth เอง, อนุมัติ Permission ครั้งเดียวต่อ Scope)
 
-## 2. Current Status (MVP Scaffold)
+## 2. Current Status
 
 ### สิ่งที่ทำเสร็จแล้ว
-- [x] โครงสร้างโปรเจกต์ + Docker Compose
-- [x] Orchestrator (FastAPI) พื้นฐาน
-  - `GET /containers` — ดูรายการ container
-  - `POST /containers` — สร้าง container ใหม่
-  - `GET/POST /tasks` — placeholder
-- [x] Agent Base Image (Ubuntu + XFCE + noVNC + Firefox + Terminal)
-- [x] Web Dashboard เริ่มต้น (Next.js)
+- [x] โครงสร้างโปรเจกต์ + Docker Compose (production build — ไม่มี dev mounts)
+- [x] Orchestrator (FastAPI)
+  - `GET /containers` — ดูรายการ container จริงจาก Docker API
+  - `POST /containers` — สร้าง container จริง
+  - `POST /containers/{id}/start|stop|restart` + `DELETE` — lifecycle จริง (guard เฉพาะ container ที่ platform สร้าง)
+  - `POST /containers/{id}/exec` — รัน shell ใน container
+  - `POST /containers/{id}/agent` — **ZAI GLM รับคำสั่งภาษาธรรมชาติ → เลือกคำสั่ง shell → รันจริง**
+  - `GET /containers/{id}/stats|inspect|files` — สถิติจริง / metadata / ไฟล์ใน container
+  - `GET/POST/DELETE /tasks` — task board จริง
+  - `GET/PUT /config`, `GET /skills`, `PUT /skills/{id}` — config + skills จริง
+- [x] Web Dashboard (Next.js + Tailwind + shadcn/ui) เชื่อม API จริงทุกหน้า
+  - Dashboard: ตาราง container สด, สร้าง container ผ่าน dialog, search/filter
+  - Container detail: noVNC console (connect จริง), metrics สดจาก docker stats, tabs Files/Analytics/Security/Networks ของจริง, Command Center (AI/Shell)
+  - Board: Kanban + เพิ่ม task จริง
+  - Skills / AI Config / Settings หน้าจริง ใช้งานได้
+- [x] Agent Base Image (Ubuntu + XFCE + noVNC + browser จริง + Terminal; Chrome บน amd64, Firefox ESR บน arm64)
+- [x] AI Integration: ZAI GLM (Anthropic-compatible endpoint) — model เปลี่ยนได้จากหน้า AI Config
+- [x] Safety guard: แก้ไขได้เฉพาะ container ที่ platform สร้างเท่านั้น (label `managed-by=ai-agent-platform`)
+- [x] E2E tests (Playwright) 30  tests ครอบทุก feature รวม full container lifecycle และ AI agent
 - [x] Repository: https://github.com/9zax/ai-agent-platform
 
 ### สิ่งที่ยังไม่ได้ทำ
-- [ ] เชื่อม Web frontend กับ Orchestrator API จริง
-- [ ] UI สำหรับสร้าง/จัดการ Container
-- [ ] ระบบ Task Queue + Assignment ของ Orchestrator
-- [ ] AI Agent logic ภายใน Container (เรียก ZAI GLM)
+- [ ] ระบบ Task Queue + Assignment อัตโนมัติของ Orchestrator (ตอนนี้เป็น board แบบ manual)
 - [ ] Vision / Screenshot capability
-- [ ] Skills management (เพิ่ม/ลดผ่านหน้าเว็บ)
 - [ ] GitHub OAuth + Permission approval flow
-- [ ] Persistent storage สำหรับ AI memory และ config
-- [ ] ระบบ Roles ที่ชัดเจน
+- [ ] Persistent storage สำหรับ AI memory และ config (ตอนนี้ config/tasks เก็บในหน่วยความจำ)
+- [ ] ระบบ Roles ที่ชัดเจน (PO, Backend, Frontend, QA, DevOps)
 
 ## 3. Architecture
 
@@ -69,15 +77,15 @@
 | หัวข้อ | รายละเอียด | สถานะ |
 |--------|------------|-------|
 | ผู้ใช้ | 1 คน | - |
-| จำนวน Container | 5–10 | - |
-| Runtime | Docker บน VPS | Scaffold done |
-| Desktop | เห็น Chrome + Terminal จริง (noVNC) | Base image done |
+| จำนวน Container | 5–10 | สร้างได้จาก UI แล้ว |
+| Runtime | Docker บน VPS | Production build ใช้งานได้ |
+| Desktop | เห็น browser + Terminal จริง (noVNC) | ✅ (Chrome amd64 / Firefox ESR arm64) |
 | Persistence | Mount volume | ยังไม่ implement |
-| AI Model | Config จากหน้าเว็บ, เก็บใน container ได้ | ยังไม่ทำ |
-| AI Mode | อิสระ หรือควบคุมจากกลางได้ | ยังไม่ทำ |
+| AI Model | Config จากหน้าเว็บ, เก็บใน container ได้ | ✅ config จากหน้า AI Config (ZAI GLM) |
+| AI Mode | อิสระ หรือควบคุมจากกลางได้ | บางส่วน (AI/Shell toggle ต่อ container) |
 | Vision | AI มองเห็นหน้าจอได้ (Screenshot) | ยังไม่ทำ |
-| Orchestrator | รับงานจากผู้ใช้ แล้วแจกให้ Agents | Placeholder |
-| Skills | ผู้ใช้เพิ่ม/ลดผ่านหน้าเว็บได้ | ยังไม่ทำ |
+| Orchestrator | รับงานจากผู้ใช้ แล้วแจกให้ Agents | Manual board (ยังไม่ auto-assign) |
+| Skills | ผู้ใช้เพิ่ม/ลดผ่านหน้าเว็บได้ | เปิด/ปิดได้จากหน้าเว็บ (เพิ่ม/ลบยังไม่ทำ) |
 | GitHub | ผู้ใช้ Auth ผ่าน UI, อนุมัติ Permission ครั้งเดียว | ยังไม่ทำ |
 | Permission UI | แสดงคำขอ Permission บนหน้าเว็บ | ยังไม่ทำ |
 
@@ -136,9 +144,13 @@
 ```bash
 git clone https://github.com/9zax/ai-agent-platform.git
 cd ai-agent-platform
-docker compose up --build
 
-# Optional: เปิด example agent
+# ZAI API key (อ่านจาก ~/.claude.json ของเครื่องที่ config ไว้)
+cp /dev/null .env   # แล้วใส่: ZAI_API_KEY=... ZAI_BASE_URL=https://api.z.ai/api/anthropic
+
+docker compose up --build -d
+
+# เปิด example agent (Ubuntu desktop + noVNC)
 docker compose --profile example up -d agent-example
 ```
 
@@ -147,6 +159,8 @@ docker compose --profile example up -d agent-example
 | Web | http://localhost:3000 |
 | API Docs | http://localhost:8000/docs |
 | noVNC (example) | http://localhost:6080 (password: `agent`) |
+
+**E2E tests:** `cd web/e2e && npm install && npx playwright install chromium && npm test`
 
 ## 9. Notes for Future AI / Developers
 

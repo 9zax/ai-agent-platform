@@ -5,3 +5,4 @@ node_modules/
 .next/
 data/
 *.db
+web/e2e/test-results/

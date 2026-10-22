@@ -6,11 +6,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./orchestrator:/app
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-data:/data
     environment:
       - DATABASE_URL=sqlite:///./data/platform.db
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - ZAI_BASE_URL=${ZAI_BASE_URL:-https://api.z.ai/api/anthropic}
     restart: unless-stopped
     networks:
       - agent-net
@@ -19,8 +20,6 @@ services:
     build: ./web
     ports:
       - "3000:3000"
-    volumes:
-      - ./web:/app
     depends_on:
       - orchestrator
     restart: unless-stopped
