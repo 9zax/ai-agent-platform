@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  orchestrator:
+    build: ./orchestrator
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./orchestrator:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-data:/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/platform.db
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  web:
+    build: ./web
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./web:/app
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+    networks:
+      - agent-net
+
+  agent-example:
+    build: ./agent-base
+    ports:
+      - "6080:6080"
+    volumes:
+      - agent-workspace:/workspace
+    environment:
+      - VNC_PASSWORD=agent
+    networks:
+      - agent-net
+    profiles:
+      - example
+
+volumes:
+  agent-data:
+  agent-workspace:
+
+networks:
+  agent-net:
+    driver: bridge
