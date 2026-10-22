@@ -1,5 +1,6 @@
 'use client'
 
+import { authFetch, getToken } from '@/lib/auth'
 import { useParams, useRouter } from 'next/navigation'
 import { useEffect, useRef, useState } from 'react'
 import {
@@ -11,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
+import { Input } from '@/components/ui/input'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const VNC_URL = process.env.NEXT_PUBLIC_VNC_URL || 'http://localhost:6080'
@@ -48,12 +50,14 @@ export default function ContainerDetail() {
   const [inspect, setInspect] = useState(null)
   const [vncState, setVncState] = useState('disconnected') // disconnected | connecting | connected | unavailable
   const [vncScaled, setVncScaled] = useState(false)
-  const [mode, setMode] = useState('ai') // 'ai' = ZAI GLM decides, 'shell' = run directly
+  const [mode, setMode] = useState('ai') // 'ai' = LLM decides, 'shell' = run directly
   const [agentModel, setAgentModel] = useState('')
+  const [authRequired, setAuthRequired] = useState(false) // true = must be logged in to touch containers
   const cmdBoxRef = useRef(null)
 
   useEffect(() => {
-    fetch(`${API}/agent/status`).then(r => r.json()).then(s => setAgentModel(s.model || '')).catch(() => {})
+    authFetch(`${API}/agent/status`).then(r => r.json()).then(s => setAgentModel(s.model || '')).catch(() => {})
+    authFetch(`${API}/config`).then(r => r.json()).then(c => setAdminGate(!!c.admin_password_set)).catch(() => {})
   }, [])
 
   // Live stats polling (every 5s) — only meaningful while running
@@ -61,7 +65,7 @@ export default function ContainerDetail() {
     let alive = true
     async function poll() {
       try {
-        const res = await fetch(`${API}/containers/${encodeURIComponent(id)}/stats`)
+        const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/stats`)
         if (res.ok && alive) setStats(await res.json())
       } catch { /* keep last known */ }
     }
@@ -73,18 +77,19 @@ export default function ContainerDetail() {
   // Lazy data per tab
   useEffect(() => {
     if (tab === 'files' && files === null) {
-      fetch(`${API}/containers/${encodeURIComponent(id)}/files`).then(r => r.json()).then(setFiles).catch(() => setFiles({ error: 'unreachable' }))
+      authFetch(`${API}/containers/${encodeURIComponent(id)}/files`).then(r => r.json()).then(setFiles).catch(() => setFiles({ error: 'unreachable' }))
     }
     if ((tab === 'security' || tab === 'networks') && inspect === null) {
-      fetch(`${API}/containers/${encodeURIComponent(id)}/inspect`).then(r => r.json()).then(setInspect).catch(() => setInspect({ error: 'unreachable' }))
+      authFetch(`${API}/containers/${encodeURIComponent(id)}/inspect`).then(r => r.json()).then(setInspect).catch(() => setInspect({ error: 'unreachable' }))
     }
   }, [tab, id, files, inspect])
 
   async function containerAction(action) {
+    if (authRequired && !getToken()) return router.push('/login')
     setBusy(action)
     setError('')
     try {
-      const res = await fetch(`${API}/containers/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       setStatus(data.status === 'exited' ? 'stopped' : data.status)
@@ -96,10 +101,11 @@ export default function ContainerDetail() {
   }
 
   async function deleteContainer() {
+    if (authRequired && !getToken()) return router.push('/login')
     setBusy('delete')
     setError('')
     try {
-      const res = await fetch(`${API}/containers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}`, { method: 'DELETE' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || `HTTP ${res.status}`)
@@ -113,11 +119,12 @@ export default function ContainerDetail() {
 
   async function sendCommand(consult = false) {
     if (!cmd.trim()) return
+    if (authRequired && !getToken()) return router.push('/login')
     setBusy('exec')
     setError('')
     const endpoint = mode === 'ai' ? 'agent' : 'exec'
     try {
-      const res = await fetch(`${API}/containers/${encodeURIComponent(id)}/${endpoint}`, {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: cmd, consult: mode === 'ai' ? consult : false }),
@@ -141,12 +148,37 @@ export default function ContainerDetail() {
   }
 
   async function connectVnc() {
+    if (authRequired && !getToken()) {
+      router.push('/login')
+      return
+    }
+    await doConnect()
+  }
+
+  async function doConnect() {
     setVncState('connecting')
     try {
-      const res = await fetch(VNC_URL, { mode: 'no-cors', signal: AbortSignal.timeout(3000) })
+      await fetch(VNC_URL, { mode: 'no-cors', signal: AbortSignal.timeout(3000) })
       setVncState('connected')
     } catch {
       setVncState('unavailable')
+    }
+  }
+
+  async function submitPassword(e) {
+    e.preventDefault()
+    setPwError('')
+    const res = await authFetch(`${API}/auth/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwInput }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      setPwPromptOpen(false)
+      await doConnect()
+    } else {
+      setPwError('รหัสผ่านไม่ถูกต้อง')
     }
   }
 
@@ -268,7 +300,7 @@ export default function ContainerDetail() {
                   </>
                 ) : (
                   <Button variant="outline" className="h-8 text-[12px]" disabled={vncState === 'connecting'} onClick={connectVnc} data-testid="vnc-connect">
-                    Connect
+                    Connect{authRequired ? ' 🔒' : ''}
                   </Button>
                 )}
               </div>
@@ -479,6 +511,7 @@ export default function ContainerDetail() {
           </Card>
         </div>
       </div>
+
     </>
   )
 }

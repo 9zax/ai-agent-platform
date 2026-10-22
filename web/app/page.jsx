@@ -1,5 +1,6 @@
 'use client'
 
+import { authFetch } from '@/lib/auth'
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, ListChecks, Search, Plus, RefreshCw, CalendarDays } from 'lucide-react'
@@ -28,15 +29,17 @@ function mapLive(c) {
   const raw = (c.status || '').split(' ')[0]
   const st = raw === 'exited' ? 'stopped' : raw
   const image = (c.image || '').split(':')[0].replace('ai-agent-platform-', '')
+  const role = c.labels?.role
   return {
     id: c.id,
     name: c.name,
-    type: image || 'docker',
-    tag: c.labels?.role === 'agent' ? 'purple' : 'blue',
+    type: role || image || 'docker',
+    tag: role ? 'purple' : 'blue',
     model: c.labels?.model || 'docker',
     status: st,
     uptime: '—',
     tasks: '—',
+    managed: c.labels?.['managed-by'] === 'ai-agent-platform',
   }
 }
 
@@ -47,6 +50,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('all')
+  const [showAll, setShowAll] = useState(false)
   const [activeTasks, setActiveTasks] = useState(3)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -59,7 +63,7 @@ export default function Dashboard() {
     setCreating(true)
     setFormError('')
     try {
-      const res = await fetch(`${API}/containers`, {
+      const res = await authFetch(`${API}/containers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form),
@@ -75,12 +79,12 @@ export default function Dashboard() {
     setCreating(false)
   }
 
-  async function load() {
+  async function load(showEverything = false) {
     setLoading(true)
     try {
       const [cRes, tRes] = await Promise.all([
-        fetch(`${API}/containers`).then(r => r.json()),
-        fetch(`${API}/tasks`).then(r => r.json()).catch(() => []),
+        authFetch(`${API}/containers${showEverything ? '?all=true' : ''}`).then(r => r.json()),
+        authFetch(`${API}/tasks`).then(r => r.json()).catch(() => []),
       ])
       setRows(cRes.map(mapLive))
       setLive(true)
@@ -93,16 +97,19 @@ export default function Dashboard() {
     setLoading(false)
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => { load(showAll) }, [showAll])
 
-  const filtered = useMemo(() => rows.filter(r => {
-    const q = query.toLowerCase()
-    const matchQ = !q || r.id.toLowerCase().includes(q) || r.name.toLowerCase().includes(q) || r.type.toLowerCase().includes(q)
-    const matchS = filter === 'all' || r.status === filter
-    return matchQ && matchS
-  }), [rows, query, filter])
+  const filtered = useMemo(() => rows
+    .filter(r => showAll || r.managed)
+    .filter(r => {
+      const q = query.toLowerCase()
+      const matchQ = !q || r.id.toLowerCase().includes(q) || r.name.toLowerCase().includes(q) || r.type.toLowerCase().includes(q)
+      const matchS = filter === 'all' || r.status === filter
+      return matchQ && matchS
+    }), [rows, query, filter, showAll])
 
-  const running = rows.filter(r => r.status === 'running' || r.status === 'busy').length
+  const running = rows.filter(r => r.managed && (r.status === 'running' || r.status === 'busy')).length
+  const managedCount = rows.filter(r => r.managed).length
 
   return (
     <>
@@ -131,11 +138,11 @@ export default function Dashboard() {
         <div className="mb-4 grid gap-3.5 [grid-template-columns:repeat(auto-fit,minmax(220px,1fr))]">
           <Card className="p-4" data-testid="stat-containers">
             <div className="flex items-center gap-2 text-[12.5px] font-medium text-muted-foreground">
-              <Package className="h-[15px] w-[15px] text-primary" /> Containers
+              <Package className="h-[15px] w-[15px] text-primary" /> Agent Containers
             </div>
-            <div className="mt-2 text-[27px] font-bold tracking-tight">{rows.length}</div>
+            <div className="mt-2 text-[27px] font-bold tracking-tight">{managedCount}</div>
             <div className="mt-2 text-[11.5px] text-muted-foreground/70">
-              <span className="font-semibold text-emerald-400">{running} running</span> · {rows.length - running} idle
+              <span className="font-semibold text-emerald-400">{running} running</span> · {managedCount - running} idle
             </div>
           </Card>
           <Card className="p-4" data-testid="stat-tasks">
@@ -174,6 +181,9 @@ export default function Dashboard() {
                   <SelectItem value="stopped">Stopped</SelectItem>
                 </SelectContent>
               </Select>
+              <Button variant="outline" data-testid="toggle-all-containers" onClick={() => setShowAll(s => !s)}>
+                {showAll ? 'My agents only' : `All containers (${rows.length})`}
+              </Button>
               <Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> New Container</Button>
             </div>
           </div>

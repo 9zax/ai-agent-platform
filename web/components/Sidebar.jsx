@@ -1,10 +1,11 @@
 'use client'
+import { authFetch } from '@/lib/auth'
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
 import {
-  Bot, LayoutDashboard, KanbanSquare, Package, Users, Sparkles, Wrench, Github, Settings,
+  Bot, LayoutDashboard, KanbanSquare, Package, Users, FolderKanban, Sparkles, Wrench, Github, Settings,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -16,6 +17,7 @@ const MAIN = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/board', label: 'Board', icon: KanbanSquare },
   { href: '/team', label: 'AI Team', icon: Users },
+  { href: '/projects', label: 'Projects', icon: FolderKanban, match: '/projects' },
   { href: '/', label: 'Containers', icon: Package, match: '/containers' },
 ]
 
@@ -30,10 +32,12 @@ export default function Sidebar() {
   const pathname = usePathname()
   const [health, setHealth] = useState(null)
   const [agents, setAgents] = useState({ running: 0, total: 0 })
+  const [session, setSession] = useState(null)
 
   useEffect(() => {
-    fetch(`${API}/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null))
-    fetch(`${API}/containers`)
+    authFetch(`${API}/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null))
+    authFetch(`${API}/auth/me`).then(r => r.json()).then(setSession).catch(() => setSession(null))
+    authFetch(`${API}/containers`)
       .then(r => r.json())
       .then(list => {
         const managed = (Array.isArray(list) ? list : []).filter(c => c.labels?.['managed-by'] === 'ai-agent-platform')
@@ -115,12 +119,31 @@ export default function Sidebar() {
 
       <div className="mt-2.5 flex items-center gap-2.5 rounded-xl border bg-card p-2.5">
         <Avatar className="h-[30px] w-[30px]">
-          <AvatarFallback>AD</AvatarFallback>
+          <AvatarFallback>{session?.valid ? session.user.slice(0, 2).toUpperCase() : '?'}</AvatarFallback>
         </Avatar>
-        <div>
-          <div className="text-[12.5px] font-semibold">Admin</div>
-          <div className="text-[10.5px] text-muted-foreground/70">admin@platform.dev</div>
-        </div>
+        {session?.valid ? (
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[12.5px] font-semibold">{session.user}</div>
+            <button
+              className="text-[10.5px] text-muted-foreground/70 hover:text-red-400"
+              onClick={async () => {
+                await authFetch(`${API}/auth/logout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: localStorage.getItem('aap_token') || '' }) })
+                localStorage.removeItem('aap_token')
+                localStorage.removeItem('aap_user')
+                window.location.href = '/login'
+              }}
+            >
+              Log out
+            </button>
+          </div>
+        ) : session?.auth_required ? (
+          <a href="/login" className="text-[12.5px] font-semibold text-primary">Sign in →</a>
+        ) : (
+          <div>
+            <div className="text-[12.5px] font-semibold">Admin</div>
+            <div className="text-[10.5px] text-muted-foreground/70">no auth required</div>
+          </div>
+        )}
       </div>
     </aside>
   )

@@ -1,27 +1,55 @@
 'use client'
 
+import { authFetch } from '@/lib/auth'
 import { useEffect, useState } from 'react'
-import { Server, Package, ShieldCheck } from 'lucide-react'
+import { Server, Package, ShieldCheck, KeyRound } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 export default function SettingsPage() {
   const [health, setHealth] = useState(null)
   const [config, setConfig] = useState(null)
+  const [password, setPassword] = useState('')
+  const [pwSaving, setPwSaving] = useState(false)
+  const [pwSaved, setPwSaved] = useState(false)
+
+  async function loadConfig() {
+    authFetch(`${API}/config`).then(r => r.json()).then(setConfig).catch(() => setConfig(null))
+  }
 
   useEffect(() => {
-    fetch(`${API}/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null))
-    fetch(`${API}/config`).then(r => r.json()).then(setConfig).catch(() => setConfig(null))
+    authFetch(`${API}/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null))
+    loadConfig()
   }, [])
+
+  async function savePassword(e) {
+    e.preventDefault()
+    if (!password) return
+    setPwSaving(true)
+    setPwSaved(false)
+    const res = await authFetch(`${API}/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ admin_password: password }),
+    })
+    if (res.ok) {
+      setPassword('')
+      setPwSaved(true)
+      await loadConfig()
+    }
+    setPwSaving(false)
+  }
 
   const rows = [
     ['Orchestrator', health ? 'Healthy' : 'Unreachable', health ? 'text-emerald-400' : 'text-red-400'],
     ['Docker socket', health?.docker ? 'Connected' : 'Not connected', health?.docker ? 'text-emerald-400' : 'text-amber-400'],
     ['API endpoint', API, ''],
-    ['Default model', config?.default_model ?? '—', ''],
-    ['Default image', config?.default_image ?? '—', ''],
+    ['AI provider', config?.ai_provider ?? '—', ''],
+    ['Model', config?.ai_model || config?.default_model || '—', ''],
     ['Max containers', config?.max_containers ?? '—', ''],
     ['Auto-restart', config ? (config.auto_restart ? 'On' : 'Off') : '—', ''],
   ]
@@ -44,6 +72,32 @@ export default function SettingsPage() {
               <span className={color || 'font-semibold'}>{v}</span>
             </div>
           ))}
+        </Card>
+
+        <Card className="p-5" data-testid="access-card">
+          <div className="mb-2 flex items-center gap-2 text-[14px] font-bold">
+            <KeyRound className="h-4 w-4 text-primary" /> Admin Access
+          </div>
+          <div className="mb-3 text-[12.5px] leading-relaxed text-muted-foreground/80">
+            ตั้ง password เดียวสำหรับเข้าถึง console ของ container ทุกตัว (noVNC) — ถามทุกครั้งก่อนเชื่อมต่อ
+          </div>
+          <div className="mb-3">
+            <Badge variant={config?.admin_password_set ? 'green' : 'gray'} data-testid="admin-password-status">
+              {config?.admin_password_set ? 'Password set' : 'No password (open access)'}
+            </Badge>
+          </div>
+          <form onSubmit={savePassword} className="flex gap-2">
+            <Input
+              type="password"
+              value={password}
+              placeholder="ตั้ง/เปลี่ยน admin password"
+              onChange={e => setPassword(e.target.value)}
+            />
+            <Button type="submit" disabled={pwSaving || !password} data-testid="save-admin-password">
+              {pwSaving ? 'Saving…' : 'Save'}
+            </Button>
+          </form>
+          {pwSaved && <div className="mt-2 text-[12.5px] font-medium text-emerald-400" data-testid="password-saved">Saved ✓</div>}
         </Card>
 
         <Card className="p-5">

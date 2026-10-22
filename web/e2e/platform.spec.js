@@ -20,20 +20,18 @@ test.describe('Skills', () => {
 })
 
 test.describe('AI Config', () => {
-  test('saves config changes', async ({ page }) => {
+  test('provider templates switch and save', async ({ page }) => {
     await page.goto('/ai-config')
-    const modelInput = page.getByLabel('Default Model')
-    await expect(modelInput).toBeVisible()
+    await expect(page.getByTestId('provider-zai')).toBeVisible()
 
-    const original = await modelInput.inputValue()
-    const changed = original === 'GPT-4o' ? 'Claude 3.5' : 'GPT-4o'
-    await modelInput.fill(changed)
-    await page.getByRole('button', { name: /Save Changes/ }).click()
-    await expect(page.getByTestId('saved-indicator')).toBeVisible()
+    // Picking a template fills the base URL and model
+    await page.getByTestId('provider-anthropic').click()
+    await expect(page.getByLabel('Base URL')).toHaveValue(/api\.anthropic\.com/)
+    await expect(page.getByLabel('Model')).not.toHaveValue('')
 
-    // Restore
-    await modelInput.fill(original)
-    await page.getByRole('button', { name: /Save Changes/ }).click()
+    // Switch back to the default and save
+    await page.getByTestId('provider-zai').click()
+    await page.getByRole('button', { name: /Save Provider Config/ }).click()
     await expect(page.getByTestId('saved-indicator')).toBeVisible()
   })
 })

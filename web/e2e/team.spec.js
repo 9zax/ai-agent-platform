@@ -15,6 +15,23 @@ test.describe('AI Team', () => {
     await expect(page.getByText(/1[4-7]\+ yrs/)).toHaveCount(6)
   })
 
+  test('persona rules editable in the markdown editor', async ({ page }) => {
+    await page.goto('/team')
+    await page.getByTestId('agent-edit-po').click()
+    const editor = page.getByTestId('md-editor')
+    await expect(editor).toBeVisible()
+    await expect(editor).toContainText('Nara')
+
+    // Preview renders the markdown
+    await page.getByTestId('md-toggle').click()
+    await expect(page.getByTestId('md-preview')).toBeVisible()
+
+    // Save unchanged
+    await page.getByTestId('md-toggle').click()
+    await page.getByTestId('save-persona').click()
+    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 10000 })
+  })
+
   test('start PO agent, consult the persona, then clean up', async ({ page }) => {
     test.setTimeout(150_000)
 

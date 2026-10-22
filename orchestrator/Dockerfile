@@ -1,14 +1,17 @@
-FROM python:3.11-slim
+FROM rust:1-slim AS build
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    docker.io \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config build-essential cmake && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
 
-COPY . .
+FROM debian:bookworm-slim
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY --from=build /app/target/release/orchestrator /usr/local/bin/orchestrator
+
+EXPOSE 8000
+
+CMD ["orchestrator"]

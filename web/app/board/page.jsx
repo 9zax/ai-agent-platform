@@ -1,5 +1,6 @@
 'use client'
 
+import { authFetch } from '@/lib/auth'
 import { useEffect, useMemo, useState } from 'react'
 import { Search } from 'lucide-react'
 import { Input } from '@/components/ui/input'
@@ -30,7 +31,7 @@ export default function Board() {
 
   async function loadTasks() {
     try {
-      const res = await fetch(`${API}/tasks`)
+      const res = await authFetch(`${API}/tasks`)
       setTasks(await res.json())
     } catch {
       setTasks([])
@@ -43,7 +44,7 @@ export default function Board() {
     if (!newTitle.trim()) return
     setSaving(true)
     try {
-      await fetch(`${API}/tasks`, {
+      await authFetch(`${API}/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTitle.trim(), status }),

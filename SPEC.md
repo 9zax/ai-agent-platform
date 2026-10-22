@@ -164,10 +164,24 @@ docker compose --profile example up -d agent-example
 
 ## 9. Notes for Future AI / Developers
 
-- โปรเจกต์นี้เป็น **MVP Scaffold** ยังไม่ใช่ระบบที่ใช้งานได้เต็มรูปแบบ
-- โฟกัสต่อไปควรเป็น "ทำให้ Web ใช้งานได้จริง" ก่อน แล้วค่อยเพิ่ม AI logic
-- การเก็บ API Key และ GitHub Token ต้องทำอย่างปลอดภัย (อย่าเก็บ plain text ใน container)
-- ถ้าต้องการเปลี่ยนโมเดล AI ให้แก้ที่ configuration layer ไม่ใช่ hardcode
+- Backend เป็น **Rust binary** (Axum + bollard) — compile ครั้งเดียวรันได้ทุกที่ที่มี Docker socket ไม่ต้องมี Python
+- การเก็บ API Key และ GitHub Token ต้องทำอย่างปลอดภัย (อย่าเก็บ plain text ใน container) — ZAI key ผ่าน `.env` (gitignored)
+- เปลี่ยนโมเดล AI ได้จากหน้า **AI Config** (provider templates: Z.ai GLM / Anthropic / OpenAI / OpenRouter / Groq / DeepSeek / Ollama local / Custom)
+- Login: ตั้ง `ADMIN_USER`/`ADMIN_PASSWORD` ใน `.env` → เปิดระบบ login → container endpoints ทั้งหมด (exec/AI/lifecycle/VNC console) ต้อง login ก่อน; เว้น `ADMIN_PASSWORD` ว่าง = ปิด auth
+- Dashboard แสดงเฉพาะ container ของ platform (label `managed-by`) โดย default — กด "All containers" เพื่อดูทั้งเครื่อง
+
+## 10. Browser for AI Agents — ผลสำรวจ
+
+ข้อสรุปสำหรับให้ agent ใช้ browser ภายใน container:
+
+| ตัวเลือก | เหมาะกับ AI ใน container? | เหตุผล |
+|---|---|---|
+| **Chromium/Chrome headless + CDP** ✅ | ใช่ — มาตรฐานอุตสาหกรรม | เป็น protocol เดียวกับที่ Playwright/Puppeteer/Browser Use ใช้ — AI tooling เข้ากันได้กว้างที่สุด, เปิดหลาย tab/session ได้, ควบคุม network/DOM ละเอียด |
+| Playwright (บน CDP) ✅ | ใช่ — ค่าเริ่มต้นสำหรับงานใหม่ | ชั้นที่สูงกว่า CDP ตรง ๆ เขียนเร็วกว่า ใช้กับ agent framework ได้ทันที |
+| ego browser | ไม่ใช่สำหรับ container | ออกแบบให้ใช้ profile/login ของ user บนเครื่อง host — เหมาะกับ agent ฝั่ง host ไม่ใช่ sandbox แยก |
+| Hosted (Browserbase ฯลฯ) | กรณีพิเศษ | สะดวกแต่มีค่าใช้จ่าย + ข้อมูลออกนอกเครื่อง |
+
+**แนวทางของ platform นี้:** agent-base ติดตั้ง browser จริงไว้แล้ว (Chrome บน amd64 / Firefox ESR บน arm64 — Chrome ไม่มี arm64 Linux build) และมี `gh` CLI ให้เปิด GitHub issue ได้ตามที่ persona ประกาศไว้ใน rules; จะเพิ่ม headless Chromium + CDP endpoint ใน container เมื่อถึงขั้นตอน Vision/Screenshot
 
 ---
 

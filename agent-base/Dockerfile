@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     websockify \
     xterm \
     git \
+    gh \
     curl \
     wget \
     python3 \

@@ -7,6 +7,11 @@ test.describe('Dashboard', () => {
     await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
   })
 
+  async function showAllContainers(page) {
+    const btn = page.getByTestId('toggle-all-containers')
+    if (await btn.isVisible()) await btn.click()
+  }
+
   test('shows stat cards', async ({ page }) => {
     await expect(page.getByTestId('stat-containers')).toBeVisible()
     await expect(page.getByTestId('stat-tasks')).toBeVisible()
@@ -31,6 +36,7 @@ test.describe('Dashboard', () => {
       })
       expect(apiRows.length).toBeGreaterThan(0)
       await page.goto('/')
+      await showAllContainers(page)
       await page.getByTestId('container-row').first().waitFor({ state: 'visible', timeout: 5000 })
       for (const c of apiRows) {
         const row = page.getByText(c.name, { exact: true })
@@ -40,6 +46,7 @@ test.describe('Dashboard', () => {
   })
 
   test('search filters the container table', async ({ page }) => {
+    await showAllContainers(page)
     await page.getByPlaceholder('Search containers...').fill('orchestrator')
 
     const rows = page.getByTestId('container-row')
@@ -53,6 +60,7 @@ test.describe('Dashboard', () => {
   })
 
   test('status filter with no matches shows the empty state', async ({ page }) => {
+    await showAllContainers(page)
     await page.getByPlaceholder('Search containers...').fill('')
     await page.getByText('All Status').click()
     await page.getByRole('option', { name: 'Busy' }).click()
@@ -60,6 +68,7 @@ test.describe('Dashboard', () => {
   })
 
   test('clicking a row opens the container detail page', async ({ page }) => {
+    await showAllContainers(page)
     await page.getByText('ai-agent-platform-orchestrator-1').click()
     await expect(page).toHaveURL(/\/containers\/ai-agent-platform-orchestrator-1$/)
     await expect(page.getByText('Container console & AI agent control')).toBeVisible()
