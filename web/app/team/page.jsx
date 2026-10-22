@@ -43,10 +43,10 @@ export default function TeamPage() {
     }
   }
 
-  async function stopAgent(name) {
+  async function containerAction(name, action) {
     setBusy(name)
     try {
-      await authFetch(`${API}/containers/${encodeURIComponent(name)}/stop`, { method: 'POST' })
+      await authFetch(`${API}/containers/${encodeURIComponent(name)}/${action}`, { method: 'POST' })
       await load()
     } finally {
       setBusy('')
@@ -121,9 +121,9 @@ export default function TeamPage() {
               <div className="flex flex-col items-end gap-1.5">
                 <code className="rounded bg-secondary px-2 py-0.5 font-mono text-[10.5px] uppercase text-muted-foreground">{a.role}</code>
                 {a.container
-                  ? <Badge variant={a.container.status === 'running' ? 'running' : 'stopped'} className="gap-1.5" data-testid={`agent-status-${a.role}`}>
+                  ? <Badge variant={a.container.status === 'running' ? 'running' : a.container.status === 'paused' ? 'paused' : 'stopped'} className="gap-1.5" data-testid={`agent-status-${a.role}`}>
                       <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                      {a.container.status === 'running' ? 'Running' : a.container.status}
+                      {a.container.status === 'running' ? 'Running' : a.container.status === 'paused' ? 'Paused' : a.container.status === 'exited' ? 'Stopped' : a.container.status}
                     </Badge>
                   : <Badge variant="gray" data-testid={`agent-status-${a.role}`}>Offline</Badge>}
               </div>
@@ -142,7 +142,16 @@ export default function TeamPage() {
                     <MessageSquare className="h-3.5 w-3.5" /> Console
                   </Button>
                   {a.container.status === 'running' && (
-                    <Button size="sm" variant="outline" disabled={busy === a.container.name} onClick={() => stopAgent(a.container.name)}>Stop</Button>
+                    <>
+                      <Button size="sm" variant="outline" disabled={busy === a.container.name} onClick={() => containerAction(a.container.name, 'pause')}>Pause</Button>
+                      <Button size="sm" variant="outline" disabled={busy === a.container.name} onClick={() => containerAction(a.container.name, 'stop')}>Stop</Button>
+                    </>
+                  )}
+                  {a.container.status === 'paused' && (
+                    <Button size="sm" variant="outline" disabled={busy === a.container.name} onClick={() => containerAction(a.container.name, 'resume')}>Resume</Button>
+                  )}
+                  {a.container.status === 'exited' && (
+                    <Button size="sm" variant="outline" disabled={busy === a.container.name} onClick={() => containerAction(a.container.name, 'start')}>Start</Button>
                   )}
                   <Button size="sm" variant="outline" className="border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-400" disabled={busy === a.container.name} onClick={() => remove(a.container.name)}>
                     <Trash2 className="h-3.5 w-3.5" />

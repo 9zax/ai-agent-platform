@@ -8,16 +8,23 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { marked } from 'marked'
-import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle } from 'lucide-react'
+import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, Rocket, MonitorPlay } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Textarea } from '@/components/ui/textarea'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { AgentDetail } from '@/components/agent-detail'
-import { fmtClock } from '@/lib/utils'
+import { fmtClock, stepKey } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+// Tail-stage steps (after QA verifies): icon + label chip shown next to the title.
+const STEP_KIND_META = {
+  pr: { icon: GitPullRequest, label: 'Pull Request', cls: 'bg-sky-500/10 text-sky-300' },
+  deploy: { icon: Rocket, label: 'Deploy staging', cls: 'bg-orange-500/10 text-orange-300' },
+  demo: { icon: MonitorPlay, label: 'Acceptance demo', cls: 'bg-violet-500/10 text-violet-300' },
+}
 
 function PersonaNode({ data }) {
   const ring =
@@ -66,13 +73,23 @@ function PersonaNode({ data }) {
   )
 }
 
-// A live team meeting on the canvas: one agent's blocking question + everyone answering.
+// A live team meeting on the canvas: one agent's blocking question + everyone
+// answering. kind === 'demo' renders the acceptance demo card (violet).
 function MeetingNode({ data }) {
+  const isDemo = data.kind === 'demo'
   return (
-    <div className={`w-[230px] rounded-xl border-2 bg-[#161207] p-3 ${data.needHuman ? 'border-rose-400/80 shadow-[0_0_24px_rgba(251,113,133,.28)]' : 'border-amber-400/80 shadow-[0_0_24px_rgba(251,191,36,.28)]'}`} data-testid="meeting-node">
+    <div
+      className={`w-[230px] rounded-xl border-2 p-3 ${isDemo ? 'bg-[#12091f]' : 'bg-[#161207]'} ${
+        data.needHuman ? 'border-rose-400/80 shadow-[0_0_24px_rgba(251,113,133,.28)]'
+        : isDemo ? 'border-violet-400/80 shadow-[0_0_24px_rgba(167,139,250,.28)]'
+        : 'border-amber-400/80 shadow-[0_0_24px_rgba(251,191,36,.28)]'}`}
+      data-testid="meeting-node"
+    >
       <div className="flex items-center gap-2">
-        <MessageCircle className={`h-4 w-4 shrink-0 ${data.needHuman ? 'text-rose-400' : 'text-amber-400'}`} />
-        <span className={`text-[12.5px] font-bold ${data.needHuman ? 'text-rose-300' : 'text-amber-300'}`}>Team Meeting</span>
+        {isDemo
+          ? <MonitorPlay className="h-4 w-4 shrink-0 text-violet-300" />
+          : <MessageCircle className={`h-4 w-4 shrink-0 ${data.needHuman ? 'text-rose-400' : 'text-amber-400'}`} />}
+        <span className={`text-[12.5px] font-bold ${data.needHuman ? 'text-rose-300' : isDemo ? 'text-violet-300' : 'text-amber-300'}`}>{isDemo ? 'Acceptance Demo' : 'Team Meeting'}</span>
         {data.status === 'resolved'
           ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
           : data.needHuman
@@ -116,6 +133,27 @@ function StepStatusIcon({ status }) {
   return <Clock className="h-4 w-4 text-muted-foreground/50" />
 }
 
+// Orchestrator notes stay plain text, except URLs become clickable links and
+// GitHub device-flow codes (XXXX-XXXX) get highlighted — the PR stage's auth
+// request carries both and must be actionable straight from the chat.
+function noteText(text) {
+  return String(text).split(/(https?:\/\/[^\s<>"]+)/g).map((part, i) => {
+    if (i % 2 === 1) {
+      return (
+        <a key={i} href={part} target="_blank" rel="noreferrer"
+           className="font-semibold not-italic underline decoration-amber-400/60 underline-offset-2 hover:text-amber-100">
+          {part}
+        </a>
+      )
+    }
+    return part.split(/(\b[A-Z0-9]{4}-[A-Z0-9]{4}\b)/g).map((seg, j) =>
+      j % 2 === 1
+        ? <code key={`${i}-${j}`} data-testid="device-code" className="mx-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[11px] font-bold not-italic text-amber-200">{seg}</code>
+        : seg
+    )
+  })
+}
+
 // One chat bubble row. AI teammates sit left; the user ("human") sits right in
 // the platform tint; orchestrator notes render as centered system dividers.
 function ChatBubble({ from, text, at, stepByRole }) {
@@ -123,7 +161,7 @@ function ChatBubble({ from, text, at, stepByRole }) {
     return (
       <div className="my-1.5 flex items-center gap-2.5" data-testid="chat-note">
         <div className="h-px flex-1 bg-amber-500/15" />
-        <div className="max-w-[85%] text-center text-[10.5px] italic leading-relaxed text-amber-200/60">{text}{at ? <span className="ml-1.5 not-italic text-muted-foreground/40">{fmtClock(at)}</span> : null}</div>
+        <div className="max-w-[85%] whitespace-pre-line text-center text-[10.5px] italic leading-relaxed text-amber-200/60">{noteText(text)}{at ? <span className="ml-1.5 not-italic text-muted-foreground/40">{fmtClock(at)}</span> : null}</div>
         <div className="h-px flex-1 bg-amber-500/15" />
       </div>
     )
@@ -163,6 +201,7 @@ function TypingRow({ label, tone = 'amber', revert = false }) {
 }
 
 // One meeting = one chat thread: the question, then everyone answering live.
+// kind === 'demo' renders the acceptance demo session (violet) instead.
 function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending }) {
   const scrollRef = useRef(null)
   const [reply, setReply] = useState('')
@@ -170,6 +209,7 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [d.messages.length, d.answering, d.status])
 
+  const isDemo = d.kind === 'demo'
   const asker = stepByRole[d.from]?.name || d.from
   const addressees = d.to.map(r => r === 'human' ? 'คุณ' : (stepByRole[r]?.name || r)).join(', ')
   const askerRevising = d.status !== 'resolved' && d.answering === d.from
@@ -185,14 +225,18 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
 
   return (
     <div
-      className={`rounded-xl border bg-[#161207] ${d.status === 'need_human' ? 'border-rose-400/60 shadow-[0_0_20px_rgba(251,113,133,.18)]' : 'border-amber-500/30'}`}
-      data-testid={`meeting-${d.id}`}
+      className={`rounded-xl border ${isDemo ? 'bg-[#12091f]' : 'bg-[#161207]'} ${d.status === 'need_human' ? 'border-rose-400/60 shadow-[0_0_20px_rgba(251,113,133,.18)]' : isDemo ? 'border-violet-500/30' : 'border-amber-500/30'}`}
+      data-testid={`${isDemo ? 'demo' : 'meeting'}-${d.id}`}
     >
-      <div className={`flex flex-wrap items-center gap-2 border-b px-3.5 py-2.5 ${d.status === 'need_human' ? 'border-rose-400/25' : 'border-amber-500/20'}`}>
-        <MessageCircle className={`h-3.5 w-3.5 shrink-0 ${d.status === 'need_human' ? 'text-rose-400' : 'text-amber-400'}`} />
-        <span className="text-[12.5px] font-semibold text-amber-200">{asker} ถาม → {addressees}</span>
+      <div className={`flex flex-wrap items-center gap-2 border-b px-3.5 py-2.5 ${d.status === 'need_human' ? 'border-rose-400/25' : isDemo ? 'border-violet-500/20' : 'border-amber-500/20'}`}>
+        {isDemo
+          ? <MonitorPlay className="h-3.5 w-3.5 shrink-0 text-violet-300" />
+          : <MessageCircle className={`h-3.5 w-3.5 shrink-0 ${d.status === 'need_human' ? 'text-rose-400' : 'text-amber-400'}`} />}
+        <span className={`text-[12.5px] font-semibold ${isDemo ? 'text-violet-200' : 'text-amber-200'}`}>
+          {isDemo ? 'Acceptance Demo — QA แสดงหลักฐาน · Dev ส่งมอบ PR/Deploy · PO ตรวจรับ' : `${asker} ถาม → ${addressees}`}
+        </span>
         <Badge variant={d.status === 'resolved' ? 'running' : d.status === 'need_human' ? 'dead' : 'purple'} className="text-[9.5px]">
-          {d.status === 'resolved' ? 'resolved' : d.status === 'need_human' ? '⏸ รอคุณตอบ' : d.status === 'answering' ? 'กำลังคุยกัน' : 'รอเปิดประชุม'}
+          {d.status === 'resolved' ? (isDemo ? 'ตรวจรับเสร็จ' : 'resolved') : d.status === 'need_human' ? '⏸ รอคุณตอบ' : d.status === 'answering' ? (isDemo ? 'กำลัง demo' : 'กำลังคุยกัน') : 'รอเปิดประชุม'}
         </Badge>
       </div>
       <div ref={scrollRef} className="max-h-[300px] overflow-y-auto px-3.5 py-3">
@@ -227,6 +271,18 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
 
 function initials(name) {
   return (name || '?').split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase()
+}
+
+// Chip for a tail-stage step kind (pr/deploy/demo) next to the step title.
+function StepKindBadge({ kind }) {
+  const meta = STEP_KIND_META[kind]
+  if (!meta) return null
+  const Icon = meta.icon
+  return (
+    <span className={`ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9.5px] font-semibold ${meta.cls}`}>
+      <Icon className="h-3 w-3" /> {meta.label}
+    </span>
+  )
 }
 
 export default function ProjectFlow() {
@@ -447,7 +503,9 @@ export default function ProjectFlow() {
   // ---- Live run state on the flow canvas (plain derivations — must stay after
   // the early returns above, so no hooks here) ----
   const live = run?.status === 'running' || run?.status === 'waiting_human'
-  const stepByRole = Object.fromEntries((run?.steps || []).map(s => [s.role, s]))
+  // Role → that agent's WORK step only, so chat names/canvas rings never get
+  // shadowed by the same agent's tail steps (pr/deploy/demo).
+  const stepByRole = Object.fromEntries((run?.steps || []).filter(s => (s.kind || 'work') === 'work').map(s => [s.role, s]))
   const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved')
   // Agents paused on a need-human meeting
   const waitingHuman = run?.status === 'waiting_human'
@@ -456,6 +514,14 @@ export default function ProjectFlow() {
   )
   // Who each agent is talking to in a live meeting: role → display names of the others
   const meetingPartners = {}
+  // Participants of a live discussion on the canvas. A demo session is the
+  // orchestrator's — participants are whoever actually speaks in the thread
+  // (qa / dev / po), not the "orchestrator" sender.
+  const meetingParts = d => d.kind === 'demo'
+    ? ([...new Set(d.messages.map(m => m.from).filter(r => r !== 'orchestrator' && r !== 'human'))].length
+        ? [...new Set(d.messages.map(m => m.from).filter(r => r !== 'orchestrator' && r !== 'human'))]
+        : ['po'])
+    : [d.from, ...d.to.filter(r => r !== 'human')]
   activeMeetings.forEach(d => {
     if (!d.answering || d.answering === 'human') return
     meetingPartners[d.answering] = [d.from, ...d.to]
@@ -482,7 +548,7 @@ export default function ProjectFlow() {
     if (!live) return withState
     // A meeting card floating above the participants, wired to each of them
     const meetings = activeMeetings.map(d => {
-      const parts = [d.from, ...d.to.filter(r => r !== 'human')]
+      const parts = meetingParts(d)
       const ps = parts.map(r => nodes.find(n => n.id === r)?.position).filter(Boolean)
       const pos = ps.length
         ? { x: ps.reduce((a, p) => a + p.x, 0) / ps.length + 70, y: ps.reduce((a, p) => a + p.y, 0) / ps.length - 100 }
@@ -494,6 +560,7 @@ export default function ProjectFlow() {
         draggable: false, selectable: false, deletable: false, connectable: false,
         data: {
           topic: d.topic,
+          kind: d.kind,
           status: d.status,
           participants: parts.map(r => stepByRole[r]?.name || r),
           speaking: d.answering && d.answering !== 'human' ? (stepByRole[d.answering]?.name || d.answering) : null,
@@ -511,7 +578,7 @@ export default function ProjectFlow() {
         // direction (meeting → asker) into a dashed rose line with an arrowhead —
         // the work is being sent back down the wire.
         const reverted = d.answering === d.from
-        return [d.from, ...d.to].filter(p => p !== 'human').map(p => (reverted && p === d.from)
+        return meetingParts(d).map(p => (reverted && p === d.from)
           ? {
               id: `m-${d.id}-${p}`,
               source: `meeting-${d.id}`,
@@ -608,11 +675,13 @@ export default function ProjectFlow() {
           {run && (
             <div ref={outputRef} className="mt-4 border-t pt-4" data-testid="run-timeline">
               <div className="mb-3 flex flex-wrap items-center gap-2.5">
-                <Badge variant={run.status === 'error' || run.status === 'stopped' ? 'dead' : run.status === 'waiting_human' ? 'dead' : run.status === 'running' ? (run.phase === 'meeting' ? 'purple' : 'created') : 'running'} className="gap-1.5">
+                <Badge variant={run.status === 'error' || run.status === 'stopped' ? 'dead' : run.status === 'waiting_human' ? 'dead' : run.status === 'running' ? (run.phase === 'meeting' || run.phase === 'demo' ? 'purple' : 'created') : 'running'} className="gap-1.5">
                   {run.status === 'running'
                     ? (run.phase === 'meeting'
                         ? <><MessagesSquare className="h-3 w-3" /> team meeting — รอบที่ {run.round}</>
-                        : 'team working')
+                        : run.phase === 'demo'
+                          ? <><MonitorPlay className="h-3 w-3" /> demo & acceptance — PO ตรวจรับ</>
+                          : 'team working')
                     : run.status === 'waiting_human'
                       ? <><User className="h-3 w-3" /> รอคุณตอบในแชท</>
                       : run.status}
@@ -650,6 +719,23 @@ export default function ProjectFlow() {
                 )}
               </div>
 
+              {run.acceptance && (
+                <div
+                  className={`mb-3 rounded-xl border p-3.5 ${run.acceptance.verdict === 'pass' ? 'border-emerald-500/40 bg-emerald-500/5' : 'border-rose-500/40 bg-rose-500/5'}`}
+                  data-testid="acceptance-card"
+                  data-verdict={run.acceptance.verdict}
+                >
+                  <div className={`mb-1.5 flex items-center gap-2 text-[12.5px] font-bold ${run.acceptance.verdict === 'pass' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {run.acceptance.verdict === 'pass' ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+                    Acceptance: {run.acceptance.verdict.toUpperCase()} — ตัดสินโดย PO จาก demo session
+                  </div>
+                  <div
+                    className="max-h-[260px] overflow-auto text-[12.5px] [&_code]:rounded [&_code]:bg-secondary [&_code]:px-1 [&_h1]:mb-2 [&_h1]:text-[15px] [&_h1]:font-bold [&_h2]:mb-1.5 [&_h2]:mt-3 [&_h2]:text-[13.5px] [&_h2]:font-bold [&_h3]:mt-2 [&_h3]:text-[12.5px] [&_h3]:font-semibold [&_li]:list-disc [&_ol]:list-decimal [&_p]:mb-2 [&_pre]:my-2 [&_ul]:list-disc [&_ul]:pl-5"
+                    dangerouslySetInnerHTML={{ __html: marked.parse(run.acceptance.summary) }}
+                  />
+                </div>
+              )}
+
               {run.summary && (
                 <div className="mb-3 rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-3.5" data-testid="run-summary">
                   <div className="mb-1.5 flex items-center gap-2 text-[12.5px] font-bold text-emerald-400">
@@ -664,13 +750,15 @@ export default function ProjectFlow() {
 
               <div className="flex flex-col gap-2.5">
                 {run.steps.map((step, i) => {
-                  const open = !collapsed[step.role]
-                  const reverting = live && revisingRoles.has(step.role) && step.status === 'working'
+                  const sKey = stepKey(step)
+                  const kind = step.kind || 'work'
+                  const open = !collapsed[sKey]
+                  const reverting = live && kind === 'work' && revisingRoles.has(step.role) && step.status === 'working'
                   return (
-                    <div key={step.role} className={`rounded-xl border bg-[#0d1420] ${reverting ? 'revert-flash border-rose-400/60' : ''}`} data-testid={`run-step-${step.role}`} data-status={step.status} data-revert={reverting ? '1' : undefined}>
+                    <div key={sKey} className={`rounded-xl border bg-[#0d1420] ${reverting ? 'revert-flash border-rose-400/60' : ''}`} data-testid={`run-step-${step.role}${kind !== 'work' ? `-${kind}` : ''}`} data-status={step.status} data-revert={reverting ? '1' : undefined}>
                       <button
                         className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left"
-                        onClick={() => setCollapsed(c => ({ ...c, [step.role]: open }))}
+                        onClick={() => setCollapsed(c => ({ ...c, [sKey]: open }))}
                       >
                         <StepStatusIcon status={reverting ? 'revising' : step.status} />
                         <Avatar className="h-6 w-6">
@@ -681,6 +769,7 @@ export default function ProjectFlow() {
                             <span className="text-muted-foreground/50">{i + 1}. </span>{step.name}
                             <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
                             {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
+                            {kind !== 'work' && <StepKindBadge kind={kind} />}
                           </div>
                         </div>
                         {step.container && (
@@ -700,6 +789,7 @@ export default function ProjectFlow() {
                           )}
                           {step.status === 'working' && !reverting && <div className="flex items-center gap-2 text-[12px] text-blue-400"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังทำงาน…</div>}
                           {step.status === 'error' && <div className="text-[12.5px] text-red-400">{step.output}</div>}
+                          {step.status === 'skipped' && <div className="text-[12px] text-muted-foreground/70">ข้าม — {step.output || 'ไม่มีเหตุผลระบุ'}</div>}
                           {step.status === 'done' && (
                             <>
                               {step.deliverable && (

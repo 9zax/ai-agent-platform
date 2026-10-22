@@ -110,7 +110,7 @@ function ProjectCard({ group, roleInfo }) {
 
           <div className="flex flex-wrap gap-1.5" data-testid="board-agent-chips">
             {latest.steps.map(step => (
-              <AgentChip key={step.role} step={step} role={step.role} roleInfo={roleInfo.get(step.role)} />
+              <AgentChip key={`${step.role}-${step.kind || 'work'}`} step={step} role={step.role} roleInfo={roleInfo.get(step.role)} />
             ))}
           </div>
 

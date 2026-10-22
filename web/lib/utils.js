@@ -27,3 +27,12 @@ export function fmtDur(start, end) {
   const h = Math.floor(m / 60)
   return `${h}h ${String(m % 60).padStart(2, '0')}m`
 }
+
+// Stable key for a run step — one role can own work/pr/deploy/demo steps.
+export function stepKey(s) {
+  return `${s.role}-${s.kind || 'work'}`
+}
+
+// Thai-ish label for the tail-stage step kinds (agent history rows)
+export const STEP_KIND_LABEL = { pr: 'PR', deploy: 'deploy', demo: 'demo' }
+

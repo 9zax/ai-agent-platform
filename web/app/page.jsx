@@ -37,6 +37,9 @@ function mapLive(c) {
     tag: role ? 'purple' : 'blue',
     model: c.labels?.model || 'docker',
     status: st,
+    paused_since: c.paused_since,
+    auto_paused: c.auto_paused,
+    idle_secs: c.idle_secs,
     uptime: '—',
     tasks: '—',
     managed: c.labels?.['managed-by'] === 'ai-agent-platform',
@@ -109,6 +112,7 @@ export default function Dashboard() {
     }), [rows, query, filter, showAll])
 
   const running = rows.filter(r => r.managed && (r.status === 'running' || r.status === 'busy')).length
+  const pausedCount = rows.filter(r => r.managed && r.status === 'paused').length
   const managedCount = rows.filter(r => r.managed).length
 
   return (
@@ -142,7 +146,7 @@ export default function Dashboard() {
             </div>
             <div className="mt-2 text-[27px] font-bold tracking-tight">{managedCount}</div>
             <div className="mt-2 text-[11.5px] text-muted-foreground/70">
-              <span className="font-semibold text-emerald-400">{running} running</span> · {managedCount - running} idle
+              <span className="font-semibold text-emerald-400">{running} running</span> · {pausedCount > 0 && <><span className="font-semibold text-cyan-400">{pausedCount} paused</span> · </>}{managedCount - running} idle
             </div>
           </Card>
           <Card className="p-4" data-testid="stat-tasks">
@@ -178,6 +182,7 @@ export default function Dashboard() {
                   <SelectItem value="all">All Status</SelectItem>
                   <SelectItem value="running">Running</SelectItem>
                   <SelectItem value="busy">Busy</SelectItem>
+                  <SelectItem value="paused">Paused</SelectItem>
                   <SelectItem value="stopped">Stopped</SelectItem>
                 </SelectContent>
               </Select>

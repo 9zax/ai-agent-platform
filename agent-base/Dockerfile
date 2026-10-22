@@ -20,7 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     novnc \
     websockify \
     git \
-    gh \
     curl \
     wget \
     jq \
@@ -49,6 +48,21 @@ RUN case "$(dpkg --print-architecture)" in \
         | tar -xz -C /usr/local --strip-components=1 \
     && node -v && npm -v
 
+# Docker CLI + compose v2 plugin — agents talk to the HOST daemon via the
+# mounted /var/run/docker.sock (the deploy stage runs `docker compose up` for
+# real). Static binaries; dpkg arch maps to Docker's static arch names.
+RUN case "$(dpkg --print-architecture)" in \
+        arm64) DARCH=aarch64 ;; \
+        *) DARCH=x86_64 ;; \
+    esac && \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${DARCH}/docker-27.5.1.tgz" \
+        | tar -xz -C /tmp && mv /tmp/docker/docker /usr/local/bin/docker && rm -rf /tmp/docker && \
+    mkdir -p /usr/local/lib/docker/cli-plugins && \
+    curl -fsSL "https://github.com/docker/compose/releases/download/v2.34.0/docker-compose-linux-${DARCH}" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
+    docker --version && docker compose version
+
 # Real browser, exposed uniformly as /usr/local/bin/chromium:
 # - amd64 gets Google Chrome (official .deb)
 # - arm64 (Apple Silicon) gets Chromium via Playwright — Google ships no arm64
@@ -71,6 +85,16 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # list above never invalidate the big browser layer in the build cache.
 RUN apt-get update && apt-get install -y --no-install-recommends xfonts-base \
     && rm -rf /var/lib/apt/lists/*
+
+# gh CLI from GitHub's official repo. Ubuntu 22.04's apt build (2.4.0, 2022)
+# is too old for `gh auth git-credential`, so the GitHub connector's
+# `gh auth setup-git` leaves git unable to authenticate — install latest.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/* && gh --version
 
 RUN mkdir -p /root/.vnc /root/Desktop \
     && echo "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd \

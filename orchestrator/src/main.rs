@@ -39,6 +39,8 @@ const GH_DEVICE_SCOPE: &str = "repo read:org gist workflow";
 /// Derived per-container connector status is cached this many seconds so the
 /// UI's 5s polls don't exec `gh auth status` in every container constantly.
 const CONNECTOR_CACHE_TTL: u64 = 10;
+/// How often the idle sweeper evaluates auto-pause candidates.
+const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Default tool belt — every agent's Linux box gets these, and every prompt
@@ -299,6 +301,10 @@ struct AiConfig {
     git_token: String,
     /// sha256 hex of the admin password that gates console access to all containers ("" = no gate)
     admin_password_hash: String,
+    /// auto-pause containers that have been idle this long (idle sweeper enforces)
+    auto_pause_enabled: bool,
+    /// idle threshold in seconds before the sweeper stops a container
+    idle_timeout_secs: u64,
 }
 
 impl Default for AiConfig {
@@ -312,6 +318,8 @@ impl Default for AiConfig {
             ai_api_key: String::new(),
             git_token: String::new(),
             admin_password_hash: String::new(),
+            auto_pause_enabled: true,
+            idle_timeout_secs: 900,
         }
     }
 }
@@ -461,6 +469,18 @@ struct CachedConnectorStatus {
     at: u64,
 }
 
+/// A container this platform stopped itself (manual Pause or the idle sweeper).
+/// Docker labels are immutable after creation, so this app-side registry —
+/// persisted to /data/paused.json — is the source of truth for "paused"
+/// (as opposed to a container the user stopped directly).
+#[derive(Clone, Serialize, Deserialize)]
+struct PausedInfo {
+    /// unix secs when the pause happened
+    since: u64,
+    /// true = idle sweeper, false = a human pressed Pause
+    auto: bool,
+}
+
 struct Store {
     personas: Vec<Persona>,
     tasks: Vec<Task>,
@@ -475,6 +495,10 @@ struct Store {
     pending_device_flows: HashMap<String, PendingDeviceFlow>,
     /// container id → recently probed connector status (CONNECTOR_CACHE_TTL)
     connector_cache: HashMap<String, CachedConnectorStatus>,
+    /// container name → platform-paused info (persisted, /data/paused.json)
+    paused: HashMap<String, PausedInfo>,
+    /// container name → unix secs of last real activity (in-memory only)
+    last_activity: HashMap<String, u64>,
     task_counter: usize,
     project_counter: usize,
     run_counter: usize,
@@ -500,6 +524,8 @@ impl Default for Store {
             models_cache: None,
             pending_device_flows: HashMap::new(),
             connector_cache: HashMap::new(),
+            paused: HashMap::new(),
+            last_activity: HashMap::new(),
             task_counter: 0,
             project_counter: 1,
             run_counter: 0,
@@ -602,6 +628,8 @@ struct ConfigUpdate {
     ai_api_key: Option<String>,
     git_token: Option<String>,
     admin_password: Option<String>,
+    auto_pause_enabled: Option<bool>,
+    idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -665,9 +693,12 @@ impl App {
         c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_else(|| "unknown".into())
     }
 
-    /// Find this platform's running container for a persona role → (id, name)
+    /// Find this platform's container for a persona role → (id, name).
+    /// Running first; otherwise a PLATFORM-paused one is revived on the spot
+    /// (the idle sweeper may have stopped it hours ago). User-stopped
+    /// containers stay invisible — runs keep their degrade-to-text semantics.
     async fn agent_container(&self, role: &str) -> Option<(String, String)> {
-        let docker = self.docker.as_ref()?;
+        let docker = self.docker.as_ref()?.clone();
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![
             format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
@@ -675,12 +706,91 @@ impl App {
         ]);
         let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
         let list = docker.list_containers(Some(opts)).await.ok()?;
-        list.into_iter()
-            .find(|c| c.state.as_ref().map(|s| s.to_string() == "running").unwrap_or(false))
-            .map(|c| (
+        let mut exited: Option<(String, String)> = None;
+        for c in list {
+            let pair = (
                 c.id.clone().unwrap_or_default(),
                 c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            ))
+            );
+            match c.state.as_ref().map(|s| s.to_string()).unwrap_or_default() {
+                s if s == "running" => {
+                    self.touch_activity(&pair.1);
+                    return Some(pair);
+                }
+                s if s == "exited" && exited.is_none() => exited = Some(pair),
+                _ => {}
+            }
+        }
+        if let Some((id, name)) = exited {
+            let paused = self.store.lock().unwrap().paused.contains_key(&name);
+            if paused && self.resume_paused(&id, &name).await {
+                return Some((id, name));
+            }
+        }
+        None
+    }
+
+    fn mark_paused(&self, name: &str, auto: bool) {
+        let mut store = self.store.lock().unwrap();
+        store.paused.insert(name.to_string(), PausedInfo { since: now_secs(), auto });
+        store.last_activity.remove(name);
+        save_paused(&store);
+    }
+
+    fn clear_paused(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        if store.paused.remove(name).is_some() {
+            save_paused(&store);
+        }
+        store.last_activity.insert(name.to_string(), now_secs());
+    }
+
+    fn touch_activity(&self, name: &str) {
+        self.store.lock().unwrap().last_activity.insert(name.to_string(), now_secs());
+    }
+
+    /// Start a platform-paused container back and clear its registry entry.
+    /// Idempotent: docker 304 (already started) counts as success.
+    async fn resume_paused(&self, id: &str, name: &str) -> bool {
+        let Some(docker) = self.docker.as_ref() else { return false };
+        match docker.start_container(id, None::<StartContainerOptions>).await {
+            Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+            Err(e) => {
+                eprintln!("resume of paused container '{name}' failed: {e}");
+                return false;
+            }
+        }
+        for _ in 0..10 {
+            if let Ok(c) = self.inspect(id).await {
+                if App::status_of(&c) == "running" {
+                    self.clear_paused(name);
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        false
+    }
+
+    /// Guard for ident-based endpoints (exec / agent command / terminal):
+    /// running → pass through; platform-paused → transparently revive;
+    /// anything else → clear error telling the user what to press.
+    async fn ensure_running(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
+        let managed = self.inspect_managed(ident).await?;
+        let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
+        let status = App::status_of(&managed);
+        if status == "running" {
+            self.touch_activity(&name);
+            return Ok(managed);
+        }
+        if status == "exited" && self.store.lock().unwrap().paused.contains_key(&name) {
+            let id = managed.id.clone().unwrap_or_default();
+            if self.resume_paused(&id, &name).await {
+                return self.inspect(&id).await;
+            }
+            return Err(err(StatusCode::CONFLICT, "Container is resuming — try again in a moment"));
+        }
+        Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status}) — press Start or Resume")))
     }
 
     async fn exec_in(&self, container_id: &str, command: &str) -> Result<(i64, String), ApiError> {
@@ -793,7 +903,10 @@ impl App {
     /// Make sure the default tool belt works in this container (the "every
     /// Linux box has the same defaults" rule): install the small core set when
     /// missing (apk/apt, best-effort), register the configured GitHub PAT with
-    /// `gh` AND git's URL rewrite so private repos just work, and set a git
+    /// `gh` AND git's URL rewrite so private repos just work — but only when gh
+    /// is not already logged in: a per-container connector login (GitHub
+    /// connector) wins over the platform PAT, and a leftover PAT URL rewrite is
+    /// cleared so gh's credential helper governs push/pull. Also sets a git
     /// identity so commits never fail. Best-effort and silent — the manifest
     /// probe right after reports what the box really has.
     async fn ensure_tools(&self, container_id: &str) {
@@ -811,11 +924,19 @@ impl App {
                  command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq {apt} >/dev/null 2>&1; \
              fi; \
              if [ -n '{git_token}' ]; then \
-                 command -v gh >/dev/null 2>&1 && printf '%s' '{git_token}' | gh auth login --with-token >/dev/null 2>&1; \
-                 command -v git >/dev/null 2>&1 && git config --global url.\"https://x-access-token:{git_token}@github.com/\".insteadOf https://github.com/ >/dev/null 2>&1; \
+                 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then \
+                     git config --global --unset-all url.\"https://x-access-token:{git_token}@github.com/\".insteadOf >/dev/null 2>&1; \
+                 else \
+                     command -v gh >/dev/null 2>&1 && printf '%s' '{git_token}' | gh auth login --with-token >/dev/null 2>&1; \
+                     command -v git >/dev/null 2>&1 && git config --global url.\"https://x-access-token:{git_token}@github.com/\".insteadOf https://github.com/ >/dev/null 2>&1; \
+                 fi; \
              fi; \
              command -v git >/dev/null 2>&1 && {{ git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
                  git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }}; \
+             if [ -S /var/run/docker.sock ] && ! command -v docker >/dev/null 2>&1; then \
+                 command -v apk >/dev/null 2>&1 && apk add --no-cache docker-cli docker-cli-compose >/dev/null 2>&1; \
+                 command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq docker.io >/dev/null 2>&1; \
+             fi; \
              exit 0"
         );
         let _ = self.exec_in(container_id, &script).await;
@@ -963,8 +1084,18 @@ impl App {
         let data: Value = resp.json().await
             .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("AI request failed: {e}")))?;
 
+        // content arrives as a plain string or, on some OpenAI-compatible
+        // servers, as an array of typed parts — accept both shapes
         let text = if template.protocol == "openai" {
-            data.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            let content = data.pointer("/choices/0/message/content");
+            content.and_then(|v| v.as_str()).map(str::to_string)
+                .or_else(|| content.and_then(|v| v.as_array()).map(|parts| {
+                    parts.iter()
+                        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<String>()
+                }))
+                .unwrap_or_default()
         } else {
             data.get("content").and_then(|c| c.as_array()).map(|parts| {
                 parts.iter()
@@ -973,7 +1104,23 @@ impl App {
                     .collect::<String>()
             }).unwrap_or_default()
         };
-        Ok(text.trim().to_string())
+        let text = text.trim().to_string();
+        if !text.is_empty() { return Ok(text); }
+
+        // 200 but no usable text — name the likely cause instead of a bare
+        // empty string, so callers (llm_retry) and the UI can react to it
+        let stop = if template.protocol == "openai" {
+            data.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()).unwrap_or("")
+        } else {
+            data.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("")
+        };
+        let reason = match stop {
+            "length" | "max_tokens" => format!(
+                "model '{model}' hit the {max_tokens}-token cap before writing any text (reasoning models spend the budget on thinking) — raise the limit or use a non-reasoning model"),
+            "content_filter" => format!("model '{model}' filtered the answer (content_filter)"),
+            _ => format!("model '{model}' returned an empty answer"),
+        };
+        Err(err(StatusCode::BAD_GATEWAY, reason))
     }
 }
 
@@ -1117,15 +1264,37 @@ async fn list_containers(State(app): State<App>, Query(q): Query<ListQuery>) -> 
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    let (paused, last_activity) = {
+        let store = app.store.lock().unwrap();
+        (store.paused.clone(), store.last_activity.clone())
+    };
+    let now = now_secs();
+
     let mut rows = Vec::new();
     for c in list {
-        rows.push(json!({
+        let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+        // exited + registered = platform-paused (manual or idle sweeper)
+        let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into());
+        let mut row = json!({
             "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
-            "name": c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            "status": c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()),
+            "name": name,
+            "status": &status,
             "image": c.image.clone().unwrap_or_else(|| "unknown".into()),
             "labels": c.labels.clone().unwrap_or_default(),
-        }));
+        });
+        if status == "exited" {
+            if let Some(p) = paused.get(&name) {
+                status = "paused".into();
+                row["status"] = json!("paused");
+                row["paused_since"] = json!(p.since);
+                row["auto_paused"] = json!(p.auto);
+            }
+        }
+        if status == "running" {
+            let last = last_activity.get(&name).copied().unwrap_or(now);
+            row["idle_secs"] = json!(now.saturating_sub(last));
+        }
+        rows.push(row);
     }
     Ok(json_ok(Value::Array(rows)))
 }
@@ -1152,7 +1321,13 @@ async fn create_container(State(app): State<App>, headers: axum::http::HeaderMap
         cmd,
         host_config: Some(bollard::models::HostConfig {
             network_mode: Some(AGENT_NETWORK.to_string()),
-            binds: Some(vec![format!("{WORKSPACE_VOLUME}:/workspace")]),
+            // docker.sock: the deploy stage runs `docker compose up` from inside
+            // an agent container against the HOST daemon (accepted risk: single-
+            // user platform, the orchestrator already holds the full socket).
+            binds: Some(vec![
+                format!("{WORKSPACE_VOLUME}:/workspace"),
+                "/var/run/docker.sock:/var/run/docker.sock".to_string(),
+            ]),
             ..Default::default()
         }),
         ..Default::default()
@@ -1165,6 +1340,7 @@ async fn create_container(State(app): State<App>, headers: axum::http::HeaderMap
     docker.start_container(&created.id, None::<StartContainerOptions>)
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    app.touch_activity(&req.name);
     let inspect = app.inspect(&created.id).await?;
 
     Ok(json_ok(json!({
@@ -1179,10 +1355,45 @@ async fn container_action(State(app): State<App>, headers: axum::http::HeaderMap
     let docker = app.docker()?;
     let managed = app.inspect_managed(&ident).await?;
     let id = managed.id.clone().unwrap_or_default();
+    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
     let result: Result<(), bollard::errors::Error> = match action.as_str() {
-        "start" => docker.start_container(&id, None::<StartContainerOptions>).await,
-        "stop" => docker.stop_container(&id, None::<StopContainerOptions>).await,
-        "restart" => docker.restart_container(&id, None::<RestartContainerOptions>).await,
+        "start" => {
+            let r = docker.start_container(&id, None::<StartContainerOptions>).await;
+            if r.is_ok() { app.clear_paused(&name); }
+            r
+        }
+        "stop" => {
+            // A user stop must never keep rendering as platform-paused.
+            let r = docker.stop_container(&id, None::<StopContainerOptions>).await;
+            if r.is_ok() { app.clear_paused(&name); }
+            r
+        }
+        "restart" => {
+            let r = docker.restart_container(&id, None::<RestartContainerOptions>).await;
+            if r.is_ok() { app.clear_paused(&name); }
+            r
+        }
+        "pause" => {
+            // Platform pause = real docker stop (frees RAM on the host) + a
+            // registry entry so the UI can tell it apart from a user stop.
+            return match docker.stop_container(&id, None::<StopContainerOptions>).await {
+                Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {
+                    app.mark_paused(&name, false);
+                    Ok(json_ok(json!({
+                        "id": id.chars().take(12).collect::<String>(),
+                        "name": name,
+                        "status": "paused",
+                    })))
+                }
+                Err(e) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
+            };
+        }
+        "resume" => {
+            if !app.resume_paused(&id, &name).await {
+                return Err(err(StatusCode::BAD_REQUEST, "could not resume container"));
+            }
+            Ok(())
+        }
         other => return Err(err(StatusCode::NOT_FOUND, format!("Unknown action '{other}'"))),
     };
     result.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -1198,20 +1409,24 @@ async fn delete_container(State(app): State<App>, headers: axum::http::HeaderMap
     app.require_auth(&headers)?;
     let managed = app.inspect_managed(&ident).await?;
     let id = managed.id.clone().unwrap_or_default();
+    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
     app.docker()?
         .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    {
+        let mut store = app.store.lock().unwrap();
+        if store.paused.remove(&name).is_some() {
+            save_paused(&store);
+        }
+        store.last_activity.remove(&name);
+    }
     Ok(json_ok(json!({ "id": ident, "status": "deleted" })))
 }
 
 async fn exec_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
+    let managed = app.ensure_running(&ident).await?;
     let (exit_code, output) = app.exec_in(managed.id.as_deref().unwrap_or_default(), &req.command).await?;
     Ok(json_ok(json!({ "exit_code": exit_code, "output": output })))
 }
@@ -1240,17 +1455,14 @@ async fn terminal_ws(
             return (StatusCode::UNAUTHORIZED, "Login required").into_response();
         }
     }
-    let managed = match app.inspect_managed(&ident).await {
+    let managed = match app.ensure_running(&ident).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return (StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")).into_response();
-    }
     let container_id = managed.id.unwrap_or_default();
+    let container_name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
     let initial = (params.cols.unwrap_or(80), params.rows.unwrap_or(24));
-    ws.on_upgrade(move |socket| terminal_session(app, socket, container_id, initial))
+    ws.on_upgrade(move |socket| terminal_session(app, socket, container_id, container_name, initial))
 }
 
 /// Pick the best interactive shell available inside the container.
@@ -1265,8 +1477,9 @@ async fn pick_shell(app: &App, container_id: &str) -> &'static str {
 
 /// Bridge a browser terminal to a real PTY-backed shell via `docker exec`.
 /// Binary frames carry terminal bytes both ways; text frames are control
-/// messages (`{"resize":{"cols":n,"rows":r}}`).
-async fn terminal_session(app: App, socket: WebSocket, container_id: String, (cols, rows): (u16, u16)) {
+/// messages (`{"resize":{"cols":n,"rows":r}}`). Every browser frame counts
+/// as container activity so the idle sweeper leaves live sessions alone.
+async fn terminal_session(app: App, socket: WebSocket, container_id: String, container_name: String, (cols, rows): (u16, u16)) {
     let mut socket = socket;
     let docker = match app.docker() {
         Ok(d) => d.clone(),
@@ -1327,6 +1540,7 @@ async fn terminal_session(app: App, socket: WebSocket, container_id: String, (co
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(data) => {
+                app.touch_activity(&container_name);
                 if input.write_all(&data).await.is_err() {
                     break;
                 }
@@ -1397,6 +1611,21 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
         _ => (Value::Null, Value::Null),
     };
 
+    // exited + registered = platform-paused; the detail page's stats poll
+    // uses this field to keep its status badge in sync (sweeper, auto-resume).
+    let name = inspect.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
+    let mut status = App::status_of(&inspect);
+    let mut paused_since = Value::Null;
+    let mut auto_paused = Value::Null;
+    if status == "exited" {
+        let store = app.store.lock().unwrap();
+        if let Some(p) = store.paused.get(&name) {
+            status = "paused".into();
+            paused_since = json!(p.since);
+            auto_paused = json!(p.auto);
+        }
+    }
+
     Ok(json_ok(json!({
         "cpu_percent": (cpu_percent * 100.0).round() / 100.0,
         "mem_used": mem_used,
@@ -1405,7 +1634,9 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
         "net_tx": net_tx,
         "disk_used": disk_used,
         "disk_total": disk_total,
-        "status": App::status_of(&inspect),
+        "status": status,
+        "paused_since": paused_since,
+        "auto_paused": auto_paused,
     })))
 }
 
@@ -1691,16 +1922,27 @@ async fn github_connect(State(app): State<App>, headers: axum::http::HeaderMap, 
         return Err(err(StatusCode::BAD_REQUEST, "gh CLI not found in this container — create it from the agent-base image to connect GitHub"));
     }
 
-    // Idempotent: an unexpired pending flow returns its code so a re-opened
-    // dialog resumes instead of minting a second flow
+    let (user_code, verification_url, expires_in) = start_github_device_flow(&app, &container_id).await?;
+    Ok(json_ok(json!({ "user_code": user_code, "verification_url": verification_url, "expires_in": expires_in })))
+}
+
+/// Start (or resume) a GitHub device flow for a container: mint a device code
+/// from GitHub, remember it as this container's pending flow, and spawn the
+/// background poll that injects the token once the user approves. Pure flow
+/// mechanics — callers gate on the container running and gh being installed
+/// (their failure modes differ: HTTP 400 vs an honest stage skip). Idempotent:
+/// an unexpired pending flow returns its code so a re-opened dialog (or a
+/// re-run stage) resumes instead of minting a second flow.
+/// Returns (user_code, verification_url, expires_in).
+async fn start_github_device_flow(app: &App, container_id: &str) -> Result<(String, String, u64), ApiError> {
     let existing = {
         let store = app.store.lock().unwrap();
-        store.pending_device_flows.get(&container_id)
+        store.pending_device_flows.get(container_id)
             .filter(|f| f.expires_at > now_secs())
             .map(|f| (f.user_code.clone(), f.verification_url.clone(), f.expires_at.saturating_sub(now_secs())))
     };
     if let Some((user_code, verification_url, expires_in)) = existing {
-        return Ok(json_ok(json!({ "user_code": user_code, "verification_url": verification_url, "expires_in": expires_in })));
+        return Ok((user_code, verification_url, expires_in));
     }
 
     let client = reqwest::Client::builder()
@@ -1730,7 +1972,7 @@ async fn github_connect(State(app): State<App>, headers: axum::http::HeaderMap, 
 
     {
         let mut store = app.store.lock().unwrap();
-        store.pending_device_flows.insert(container_id.clone(), PendingDeviceFlow {
+        store.pending_device_flows.insert(container_id.to_string(), PendingDeviceFlow {
             device_code,
             user_code: user_code.clone(),
             verification_url: verification_url.clone(),
@@ -1742,10 +1984,10 @@ async fn github_connect(State(app): State<App>, headers: axum::http::HeaderMap, 
     }
 
     let poll_app = app.clone();
-    let poll_id = container_id.clone();
+    let poll_id = container_id.to_string();
     tokio::spawn(async move { poll_github_device_flow(poll_app, poll_id).await });
 
-    Ok(json_ok(json!({ "user_code": user_code, "verification_url": verification_url, "expires_in": expires_in })))
+    Ok((user_code, verification_url, expires_in))
 }
 
 /// Validate a GitHub token against the API, derive the git commit identity
@@ -1776,7 +2018,12 @@ async fn inject_github_token(app: &App, container_id: &str, token: &str) -> Resu
     // Inject credentials via exec ENV — the token never shows up in `ps`
     // output or shell history. GH_LOGIN_TOKEN, not GH_TOKEN: gh special-cases
     // GH_TOKEN and would refuse `login --with-token` / mask stored creds.
-    let login_script = r#"printf %s "$GH_LOGIN_TOKEN" | gh auth login --with-token --hostname github.com && gh auth setup-git && git config --global user.name "$GIT_USER_NAME" && git config --global user.email "$GIT_USER_EMAIL""#;
+    // The trailing block drops any platform-PAT `url.*.insteadOf` rewrite
+    // (ensure_tools may have written one before this login existed) so gh's
+    // credential helper governs github.com from here on. Keys are read from
+    // gitconfig at runtime — the platform token is never in this command
+    // string, and the connector token still rides only the exec ENV.
+    let login_script = r#"printf %s "$GH_LOGIN_TOKEN" | gh auth login --with-token --hostname github.com && gh auth setup-git && git config --global user.name "$GIT_USER_NAME" && git config --global user.email "$GIT_USER_EMAIL" && { git config --global --get-regexp '^url\..*\.insteadof$' 2>/dev/null | while IFS=' ' read -r k _v; do case "$k" in *x-access-token*) git config --global --unset-all "$k" >/dev/null 2>&1 || true;; esac; done; true; }"#;
     let (code, _) = app.exec_in_env(container_id, login_script, vec![
         format!("GH_LOGIN_TOKEN={token}"),
         format!("GIT_USER_NAME={user_name}"),
@@ -1792,6 +2039,9 @@ async fn inject_github_token(app: &App, container_id: &str, token: &str) -> Resu
             reason: None,
             at: now_secs(),
         });
+        // a completed login voids any pending device flow for this container —
+        // a late approval must not re-inject a different account over this one
+        store.pending_device_flows.remove(container_id);
         Ok(login)
     } else {
         // container stopped/deleted mid-flow — the next probe re-derives reality
@@ -2035,11 +2285,7 @@ async fn github_open_browser(State(app): State<App>, headers: axum::http::Header
 
 async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
+    let managed = app.ensure_running(&ident).await?;
 
     let role_label = managed.config.as_ref()
         .and_then(|c| c.labels.as_ref())
@@ -2120,6 +2366,7 @@ async fn list_agents(State(app): State<App>) -> ApiResult {
     };
     let mut running: HashMap<String, Value> = HashMap::new();
     if let Some(docker) = app.docker.as_ref() {
+        let paused = app.store.lock().unwrap().paused.clone();
         let opts = ListContainersOptionsBuilder::new().all(true).build();
         if let Ok(list) = docker.list_containers(Some(opts)).await {
             for c in list {
@@ -2127,9 +2374,15 @@ async fn list_agents(State(app): State<App>) -> ApiResult {
                 if labels.get(MANAGED_LABEL).map(|v| v == MANAGED_VALUE).unwrap_or(false) {
                     if let Some(role) = labels.get("role") {
                         if personas.iter().any(|p| &p.role == role) {
+                            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+                            // exited + registered = platform-paused (manual or idle sweeper)
+                            let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                            if status == "exited" && paused.contains_key(&name) {
+                                status = "paused".into();
+                            }
                             running.insert(role.clone(), json!({
-                                "name": c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-                                "status": c.state.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                                "name": name,
+                                "status": status,
                                 "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
                             }));
                         }
@@ -2209,6 +2462,35 @@ async fn start_agent(State(app): State<App>, headers: axum::http::HeaderMap, Pat
         }
     }
     let name = body.map(|Json(b)| b.name).flatten().unwrap_or_else(|| format!("agent-{role}"));
+    // The container may already exist (stopped, or paused by the idle
+    // sweeper) — docker would 409 on re-creating the same name, so bring
+    // the existing one back up instead.
+    if let Some(docker) = app.docker.as_ref() {
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![
+            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
+            format!("role={role}"),
+        ]);
+        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
+        if let Ok(list) = docker.list_containers(Some(opts)).await {
+            let existing = list.iter().find_map(|c| {
+                let cname = c.names.as_ref()?.first()?.trim_start_matches('/').to_string();
+                (cname == name).then(|| (c.id.clone().unwrap_or_default(), cname, c.state.as_ref().map(|s| s.to_string()).unwrap_or_default()))
+            });
+            if let Some((id, cname, state)) = existing {
+                if state != "running" {
+                    let _ = docker.start_container(&id, None::<StartContainerOptions>).await;
+                }
+                app.clear_paused(&cname);
+                let inspect = app.inspect(&id).await?;
+                return Ok(json_ok(json!({
+                    "id": id.chars().take(12).collect::<String>(),
+                    "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
+                    "status": App::status_of(&inspect),
+                })));
+            }
+        }
+    }
     let req = ContainerCreate { name, role, image: None, command: None };
     create_container(State(app), headers, Json(req)).await
 }
@@ -2273,6 +2555,8 @@ fn config_json(cfg: &AiConfig) -> Value {
         "ai_api_key_masked": masked,
         "git_token_set": !cfg.git_token.is_empty(),
         "admin_password_set": !cfg.admin_password_hash.is_empty(),
+        "auto_pause_enabled": cfg.auto_pause_enabled,
+        "idle_timeout_secs": cfg.idle_timeout_secs,
         "auth_required": auth_enabled(),
     })
 }
@@ -2299,6 +2583,8 @@ async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) ->
         if let Some(v) = req.ai_api_key { if !v.is_empty() { cfg.ai_api_key = v; } }
         if let Some(v) = req.git_token { if !v.is_empty() { cfg.git_token = v.trim().to_string(); } }
         if let Some(v) = req.admin_password { cfg.admin_password_hash = sha256_hex(v.trim()); }
+        if let Some(v) = req.auto_pause_enabled { cfg.auto_pause_enabled = v; }
+        if let Some(v) = req.idle_timeout_secs { cfg.idle_timeout_secs = v.max(60); }
     }
     let cfg = app.store.lock().unwrap().config.clone();
     Ok(json_ok(config_json(&cfg)))
@@ -2518,6 +2804,55 @@ fn load_runs(store: &mut Store) {
     store.runs = runs;
 }
 
+// ---------------------------------------------------------------------------
+// Paused-container registry persistence — /data/paused.json, same atomic
+// tmp+rename write as the runs file. Docker labels can't record "paused",
+// so this file is what keeps platform-paused containers distinguishable
+// from user-stopped ones across orchestrator restarts.
+// ---------------------------------------------------------------------------
+
+fn paused_file() -> std::path::PathBuf {
+    data_dir().join("paused.json")
+}
+
+fn save_paused(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        paused: &'a HashMap<String, PausedInfo>,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { paused: &store.paused }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = paused_file();
+    let tmp = dir.join("paused.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist paused registry to {}", path.display());
+    }
+}
+
+/// Restore the paused registry at boot. Entries whose container vanished
+/// (removed while the orchestrator was down) are dropped lazily — the
+/// sweeper and delete path tolerate stale names.
+fn load_paused(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        paused: HashMap<String, PausedInfo>,
+    }
+    let Ok(raw) = std::fs::read_to_string(paused_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — starting with an empty paused registry", paused_file().display());
+        return;
+    };
+    if !parsed.paused.is_empty() {
+        println!("restored {} paused container(s) from {}", parsed.paused.len(), paused_file().display());
+    }
+    store.paused = parsed.paused;
+}
+
 /// Directory name for a cloned repo URL: last path segment, ".git" stripped,
 /// sanitized to safe filename chars ("repo" when nothing usable remains).
 fn repo_dir_name(repo_url: &str) -> String {
@@ -2552,6 +2887,10 @@ const MAX_LOOP_ITERATIONS: u32 = 8;
 
 /// How long a need-human wait holds the run before the team proceeds with a note.
 const HUMAN_TIMEOUT_SECS: u64 = 3600;
+
+/// Cap for the PR stage's in-mission GitHub device-flow wait (GitHub codes
+/// live ~900s; the wait ends with the earlier of the code's expiry and this).
+const DEVICE_AUTH_WAIT_CAP_SECS: u64 = 900;
 
 /// Host ports for the isolated staging compose project the deploy stage spins
 /// up — never the live 3000/8000, so a deploy can never restart the platform
@@ -2627,7 +2966,7 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
         None => (None, None),
     };
     let mut store = app.store.lock().unwrap();
-    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
         step.status = "done".into();
         step.output = output.to_string();
         step.container = container;
@@ -2742,6 +3081,763 @@ fn escalate_to_human(app: &App, run_id: &str, disc_id: &str, question: &str) {
     }
 }
 
+/// Outcome of the PR stage's in-mission GitHub device-flow wait.
+enum GhAuthOutcome {
+    /// gh is logged in as this account (from the cache or a post-reply recheck)
+    Connected(String),
+    /// the user pressed Stop — finish_run() closes the run
+    Stopped,
+    /// flow expired / denied / disconnected / never started
+    Ended,
+    /// the human replied in chat but gh is still not authenticated
+    RepliedUnauthed,
+}
+
+/// Open the PR stage's GitHub auth request: a need-human discussion carrying
+/// the device-flow code + URL, with the run flipped to waiting_human so the
+/// whole UI (badge, inbox, reply form) lights up. Returns the discussion id.
+fn raise_github_auth_discussion(app: &App, run_id: &str, dev_role: &str, user_code: &str, verification_url: &str, expires_in: u64) -> String {
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        let disc_id = format!("d-{:03}", run.discussions.len() + 1);
+        let mins = expires_in.max(60) / 60;
+        run.status = "waiting_human".into();
+        run.discussions.push(Discussion {
+            id: disc_id.clone(),
+            kind: String::new(),
+            from: dev_role.into(),
+            to: vec!["human".into()],
+            topic: "GitHub connector — อนุมัติสิทธิ์ push เพื่อเปิด PR".into(),
+            status: "need_human".into(),
+            answering: Some("human".into()),
+            messages: vec![MeetingMessage {
+                from: "orchestrator".into(),
+                text: format!("🐙 ขั้นตอน PR ต้องใช้สิทธิ์ GitHub — อนุมัติให้ container ของ Dev:\n1) เปิด {verification_url}\n2) ใส่รหัส {user_code} (หมดอายุใน ~{mins} นาที)\nเชื่อมต่อสำเร็จแล้วทีมจะ push และเปิด PR ต่อทันที หรือพิมพ์ตอบในแชทเพื่อให้ตรวจสอบอีกครั้ง/ข้ามขั้นนี้"),
+                at: now_secs(),
+            }],
+            round: run.round,
+            created_at: now_secs(),
+        });
+        save_runs(&store);
+        disc_id
+    } else {
+        String::new()
+    }
+}
+
+/// Wait for the in-mission device flow to land. The connector cache flipping
+/// to connected is the success signal — inject_github_token writes it only
+/// after a real in-container login, and `at >= baseline` (captured before the
+/// flow started, which also clears the key) rules out any stale hit. The
+/// pending flow disappearing without a connection means expired/denied/
+/// disconnected. A chat reply from the human triggers ONE authoritative
+/// `gh auth status` recheck (they may have pasted a token via the connector
+/// page, or told the team to skip). 1s ticks, lock never held across an
+/// await — same discipline as wait_for_human.
+async fn wait_for_github_auth(app: &App, run_id: &str, disc_id: &str, container_id: &str, baseline: u64, deadline: u64) -> GhAuthOutcome {
+    let cache_key = format!("{container_id}:github");
+    let mut human_seen = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
+            .map(|d| d.messages.iter().filter(|m| m.from == "human").count())
+            .unwrap_or(0)
+    };
+    loop {
+        let mut human_replied = false;
+        {
+            let store = app.store.lock().unwrap();
+            let run = match store.runs.iter().find(|r| r.id == run_id) {
+                Some(r) => r,
+                None => return GhAuthOutcome::Ended,
+            };
+            if run.stop_requested {
+                // leave the status as-is — finish_run() closes the run properly
+                return GhAuthOutcome::Stopped;
+            }
+            if let Some(c) = store.connector_cache.get(&cache_key) {
+                if c.state == "connected" && c.at >= baseline {
+                    return GhAuthOutcome::Connected(c.login.clone().unwrap_or_else(|| "github".into()));
+                }
+            }
+            // success writes the cache BEFORE the poll task drops the flow, so
+            // a missing flow with no fresh "connected" is a real end
+            if !store.pending_device_flows.contains_key(container_id) {
+                return GhAuthOutcome::Ended;
+            }
+            if let Some(disc) = run.discussions.iter().find(|d| d.id == disc_id) {
+                human_replied = disc.messages.iter().filter(|m| m.from == "human").count() > human_seen;
+            }
+            if now_secs() >= deadline {
+                return GhAuthOutcome::Ended;
+            }
+        }
+        if human_replied {
+            let (code, _) = app.exec_in(container_id, "command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1")
+                .await
+                .unwrap_or((1, String::new()));
+            return if code == 0 { GhAuthOutcome::Connected("github".into()) } else { GhAuthOutcome::RepliedUnauthed };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        human_seen = {
+            let store = app.store.lock().unwrap();
+            store.runs.iter().find(|r| r.id == run_id)
+                .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
+                .map(|d| d.messages.iter().filter(|m| m.from == "human").count())
+                .unwrap_or(human_seen)
+        };
+    }
+}
+
+/// The PR stage's GitHub auth rescue: mint a device code, surface it in the
+/// mission chat as a need-human request, and wait for the user to approve in
+/// the browser (or reply in chat / Stop / expiry). On a non-connected,
+/// non-stopped outcome the pending flow is dropped so a late approval cannot
+/// silently log the container in after the stage already moved on.
+async fn try_in_mission_github_auth(app: &App, run_id: &str, dev_role: &str, container_id: &str) -> GhAuthOutcome {
+    let baseline = now_secs();
+    let (user_code, verification_url, expires_in) = match start_github_device_flow(app, container_id).await {
+        Ok(x) => x,
+        // GitHub unreachable — nothing to ask the human for; the caller's skip
+        // note carries the reason
+        Err(_) => return GhAuthOutcome::Ended,
+    };
+    let disc_id = raise_github_auth_discussion(app, run_id, dev_role, &user_code, &verification_url, expires_in);
+    let deadline = baseline + expires_in.min(DEVICE_AUTH_WAIT_CAP_SECS);
+    let outcome = wait_for_github_auth(app, run_id, &disc_id, container_id, baseline, deadline).await;
+
+    {
+        let mut store = app.store.lock().unwrap();
+        // finish_run() resolves the discussion on Stop, and the flow may still
+        // complete there for future runs — only Ended/RepliedUnauthed void it
+        if !matches!(outcome, GhAuthOutcome::Connected(_) | GhAuthOutcome::Stopped) {
+            store.pending_device_flows.remove(container_id);
+        }
+        if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+            if let Some(disc) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                match &outcome {
+                    GhAuthOutcome::Connected(login) => {
+                        if run.status == "waiting_human" { run.status = "running".into(); }
+                        disc.status = "resolved".into();
+                        disc.answering = None;
+                        disc.messages.push(MeetingMessage {
+                            from: "orchestrator".into(),
+                            text: format!("✅ GitHub connected as @{login} — pushing branch and opening the PR"),
+                            at: now_secs(),
+                        });
+                    }
+                    GhAuthOutcome::Stopped => {}
+                    GhAuthOutcome::Ended | GhAuthOutcome::RepliedUnauthed => {
+                        if run.status == "waiting_human" { run.status = "running".into(); }
+                        disc.status = "resolved".into();
+                        disc.answering = None;
+                        let why = if matches!(outcome, GhAuthOutcome::RepliedUnauthed) {
+                            "ยังไม่พบสิทธิ์ GitHub หลังคำตอบของคุณ"
+                        } else {
+                            "หมดเวลาอนุมัติ GitHub (โค้ดหมดอายุ)"
+                        };
+                        disc.messages.push(MeetingMessage {
+                            from: "orchestrator".into(),
+                            text: format!("{why} — ข้ามขั้น PR ไว้ (mission branch ยังอยู่ใน container เรียกใช้ได้เมื่อเชื่อมต่อแล้ว)"),
+                            at: now_secs(),
+                        });
+                    }
+                }
+            }
+        }
+        save_runs(&store);
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Tail stages — after QA verifies: a REAL pull request, a REAL isolated
+// staging deploy, then the PO acceptance demo session
+// ---------------------------------------------------------------------------
+
+/// What the PR stage actually achieved. `status` mirrors the step status
+/// (done | skipped | error); when done, `url` is the real github.com PR link.
+struct PrOutcome { status: String, url: String, branch: String, note: String }
+
+impl PrOutcome {
+    /// One-line truth for prompts and the demo "delivery of record".
+    fn describe(&self) -> String {
+        if self.status == "done" {
+            format!("Pull request OPEN: {} (branch `{}`)", self.url, self.branch)
+        } else {
+            format!("Pull request {}: {}", self.status, self.note)
+        }
+    }
+}
+
+/// Same for the staging deploy. `url` is the staging web URL when done.
+struct DeployOutcome { status: String, url: String, note: String }
+
+impl DeployOutcome {
+    fn describe(&self) -> String {
+        if self.status == "done" {
+            format!("Staging DEPLOYED: {} ({})", self.url, self.note)
+        } else {
+            format!("Staging deploy {}: {}", self.status, self.note)
+        }
+    }
+}
+
+/// Flip a tail step's status/output. Tail steps are found by role+kind — the
+/// same persona can own work/pr/deploy steps in one run.
+async fn step_transition(app: &App, run_id: &str, role: &str, kind: &str, status: &str, output: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+        .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == kind))
+    {
+        step.status = status.into();
+        step.output = output.to_string();
+        if status == "working" { step.started_at = now_secs(); }
+        if status == "done" || status == "error" || status == "skipped" { step.finished_at = now_secs(); }
+    }
+    save_runs(&store);
+}
+
+/// Append the three tail steps (pr / deploy / demo) as pending, in execution order.
+async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &str) {
+    let personas = app.store.lock().unwrap().personas.clone();
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        let name_of = |role: &str| personas.iter().find(|p| p.role == role).map(|p| p.name.clone()).unwrap_or_else(|| role.to_string());
+        let mk = |role: &str, kind: &str, title: &str| RunStep {
+            role: role.into(), name: name_of(role), title: title.into(), kind: kind.into(),
+            status: "pending".into(), output: String::new(),
+            model: None, container: None, deliverable: None, rev: None,
+            started_at: 0, finished_at: 0,
+        };
+        run.steps.push(mk(dev_role, "pr", "Open Pull Request"));
+        run.steps.push(mk(dev_role, "deploy", "Deploy Staging"));
+        run.steps.push(mk(po_role, "demo", "Acceptance Demo"));
+        save_runs(&store);
+    }
+}
+
+/// Single line, single-quoted-sh-safe, capped.
+fn one_line(s: &str, max_chars: usize) -> String {
+    let flat: String = s.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();
+    flat.trim().chars().take(max_chars).collect()
+}
+
+/// First github.com .../pull/N URL in the text, else None. Used to capture the
+/// REAL PR link out of `gh pr create` output — never fabricated.
+fn extract_pr_url(text: &str) -> Option<String> {
+    let idx = text.find("https://github.com/")?;
+    let rest = &text[idx..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',']);
+    if url.contains("/pull/") { Some(url.to_string()) } else { None }
+}
+
+/// "VERDICT: PASS|FAIL" from the last matching line (case-insensitive,
+/// backtick/asterisk tolerant, Thai ผ่าน/ไม่ผ่าน accepted). None = no verdict
+/// line at all.
+fn parse_verdict(text: &str) -> Option<String> {
+    for line in text.lines().rev() {
+        let clean = line.trim().trim_matches(['`', '*', ' ']);
+        let lower = clean.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("verdict:") {
+            let v = rest.trim();
+            if v.starts_with("pass") { return Some("pass".into()); }
+            if v.starts_with("fail") { return Some("fail".into()); }
+            if v.starts_with("ผ่าน") { return Some("pass".into()); }
+            if v.starts_with("ไม่ผ่าน") { return Some("fail".into()); }
+        }
+    }
+    None
+}
+
+/// TITLE:/BODY: block out of the LLM's PR-text reply, with honest fallbacks.
+fn parse_pr_text(reply: &str, task: &str, run_id: &str) -> (String, String) {
+    let mut title = String::new();
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in reply.lines() {
+        let lower = line.trim().to_lowercase();
+        if !in_body && lower.starts_with("title:") {
+            title = line.trim()[6..].trim().to_string();
+        } else if lower.starts_with("body:") {
+            body = line.trim()[5..].trim().to_string();
+            in_body = true;
+        } else if in_body {
+            body.push('\n');
+            body.push_str(line);
+        }
+    }
+    let title = if title.is_empty() { format!("Mission {run_id}: {}", one_line(task, 60)) } else { one_line(&title, 100) };
+    let body = if body.trim().is_empty() { task.to_string() } else { body.trim().to_string() };
+    (title, body)
+}
+
+/// Real PR: mission branch in the dev's container, deliverables copied into
+/// missions/<run_id>/, commit, push, `gh pr create`. Missing preconditions →
+/// skipped with the honest reason; failed actions → error with the real output.
+async fn run_pr_stage(
+    app: &App, run_id: &str, dev_role: &str, repo_url: &str, task: &str, project_name: &str,
+    dev: &(String, String, String, Option<String>),
+) -> PrOutcome {
+    let branch = run_id.to_string();
+    let skip = |note: String| PrOutcome { status: "skipped".into(), url: String::new(), branch: branch.clone(), note };
+    step_transition(app, run_id, dev_role, "pr", "working", "").await;
+
+    let (cid, _cname) = match app.agent_container(dev_role).await {
+        Some(x) => x,
+        None => {
+            let n = format!("no running container for {dev_role} — start the agent first (branch/PR not attempted)");
+            step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+            return skip(n);
+        }
+    };
+    if repo_url.trim().is_empty() {
+        let n = "project has no git repo configured — set the repo URL on the Projects page".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    let repo_path = match app.ensure_repo(&cid, repo_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            let n = format!("repo not available in the team workspace: {}", e.1);
+            step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+            return skip(n);
+        }
+    };
+    // gh auth + git identity for THIS container (idempotent, best-effort)
+    app.ensure_tools(&cid).await;
+
+    // Branch + commit: copy the run's deliverable markdown into the repo
+    let commit_msg = format!("mission {run_id}: team deliverables");
+    let script = format!(
+        "cd '{repo_path}' || exit 10; \
+         git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
+         git fetch --all --quiet >/dev/null 2>&1 || true; \
+         git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
+         mkdir -p 'missions/{run_id}'; \
+         cp /workspace/{run_id}-*.md 'missions/{run_id}/' 2>/dev/null || true; \
+         git add 'missions/{run_id}'; \
+         git commit -q -m '{commit_msg}' 2>/dev/null || echo NOTHING_TO_COMMIT; \
+         git log -1 --format=%h 2>/dev/null"
+    );
+    let (code, out) = app.exec_in(&cid, &script).await
+        .unwrap_or((-1, "exec failed".into()));
+    if code == 10 {
+        let n = format!("repo path {repo_path} disappeared in the container");
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    if out.contains("NO_REMOTE") {
+        let n = "no git remote 'origin' in the cloned repo — cannot push a PR".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    let committed = !out.contains("NOTHING_TO_COMMIT");
+    if !committed {
+        let n = "nothing to commit — no deliverable files landed under /workspace for this run (agents without containers write text-only deliverables)".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    let sha = out.lines().rev().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()).unwrap_or_default();
+
+    // PR title/body from the dev persona — written to files to dodge shell quoting
+    let (dname, dtitle, drules, dmodel) = dev;
+    let system = format!(
+        "{drules}\n\nYou are {dname}, {dtitle}, closing a team mission on project '{project_name}'. \
+Write the pull request for this mission's deliverables. Reply with EXACTLY this shape:\n\
+TITLE: <one line, ≤72 chars, same language as the mission>\n\
+BODY:\n<markdown ≤180 words: what the mission delivered, what is added under missions/{run_id}/, and the QA evidence in one line>"
+    );
+    let user = format!("## Mission\n{task}\n\n## Added under missions/{run_id}/\nThe team's per-role deliverable markdown files for this mission.\n\nWrite TITLE: and BODY:.");
+    let (title, body) = match dmodel.as_deref() {
+        Some(m) => match app.llm_max(m, &system, &user, 400).await {
+            Ok(t) => parse_pr_text(&t, task, run_id),
+            Err(_) => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
+        },
+        None => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
+    };
+    let heredoc = |path: &str, content: &str| format!("cat > '{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n", content.replace('\r', ""));
+    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-title.txt", &title)).await;
+    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-body.md", &body)).await;
+
+    // Auth gate → push → PR. Missing auth first triggers the in-mission device
+    // flow (need-human chat with the code) — the run waits for the user to
+    // approve in the browser, then push + PR continue on the spot. Whatever
+    // still fails after that is a skip with the honest reason (nothing fake was
+    // created); a failed push/PR is an error with the real output.
+    let (code, _) = app.exec_in(&cid, "command -v gh >/dev/null 2>&1 || exit 127; gh auth status >/dev/null 2>&1")
+        .await
+        .unwrap_or((127, String::new()));
+    if code != 0 {
+        if code == 127 {
+            let n = "gh CLI not available in the dev container image — use the agent-base image to open PRs".to_string();
+            step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+            return skip(n);
+        }
+        match try_in_mission_github_auth(app, run_id, dev_role, &cid).await {
+            GhAuthOutcome::Connected(_) => { /* auth landed — fall through to push */ }
+            GhAuthOutcome::Stopped => {
+                let n = "stopped while waiting for GitHub authorization".to_string();
+                step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+                return skip(n);
+            }
+            GhAuthOutcome::RepliedUnauthed => {
+                let n = format!("gh still not authenticated after your chat reply — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page (branch '{branch}' with the mission commit exists locally in the container)");
+                step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+                return skip(n);
+            }
+            GhAuthOutcome::Ended => {
+                let n = format!("GitHub authorization did not complete in time — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page, then re-run (branch '{branch}' with the mission commit exists locally in the container)");
+                step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+                return skip(n);
+            }
+        }
+    }
+    let (code, out) = app.exec_in(&cid, &format!("cd '{repo_path}' && git push -q -u origin '{branch}' 2>&1")).await
+        .unwrap_or((-1, "exec failed".into()));
+    if code != 0 {
+        let n = format!("pushing branch '{branch}' failed (exit {code}): {}", one_line(&out, 400));
+        step_transition(app, run_id, dev_role, "pr", "error", &n).await;
+        return PrOutcome { status: "error".into(), url: String::new(), branch, note: n };
+    }
+    let (code, out) = app.exec_in(&cid, &format!(
+        "cd '{repo_path}' && gh pr create --head '{branch}' --title \"$(cat /tmp/aap-pr-title.txt)\" --body-file /tmp/aap-pr-body.md 2>&1"
+    )).await.unwrap_or((-1, "exec failed".into()));
+    let url = extract_pr_url(&out);
+    if let Some(u) = url.filter(|_| code == 0) {
+        let report = format!(
+            "✅ Pull request opened: {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Files: `missions/{run_id}/*.md` — the team's deliverables for this mission\n- Repo: {repo_url}\n\n---\n{body}"
+        );
+        step_transition(app, run_id, dev_role, "pr", "done", &report).await;
+        return PrOutcome { status: "done".into(), url: u, branch, note: report };
+    }
+    if out.to_lowercase().contains("already exists") {
+        let (c2, o2) = app.exec_in(&cid, &format!("cd '{repo_path}' && gh pr view '{branch}' --json url -q .url 2>&1")).await
+            .unwrap_or((-1, String::new()));
+        if c2 == 0 {
+            if let Some(u) = extract_pr_url(&o2) {
+                let report = format!("✅ Pull request (already existed): {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Repo: {repo_url}");
+                step_transition(app, run_id, dev_role, "pr", "done", &report).await;
+                return PrOutcome { status: "done".into(), url: u, branch, note: report };
+            }
+        }
+    }
+    let n = format!("gh pr create failed (exit {code}): {}", one_line(&out, 400));
+    step_transition(app, run_id, dev_role, "pr", "error", &n).await;
+    PrOutcome { status: "error".into(), url: String::new(), branch, note: n }
+}
+
+/// Real deploy: check out the mission branch and `docker compose up --build`
+/// an ISOLATED staging project (its own compose project name + remapped host
+/// ports) — the live stack running this mission is never touched.
+async fn run_deploy_stage(app: &App, run_id: &str, dev_role: &str, repo_url: &str, branch: &str) -> DeployOutcome {
+    let skip = |note: String| DeployOutcome { status: "skipped".into(), url: String::new(), note };
+    step_transition(app, run_id, dev_role, "deploy", "working", "").await;
+
+    let (cid, _cname) = match app.agent_container(dev_role).await {
+        Some(x) => x,
+        None => {
+            let n = format!("no running container for {dev_role} — start the agent first");
+            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
+            return skip(n);
+        }
+    };
+    if repo_url.trim().is_empty() {
+        let n = "project has no git repo configured — nothing to deploy".to_string();
+        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
+        return skip(n);
+    }
+    let repo_path = match app.ensure_repo(&cid, repo_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            let n = format!("repo not available in the team workspace: {}", e.1);
+            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
+            return skip(n);
+        }
+    };
+    app.ensure_tools(&cid).await;
+
+    // One probe script with named outcomes — every gap is a skip, never a guess.
+    let probe = format!(
+        "cd '{repo_path}' || exit 10; \
+         git rev-parse --verify '{branch}' >/dev/null 2>&1 || {{ echo BRANCH_MISSING; exit 0; }}; \
+         [ -f docker-compose.yml ] || {{ echo NO_COMPOSE; exit 0; }}; \
+         [ -S /var/run/docker.sock ] || {{ echo NO_SOCKET; exit 0; }}; \
+         command -v docker >/dev/null 2>&1 || {{ echo NO_DOCKER_CLI; exit 0; }}; \
+         docker version >/dev/null 2>&1 || {{ echo NO_DAEMON; exit 0; }}; \
+         docker compose version >/dev/null 2>&1 || {{ echo NO_COMPOSE_PLUGIN; exit 0; }}; \
+         echo PROBE_OK"
+    );
+    let (code, out) = app.exec_in(&cid, &probe).await.unwrap_or((-1, "exec failed".into()));
+    let note = match (code, out.trim()) {
+        (10, _) => Some(format!("repo path {repo_path} disappeared in the container")),
+        (_, "BRANCH_MISSING") => Some(format!("no mission branch '{branch}' to deploy — the PR stage did not create it")),
+        (_, "NO_COMPOSE") => Some("repo has no docker-compose.yml at its root — nothing to stage".to_string()),
+        (_, "NO_SOCKET") => Some("no Docker socket mounted in the agent container — recreate the agent after upgrading the platform (docker.sock bind is not retroactive)".to_string()),
+        (_, "NO_DOCKER_CLI") => Some("docker CLI not available in the container and could not be installed".to_string()),
+        (_, "NO_DAEMON") => Some("docker CLI cannot reach the daemon through the mounted socket".to_string()),
+        (_, "NO_COMPOSE_PLUGIN") => Some("docker compose plugin not available in the container".to_string()),
+        _ => None,
+    };
+    if let Some(n) = note {
+        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
+        return skip(n);
+    }
+
+    // Staging compose file: sed-remapped FULL copy of the repo's compose file
+    // (a `-f` override would MERGE ports and collide with the live 3000/8000).
+    let dir = repo_dir_name(repo_url);
+    let staging_file = format!("/tmp/{dir}-staging-compose.yml");
+    let proj = format!("{dir}-staging");
+    let up = format!(
+        "cd '{repo_path}' && git checkout -q '{branch}' && \
+         sed -e 's/\"3000:3000\"/\"{STAGING_WEB_PORT}:3000\"/' -e 's/\"8000:8000\"/\"{STAGING_API_PORT}:8000\"/' docker-compose.yml > '{staging_file}' && \
+         docker compose -p '{proj}' --project-directory '{repo_path}' -f '{staging_file}' up --build -d 2>&1 | tail -25"
+    );
+    let (code, out) = app.exec_in(&cid, &up).await.unwrap_or((-1, "exec failed".into()));
+    let (_, ps_out) = app.exec_in(&cid, &format!("docker compose -p '{proj}' -f '{staging_file}' ps --status running --services 2>/dev/null")).await
+        .unwrap_or((-1, String::new()));
+    let services: Vec<&str> = ps_out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+    if code == 0 && !services.is_empty() {
+        let url = format!("http://localhost:{STAGING_WEB_PORT}");
+        let note = format!("web :{STAGING_WEB_PORT} · api :{STAGING_API_PORT} · compose project `{proj}` · branch `{branch}` · running: {}", services.join(", "));
+        let report = format!("🚀 Staging deployed: {url}\n\n- API: http://localhost:{STAGING_API_PORT}\n- Isolated compose project `{proj}` from branch `{branch}` — the live stack was not touched\n- Running services: {}\n\n```\n{}\n```", services.join(", "), out.lines().take(25).collect::<Vec<_>>().join("\n"));
+        step_transition(app, run_id, dev_role, "deploy", "done", &report).await;
+        return DeployOutcome { status: "done".into(), url, note };
+    }
+    let n = format!("docker compose up failed (exit {code}): {}", one_line(&out, 400));
+    step_transition(app, run_id, dev_role, "deploy", "error", &n).await;
+    DeployOutcome { status: "error".into(), url: String::new(), note: n }
+}
+
+/// Push one message into a demo discussion (and clear the typing indicator).
+async fn demo_say(app: &App, run_id: &str, disc_id: &str, from: &str, text: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id)
+        .and_then(|r| r.discussions.iter_mut().find(|d| d.id == disc_id))
+    {
+        disc.messages.push(MeetingMessage { from: from.into(), text: text.into(), at: now_secs() });
+        disc.answering = None;
+    }
+    save_runs(&store);
+}
+
+/// Mark who is about to speak (live typing indicator in the UI).
+async fn demo_answering(app: &App, run_id: &str, disc_id: &str, role: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id)
+        .and_then(|r| r.discussions.iter_mut().find(|d| d.id == disc_id))
+    {
+        disc.answering = Some(role.into());
+    }
+    save_runs(&store);
+}
+
+/// The acceptance demo: a scripted meeting-kind discussion — QA presents the
+/// e2e evidence, the Dev presents the REAL PR/staging delivery, then the PO
+/// checks every acceptance criterion and issues the final VERDICT.
+async fn run_demo_session(
+    app: &App, run_id: &str, task: &str, project_name: &str, dev_role: &str,
+    qa: &(String, String, String, Option<String>),
+    dev: &(String, String, String, Option<String>),
+    po: &(String, String, String, Option<String>),
+    pr: &PrOutcome, deploy: &DeployOutcome,
+) -> Option<Acceptance> {
+    step_transition(app, run_id, "po", "demo", "working", "").await;
+    {
+        let mut store = app.store.lock().unwrap();
+        if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+            run.phase = "demo".into();
+            run.discussions.push(Discussion {
+                id: format!("d-{:03}", run.discussions.len() + 1),
+                kind: "demo".into(),
+                from: "orchestrator".into(),
+                to: vec!["po".into()],
+                topic: "Acceptance demo — QA evidence · Dev delivery · PO acceptance".into(),
+                status: "answering".into(),
+                answering: None,
+                messages: Vec::new(),
+                round: 1,
+                created_at: now_secs(),
+            });
+        }
+        save_runs(&store);
+    }
+    let disc_id = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.discussions.iter().rev().find(|d| d.kind == "demo"))
+            .map(|d| d.id.clone())?
+    };
+    let qa_output = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.steps.iter().find(|s| s.role == "qa" && s.kind == "work"))
+            .map(|s| s.output.clone()).unwrap_or_default()
+    };
+    let po_output = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.steps.iter().find(|s| s.role == "po" && s.kind == "work"))
+            .map(|s| s.output.clone()).unwrap_or_default()
+    };
+
+    demo_say(app, run_id, &disc_id, "orchestrator",
+        "🎬 Demo รับมอบงาน — QA แสดงหลักฐานการทดสอบ, Dev ส่งมอบ PR/deploy จริง, แล้ว PO ตรวจนับ acceptance criteria ทีละข้อ").await;
+
+    // QA presents the e2e evidence
+    let (qname, _qt, qrules, qmodel) = qa;
+    demo_answering(app, run_id, &disc_id, "qa").await;
+    let qsys = format!(
+        "{qrules}\n\nYou are {qname} presenting your test evidence in the acceptance demo for the mission on '{project_name}'. \
+Present concisely (≤180 words): what was verified, the concrete evidence from your deliverable (test cases / results), and residual risks. Same language as the mission."
+    );
+    let quser = format!("## Mission\n{task}\n\n## Your QA deliverable\n{}\n\nPresent the evidence.", qa_output.chars().take(1600).collect::<String>());
+    let qa_msg = match qmodel.as_deref() {
+        Some(m) => llm_retry(app, m, &qsys, &quser, 500).await
+            .unwrap_or_else(|e| format!("(QA could not present: {})", e.1)),
+        None => "(no model configured for QA)".into(),
+    };
+    demo_say(app, run_id, &disc_id, "qa", &qa_msg).await;
+
+    // Dev presents the REAL delivery (facts only — never invented URLs)
+    let (dname, _dt, drules, dmodel) = dev;
+    demo_answering(app, run_id, &disc_id, dev_role).await;
+    let dsys = format!(
+        "{drules}\n\nYou are {dname} presenting the REAL delivery in the acceptance demo for the mission on '{project_name}'. \
+State what was shipped — branch, pull request, staging — using EXACTLY the facts given to you; never invent or alter URLs. ≤150 words, same language as the mission."
+    );
+    let duser = format!(
+        "## Mission\n{task}\n\n## Your real delivery (facts of record)\n- {}\n- {}\n\nPresent the delivery.",
+        pr.describe(), deploy.describe()
+    );
+    let dev_msg = match dmodel.as_deref() {
+        Some(m) => llm_retry(app, m, &dsys, &duser, 400).await
+            .unwrap_or_else(|e| format!("(Dev could not present: {})", e.1)),
+        None => "(no model configured for the Dev)".into(),
+    };
+    demo_say(app, run_id, &disc_id, dev_role, &dev_msg).await;
+
+    // Machine-truth footer: exact URLs verbatim, regardless of LLM wording
+    let footer = format!("📦 delivery of record — PR: {} · Staging: {}", pr.describe(), deploy.describe());
+    demo_say(app, run_id, &disc_id, "orchestrator", &footer).await;
+
+    // PO checks every acceptance criterion, then issues the verdict
+    let (pname, _pt, prules, pmodel) = po;
+    demo_answering(app, run_id, &disc_id, "po").await;
+    let psys = format!(
+        "{prules}\n\nYou are {pname} running the acceptance check in the demo for the mission on '{project_name}'. \
+Check EVERY acceptance criterion from your own mission output ONE BY ONE: quote it briefly, mark ✅ or ❌, one SHORT line of evidence each \
+(map evidence from QA's tests and the Dev's real delivery; a criterion with no evidence is ❌) — keep each check to ONE line so you never run out of space. \
+The VERY LAST line must be exactly `VERDICT: PASS` or `VERDICT: FAIL` — these exact English words even when the mission is in another language. \
+Write the checks in the same language as the mission."
+    );
+    let puser = format!(
+        "## Mission\n{task}\n\n## Your acceptance criteria (your own deliverable)\n{}\n\n## QA evidence\n{}\n\n## Dev delivery + delivery of record\n{}\n\n{}",
+        po_output.chars().take(1600).collect::<String>(), qa_msg, dev_msg, footer
+    );
+    let po_msg = match pmodel.as_deref() {
+        Some(m) => llm_retry(app, m, &psys, &puser, 1600).await,
+        None => Err(err(StatusCode::BAD_REQUEST, "No model configured for the PO")),
+    };
+    match po_msg {
+        Ok(po_msg) if !po_msg.is_empty() => {
+            demo_say(app, run_id, &disc_id, "po", &po_msg).await;
+            let (verdict, summary) = match parse_verdict(&po_msg) {
+                Some(v) => (v, po_msg.chars().take(600).collect::<String>()),
+                None => ("fail".to_string(), format!("{}\n\n(PO's verdict line missing — treated as FAIL)", po_msg.chars().take(500).collect::<String>())),
+            };
+            let acceptance = Acceptance { verdict: verdict.clone(), summary: summary.clone() };
+            {
+                let mut store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                    run.acceptance = Some(acceptance.clone());
+                    if let Some(disc) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                        disc.status = "resolved".into();
+                        disc.answering = None;
+                    }
+                }
+                save_runs(&store);
+            }
+            let report = format!(
+                "{} Acceptance: {}\n\n{}\n\n---\n{}\n\n---\n{}",
+                if verdict == "pass" { "✅" } else { "❌" },
+                verdict.to_uppercase(),
+                summary,
+                pr.describe(),
+                deploy.describe()
+            );
+            step_transition(app, run_id, "po", "demo", "done", &report).await;
+            if let Some((cid, _)) = app.agent_container("po").await {
+                let _ = write_deliverable(app, &cid, run_id, "demo", &report).await;
+            }
+            Some(acceptance)
+        }
+        Err(e) => {
+            demo_say(app, run_id, &disc_id, "orchestrator", &format!("⚠️ PO could not run the acceptance check: {}", e.1)).await;
+            let acceptance = Acceptance { verdict: "fail".into(), summary: format!("PO acceptance check failed: {}", e.1) };
+            {
+                let mut store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                    run.acceptance = Some(acceptance.clone());
+                    if let Some(disc) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                        disc.status = "resolved".into();
+                        disc.answering = None;
+                    }
+                }
+                save_runs(&store);
+            }
+            step_transition(app, run_id, "po", "demo", "error", &format!("PO acceptance check failed: {}", e.1)).await;
+            Some(acceptance)
+        }
+        Ok(_) => {
+            demo_say(app, run_id, &disc_id, "orchestrator", "⚠️ PO returned an empty verdict — treated as FAIL").await;
+            let acceptance = Acceptance { verdict: "fail".into(), summary: "PO returned an empty verdict — treated as FAIL".into() };
+            {
+                let mut store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                    run.acceptance = Some(acceptance.clone());
+                    if let Some(disc) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                        disc.status = "resolved".into();
+                        disc.answering = None;
+                    }
+                }
+                save_runs(&store);
+            }
+            step_transition(app, run_id, "po", "demo", "error", "PO returned an empty verdict").await;
+            Some(acceptance)
+        }
+    }
+}
+
+/// llm_max with retries — provider hiccups (rate limits under load) and
+/// reasoning models that spend the whole budget on thinking would otherwise
+/// stall the relay or the demo verdict with an empty answer. A token-cap empty
+/// retries once with a doubled budget (room for visible text after the
+/// thinking); transient upstream errors back off; config errors fail fast.
+async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<String, ApiError> {
+    let mut budget = max;
+    let mut last_err: Option<ApiError> = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await; }
+        match app.llm_max(model, system, user, budget).await {
+            Ok(t) if !t.trim().is_empty() => return Ok(t),
+            Ok(_) => last_err = Some(err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer"))),
+            Err(e) => {
+                if attempt == 0 && budget < 8000 && e.1.contains("token cap") {
+                    budget = (budget * 2).min(8000); // thinking ate the budget — leave room for the answer
+                } else if e.0.as_u16() == 429 || e.0.as_u16() == 502 {
+                    last_err = Some(e); // transient — back off and try again
+                } else {
+                    return Err(e); // misconfiguration or a hard refusal won't heal on retry
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer after 3 attempts"))))
+}
+
 /// Team run engine with a meeting loop.
 ///
 /// Round 1 is a relay: each persona produces its piece of work, sees what
@@ -2809,7 +3905,7 @@ async fn execute_run(app: App, run_id: String) {
     let work_system = |rules: &str, name: &str, title: &str| {
         format!(
             "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec.{repo_line} \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request and deploys an isolated staging stack, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line} \
 Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
 Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies). \
 Answer in the same language the task is written in. Keep it under ~450 words. \
@@ -2856,7 +3952,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
         // step → working (records the model this step will run with, even if it later errors)
         {
             let mut store = app.store.lock().unwrap();
-            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
                 step.status = "working".into();
                 step.model = model.clone();
                 step.started_at = now_secs();
@@ -2869,7 +3965,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
         {
             let store = app.store.lock().unwrap();
             if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
-                for s in run.steps.iter().take_while(|s| s.role != role) {
+                for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
                     if s.status == "done" && !s.output.is_empty() {
                         let brief: String = s.output.chars().take(1400).collect();
                         handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
@@ -2887,7 +3983,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
         };
 
         let result = match model.as_deref() {
-            Some(m) => app.llm_max(m, &system, &user, 1400).await,
+            Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
         match result {
@@ -2900,7 +3996,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             }
             Ok(_) => {
                 let mut store = app.store.lock().unwrap();
-                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
                     step.status = "error".into();
                     step.output = "Model returned an empty answer".into();
                     step.finished_at = now_secs();
@@ -2909,7 +4005,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             }
             Err(e) => {
                 let mut store = app.store.lock().unwrap();
-                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role)) {
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
                     step.status = "error".into();
                     step.output = e.1;
                     step.finished_at = now_secs();
@@ -3014,7 +4110,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
                 let asker_work: String = {
                     let store = app.store.lock().unwrap();
                     store.runs.iter().find(|r| r.id == run_id)
-                        .and_then(|r| r.steps.iter().find(|s| s.role == d.from))
+                        .and_then(|r| r.steps.iter().find(|s| s.role == d.from && s.kind == "work"))
                         .map(|s| s.output.chars().take(700).collect())
                         .unwrap_or_default()
                 };
@@ -3027,7 +4123,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                     d.topic,
                 );
                 let answer = match tmodel.as_deref() {
-                    Some(m) => app.llm_max(m, &system, &user, 350).await,
+                    Some(m) => llm_retry(&app, m, &system, &user, 350).await,
                     None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
                 };
                 let text = match answer {
@@ -3047,7 +4143,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             let (prev, msgs) = {
                 let store = app.store.lock().unwrap();
                 let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
-                let prev: String = run.steps.iter().find(|s| s.role == d.from).map(|s| s.output.chars().take(1200).collect()).unwrap_or_default();
+                let prev: String = run.steps.iter().find(|s| s.role == d.from && s.kind == "work").map(|s| s.output.chars().take(1200).collect()).unwrap_or_default();
                 let msgs = run.discussions.iter().find(|x| x.id == d.id).map(|x| x.messages.clone()).unwrap_or_default();
                 (prev, msgs)
             };
@@ -3060,7 +4156,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             {
                 let mut store = app.store.lock().unwrap();
                 if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
-                    if let Some(step) = run.steps.iter_mut().find(|s| s.role == d.from) { step.status = "working".into(); step.started_at = now_secs(); }
+                    if let Some(step) = run.steps.iter_mut().find(|s| s.role == d.from && s.kind == "work") { step.status = "working".into(); step.started_at = now_secs(); }
                     if let Some(disc) = run.discussions.iter_mut().find(|x| x.id == d.id) { disc.answering = Some(d.from.clone()); }
                 }
                 save_runs(&store);
@@ -3071,7 +4167,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 d.topic,
             );
             let result = match amodel.as_deref() {
-                Some(m) => app.llm_max(m, &system, &user, 1400).await,
+                Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
                 None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
             };
             match result {
@@ -3088,7 +4184,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 _ => {
                     let mut store = app.store.lock().unwrap();
                     if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
-                        if let Some(step) = run.steps.iter_mut().find(|s| s.role == d.from) { step.status = "done".into(); step.finished_at = now_secs(); }
+                        if let Some(step) = run.steps.iter_mut().find(|s| s.role == d.from && s.kind == "work") { step.status = "done".into(); step.finished_at = now_secs(); }
                     }
                     save_runs(&store);
                 }
@@ -3104,6 +4200,34 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 save_runs(&store);
             }
         }
+    }
+
+    // ---- Tail: after QA verifies — the dev opens a REAL pull request, deploys
+    // a REAL isolated staging stack, then the PO runs the acceptance demo ----
+    let tail_gate = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id).map(|run| {
+            run.steps.iter().any(|s| s.kind == "work" && s.role == "qa" && s.status == "done")
+                && roles.iter().any(|(r, _, _)| r.starts_with("dev"))
+                && roles.iter().any(|(r, _, _)| r == "po")
+        }).unwrap_or(false)
+    };
+    let mut tail: Option<(PrOutcome, DeployOutcome, Option<Acceptance>)> = None;
+    if tail_gate {
+        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
+        // first dev role owns both PR and deploy — one branch, one working tree
+        let dev_role = roles.iter().find(|(r, _, _)| r.starts_with("dev")).map(|(r, _, _)| r.clone()).unwrap();
+        append_tail_steps(&app, &run_id, &dev_role, "po").await;
+        let dev_persona = persona_of(&dev_role);
+        let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
+        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
+        let deploy = run_deploy_stage(&app, &run_id, &dev_role, &repo_url, &pr.branch).await;
+        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
+        let qa_persona = persona_of("qa");
+        let po_persona = persona_of("po");
+        let acceptance = run_demo_session(&app, &run_id, &task, &project_name, &dev_role,
+            &qa_persona, &dev_persona, &po_persona, &pr, &deploy).await;
+        tail = Some((pr, deploy, acceptance));
     }
 
     // ---- PO closes the mission with one summary ----
@@ -3122,9 +4246,18 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             "{prules}\n\nYou are {pname}, closing a team mission on project '{project_name}'. \
 Write ONE tight summary (≤200 words) of what the team produced and what the meetings decided — decisions and outcomes only, same language as the mission."
         );
-        let user = format!("## Mission\n{task}\n\n## Deliverables\n{deliverables}\n\n## Meetings\n{meetings}\n\nWrite the mission summary.");
+        let tail_line = match &tail {
+            Some((pr, deploy, acc)) => format!(
+                "\n\n## Real delivery\n- {}\n- {}\n\n## Acceptance verdict\n{}",
+                pr.describe(), deploy.describe(),
+                acc.as_ref().map(|a| format!("VERDICT: {} — {}", a.verdict.to_uppercase(), a.summary.chars().take(300).collect::<String>()))
+                    .unwrap_or_else(|| "(the demo did not produce a verdict)".into())
+            ),
+            None => String::new(),
+        };
+        let user = format!("## Mission\n{task}\n\n## Deliverables\n{deliverables}\n\n## Meetings\n{meetings}{tail_line}\n\nWrite the mission summary.");
         let result = match pmodel.as_deref() {
-            Some(m) => app.llm_max(m, &system, &user, 500).await,
+            Some(m) => llm_retry(&app, m, &system, &user, 500).await,
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
         if let Ok(summary) = result {
@@ -3165,19 +4298,25 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
     if loop_mode && !all_error && !stop_requested(&app, &run_id) && iteration < MAX_LOOP_ITERATIONS {
         let (pname, _ptitle, prules, pmodel) = persona_of("po");
         if let Some(model) = pmodel {
-            let chain = {
+            let (chain, acc_text) = {
                 let store = app.store.lock().unwrap();
-                store.runs.iter()
+                let chain = store.runs.iter()
                     .filter(|r| r.project_id == project_id && r.loop_mode)
                     .map(|r| format!("### Iteration {} — {}\nSummary: {}", r.iteration, r.task, r.summary.as_deref().map(|s| s.chars().take(500).collect::<String>()).unwrap_or_else(|| "(none)".into())))
-                    .collect::<Vec<_>>().join("\n\n")
+                    .collect::<Vec<_>>().join("\n\n");
+                let acc_text = store.runs.iter().find(|r| r.id == run_id)
+                    .and_then(|r| r.acceptance.clone())
+                    .map(|a| format!("VERDICT: {} — {}", a.verdict.to_uppercase(), a.summary.chars().take(300).collect::<String>()))
+                    .unwrap_or_else(|| "(none — no acceptance demo ran this iteration)".into());
+                (chain, acc_text)
             };
             let system = format!(
                 "{prules}\n\nYou are {pname}, the PO of an AI team running in a LOOP on project '{project_name}'. \
 The loop's standing goal is the ORIGINAL task. After each iteration you decide what the team should do next. \
+The last iteration's acceptance verdict from the demo session is listed under 'Acceptance verdict'. If it is FAIL you MUST reply with a concrete fix task for the next iteration — replying DONE is not allowed. If it is PASS you may reply DONE when the standing goal is fully achieved. \
 Reply with EITHER the concrete task for the next iteration (one sentence, same language as the goal, ≤60 words — build on what is already done, do not repeat it) OR exactly `DONE` when the goal is achieved and no further iteration adds value."
             );
-            let user = format!("## Standing goal\n{task}\n\n## Iterations so far\n{chain}\n\nDecide: the next iteration's task, or `DONE`.");
+            let user = format!("## Standing goal\n{task}\n\n## Iterations so far\n{chain}\n\n## Acceptance verdict\n{acc_text}\n\nDecide: the next iteration's task, or `DONE`.");
             if let Ok(next) = app.llm_max(&model, &system, &user, 200).await {
                 let next = next.trim().trim_matches('`').to_string();
                 if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600 {
@@ -3341,7 +4480,12 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
     // Live state: the newest run that is still in flight (running or paused on a human).
     let mut current: Option<Value> = None;
     for run in runs.iter().filter(|r| r.status == "running" || r.status == "waiting_human") {
-        let step = match run.steps.iter().find(|s| s.role == role) { Some(s) => s, None => continue };
+        if !run.steps.iter().any(|s| s.role == role) { continue; }
+        // a tail stage in flight (pr/deploy/demo) is the more specific live step
+        let step = run.steps.iter().find(|s| s.role == role && s.status == "working")
+            .or_else(|| run.steps.iter().find(|s| s.role == role && s.kind == "work"))
+            .or_else(|| run.steps.iter().find(|s| s.role == role))
+            .unwrap();
         // Speaking in a live meeting beats "working" — it is the more specific state.
         let speaking = run.discussions.iter()
             .find(|d| d.answering.as_deref() == Some(role.as_str()) && d.status != "resolved");
@@ -3352,6 +4496,12 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
         } else if waiting_human {
             let d = run.discussions.iter().find(|d| d.status == "need_human" && (d.from == role || d.to.iter().any(|t| t == &role)));
             ("waiting_human".to_string(), "ทีมรอคำตอบจากคุณอยู่".to_string(), d.map(|d| d.topic.clone()))
+        } else if step.status == "working" && step.kind == "pr" {
+            ("working".to_string(), "กำลังเปิด Pull Request จริงใน container".to_string(), None)
+        } else if step.status == "working" && step.kind == "deploy" {
+            ("working".to_string(), "กำลัง deploy staging จริง (docker compose)".to_string(), None)
+        } else if step.status == "working" && step.kind == "demo" {
+            ("working".to_string(), "กำลัง demo ตรวจรับหน้างานกับ PO".to_string(), None)
         } else if step.status == "working" {
             if step.rev.map(|r| r > 1).unwrap_or(false) {
                 ("working".to_string(), "กำลังแก้งานหลัง meeting (revision)".to_string(), None)
@@ -3376,31 +4526,33 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
         break;
     }
 
-    // History: this agent's step in every run, newest first.
+    // History: EVERY step this agent owns in every run (work + pr/deploy/demo), newest first.
     let mut history: Vec<Value> = runs.iter()
         .filter(|r| r.steps.iter().any(|s| s.role == role))
-        .map(|r| {
-            let s = r.steps.iter().find(|s| s.role == role).unwrap();
+        .flat_map(|r| {
             let meetings = r.discussions.iter()
                 .filter(|d| d.from == role || d.to.iter().any(|t| t == &role) || d.messages.iter().any(|m| m.from == role))
                 .count();
-            let excerpt: String = s.output.chars().take(300).collect();
-            json!({
-                "run_id": r.id,
-                "project_id": r.project_id,
-                "project_name": r.project_name,
-                "task": r.task,
-                "run_status": r.status,
-                "status": s.status,
-                "rev": s.rev,
-                "started_at": s.started_at,
-                "finished_at": s.finished_at,
-                "output_excerpt": excerpt,
-                "deliverable": s.deliverable,
-                "container": s.container,
-                "meetings": meetings,
-                "iteration": r.iteration,
-            })
+            r.steps.iter().filter(|s| s.role == role).map(move |s| {
+                let excerpt: String = s.output.chars().take(300).collect();
+                json!({
+                    "run_id": r.id,
+                    "project_id": r.project_id,
+                    "project_name": r.project_name,
+                    "task": r.task,
+                    "run_status": r.status,
+                    "kind": s.kind,
+                    "status": s.status,
+                    "rev": s.rev,
+                    "started_at": s.started_at,
+                    "finished_at": s.finished_at,
+                    "output_excerpt": excerpt,
+                    "deliverable": s.deliverable,
+                    "container": s.container,
+                    "meetings": meetings,
+                    "iteration": r.iteration,
+                })
+            }).collect::<Vec<_>>()
         })
         .collect();
     history.reverse();
@@ -3491,6 +4643,83 @@ impl App {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Roles the run engine may exec into at any moment — the idle sweeper never
+/// pauses these. waiting_human runs are NOT busy: while waiting, the engine
+/// only polls the store, and `agent_container` revives a paused agent the
+/// moment the human replies and the run flips back to running.
+fn busy_roles(store: &Store) -> std::collections::HashSet<String> {
+    store.runs.iter()
+        .filter(|r| r.status == "running")
+        .flat_map(|r| r.steps.iter().map(|s| s.role.clone()))
+        .collect()
+}
+
+/// Background loop: every IDLE_SWEEP_INTERVAL_SECS, stop managed running
+/// containers that have been idle longer than config.idle_timeout_secs and
+/// are not needed by any live run. Pausing = docker stop + registry entry —
+/// the RAM release is the point (docker pause would keep it allocated).
+/// A stop that races an incoming activity is benign by design: the next
+/// `agent_container` / `ensure_running` call revives the container (~2s).
+async fn idle_sweeper(app: App) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(IDLE_SWEEP_INTERVAL_SECS));
+    loop {
+        tick.tick().await;
+        let Some(docker) = app.docker.as_ref().cloned() else { continue };
+        let (enabled, idle_after) = {
+            let store = app.store.lock().unwrap();
+            (store.config.auto_pause_enabled, store.config.idle_timeout_secs)
+        };
+        if !enabled || idle_after == 0 { continue; }
+
+        let (busy, registered) = {
+            let store = app.store.lock().unwrap();
+            (busy_roles(&store), store.paused.keys().cloned().collect::<std::collections::HashSet<String>>())
+        };
+
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
+        filters.insert("status".to_string(), vec!["running".to_string()]);
+        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
+        let Ok(list) = docker.list_containers(Some(opts)).await else { continue };
+
+        // Reconcile: a registry entry whose container is running again (someone
+        // raced the sweeper with a start/resume) is stale — drop it.
+        {
+            let mut store = app.store.lock().unwrap();
+            let mut changed = false;
+            for c in &list {
+                let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+                if store.paused.remove(&name).is_some() { changed = true; }
+            }
+            if changed { save_paused(&store); }
+        }
+
+        let now = now_secs();
+        for c in list {
+            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+            let id = c.id.clone().unwrap_or_default();
+            if name.is_empty() || registered.contains(&name) { continue; }
+            let role = c.labels.as_ref().and_then(|l| l.get("role").cloned()).unwrap_or_default();
+            if !role.is_empty() && busy.contains(&role) { continue; }
+            // First sighting starts the clock (persisted into the store, not
+            // just the snapshot) — a fresh container gets one full idle
+            // window before it is a candidate.
+            let last = {
+                let mut store = app.store.lock().unwrap();
+                *store.last_activity.entry(name.clone()).or_insert(now)
+            };
+            if now.saturating_sub(last) < idle_after { continue; }
+            match docker.stop_container(&id, None::<StopContainerOptions>).await {
+                Ok(()) => {
+                    app.mark_paused(&name, true);
+                    println!("auto-paused idle container '{name}' (idle {}s, role '{role}')", now - last);
+                }
+                Err(e) => eprintln!("auto-pause of '{name}' failed: {e}"),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let docker = Docker::connect_with_local_defaults().ok();
@@ -3503,10 +4732,14 @@ async fn main() {
         store: {
             let mut store = Store::default();
             load_runs(&mut store); // work history survives restarts (/data/runs.json)
+            load_paused(&mut store); // paused-registry survives restarts (/data/paused.json)
             Arc::new(Mutex::new(store))
         },
         seq: Arc::new(AtomicUsize::new(1)),
     };
+
+    // Idle sweeper — auto-pause containers idle past the configured window.
+    tokio::spawn(idle_sweeper(app_state.clone()));
 
     let cors = tower_http::cors::CorsLayer::permissive();
 

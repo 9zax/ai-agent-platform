@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation'
 import dynamic from 'next/dynamic'
 import { useEffect, useRef, useState } from 'react'
 import {
-  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, ExternalLink, Monitor, Loader2, Figma, KeyRound,
+  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, ExternalLink, Monitor, Loader2, Figma, KeyRound, PauseCircle, PlayCircle,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -266,13 +266,18 @@ export default function ContainerDetail() {
     authFetch(`${API}/config`).then(r => r.json()).then(c => setAuthRequired(!!c.auth_required)).catch(() => {})
   }, [id])
 
-  // Live stats polling (every 5s) — only meaningful while running
+  // Live stats polling (every 5s) — also keeps the status badge in sync when
+  // the idle sweeper pauses the container or an access revives it.
   useEffect(() => {
     let alive = true
     async function poll() {
       try {
         const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/stats`)
-        if (res.ok && alive) setStats(await res.json())
+        if (res.ok && alive) {
+          const data = await res.json()
+          setStats(data)
+          if (data.status) setStatus(data.status === 'exited' ? 'stopped' : data.status)
+        }
       } catch { /* keep last known */ }
     }
     poll()
@@ -408,12 +413,19 @@ export default function ContainerDetail() {
                 {status === 'stopped' ? 'Stopped' : status.charAt(0).toUpperCase() + status.slice(1)}
               </Badge>
             </h1>
-            <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">Container console &amp; AI agent control</div>
+            <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
+              Container console &amp; AI agent control
+              {status === 'paused' && stats?.paused_since
+                ? <span className="ml-2 text-cyan-400/80">{stats.auto_paused ? 'auto-' : ''}paused {Math.max(0, Math.round((Date.now() / 1000 - stats.paused_since) / 60))} min ago</span>
+                : null}
+            </div>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {error && <div className="mr-2 max-w-[280px] truncate rounded-md bg-red-500/15 px-3 py-1.5 text-[12px] text-red-400" title={error}>{error}</div>}
           <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('start')}><Play className="h-3.5 w-3.5" /> {busy === 'start' ? 'Starting…' : 'Start'}</Button>
+          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('pause')}><PauseCircle className="h-3.5 w-3.5" /> {busy === 'pause' ? 'Pausing…' : 'Pause'}</Button>
+          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('resume')}><PlayCircle className="h-3.5 w-3.5" /> {busy === 'resume' ? 'Resuming…' : 'Resume'}</Button>
           <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('stop')}><Square className="h-3.5 w-3.5" /> {busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
           <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('restart')}><RotateCw className="h-3.5 w-3.5" /> {busy === 'restart' ? 'Restarting…' : 'Restart'}</Button>
           <Button variant="outline" onClick={() => { setTab('console'); setTimeout(() => cmdBoxRef.current?.focus(), 100) }}>

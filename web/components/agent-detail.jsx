@@ -15,7 +15,7 @@ import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PersonaForm } from '@/components/persona-editor'
-import { fmtClock, fmtDateTime, fmtDur } from '@/lib/utils'
+import { fmtClock, fmtDateTime, fmtDur, STEP_KIND_LABEL } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -49,6 +49,7 @@ function HistoryEntry({ h }) {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12.5px] font-semibold">
             <span className="font-mono text-[11px] text-muted-foreground/70">{h.run_id}</span>
             <span className="text-muted-foreground/80">{h.project_name}</span>
+            {h.kind && h.kind !== 'work' && <Badge variant="purple" className="text-[9px]">{STEP_KIND_LABEL[h.kind] || h.kind}</Badge>}
             {h.iteration > 1 && <Badge variant="purple" className="text-[9px]">loop รอบ {h.iteration}</Badge>}
             {h.rev && <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-300">rev {h.rev}</span>}
           </div>
