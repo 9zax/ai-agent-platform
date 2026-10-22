@@ -6,4 +6,7 @@ node_modules/
 data/
 *.db
 web/e2e/test-results/
+# playwright artifacts wherever the runner was started from
+test-results/
+web/test-results/
 target/

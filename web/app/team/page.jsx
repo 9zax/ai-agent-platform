@@ -6,24 +6,16 @@ import { Play, MessageSquare, Trash2, Users, Plus, Pencil, Eye, Code2, Network }
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { marked } from 'marked'
+import { PersonaEditor } from '@/components/persona-editor'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-
-const EMPTY_PERSONA = { role: '', name: '', title: '', years: '14', expertise: '', rules_md: '' }
 
 export default function TeamPage() {
   const [agents, setAgents] = useState(null)
   const [busy, setBusy] = useState('')
   const [editorOpen, setEditorOpen] = useState(false)
-  const [editing, setEditing] = useState(null) // null = new
-  const [form, setForm] = useState(EMPTY_PERSONA)
-  const [mdPreview, setMdPreview] = useState(false)
-  const [formError, setFormError] = useState('')
-  const [saving, setSaving] = useState(false)
+  const [editingAgent, setEditingAgent] = useState(null) // persona object, or null = new
+  const [agentStatus, setAgentStatus] = useState(null) // {model, provider, provider_id} from /agent/status
 
   async function load() {
     try {
@@ -36,6 +28,7 @@ export default function TeamPage() {
 
   useEffect(() => {
     load()
+    authFetch(`${API}/agent/status`).then(r => r.json()).then(setAgentStatus).catch(() => {})
     const t = setInterval(load, 5000)
     return () => clearInterval(t)
   }, [])
@@ -71,38 +64,8 @@ export default function TeamPage() {
   }
 
   function openEditor(agent) {
-    setFormError('')
-    setMdPreview(false)
-    if (agent) {
-      setEditing(agent.role)
-      setForm({ role: agent.role, name: agent.name, title: agent.title, years: agent.years, expertise: agent.expertise, rules_md: agent.rules_md || '' })
-    } else {
-      setEditing(null)
-      setForm(EMPTY_PERSONA)
-    }
+    setEditingAgent(agent)
     setEditorOpen(true)
-  }
-
-  async function savePersona(e) {
-    e.preventDefault()
-    if (!form.name.trim() || (!editing && !form.role.trim())) return setFormError('Role and name are required')
-    setSaving(true)
-    setFormError('')
-    try {
-      const url = editing ? `${API}/agents/${editing}` : `${API}/agents`
-      const res = await fetch(url, {
-        method: editing ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(form),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setEditorOpen(false)
-      await load()
-    } catch (err) {
-      setFormError(err.message)
-    }
-    setSaving(false)
   }
 
   async function deletePersona(role) {
@@ -146,6 +109,14 @@ export default function TeamPage() {
                   <Badge variant="purple">{a.years}+ yrs</Badge>
                 </div>
                 <div className="mt-0.5 text-[12.5px] font-medium text-primary">{a.title}</div>
+                <Badge
+                  variant={a.model_overrides?.[agentStatus?.provider_id] ? 'blue' : 'gray'}
+                  className="mt-1 max-w-full truncate font-mono text-[10px]"
+                  data-testid={`agent-model-${a.role}`}
+                  title={a.model_overrides?.[agentStatus?.provider_id] ? 'persona override' : 'provider default'}
+                >
+                  {a.model || 'ไม่ได้ตั้งโมเดล'}
+                </Badge>
               </div>
               <div className="flex flex-col items-end gap-1.5">
                 <code className="rounded bg-secondary px-2 py-0.5 font-mono text-[10.5px] uppercase text-muted-foreground">{a.role}</code>
@@ -189,66 +160,7 @@ export default function TeamPage() {
         ))}
       </div>
 
-      <Dialog open={editorOpen} onOpenChange={setEditorOpen}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{editing ? `Edit ${form.name || editing}` : 'New Persona'}</DialogTitle>
-            <DialogDescription>ข้อมูลตัวตน + ความสามารถ + rules (markdown) ที่ใช้เป็น system prompt</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={savePersona} className="grid gap-4">
-            <div className="grid grid-cols-2 gap-3">
-              <div className="grid gap-1.5">
-                <label className="text-[13px] font-medium">Role id {editing && <span className="text-muted-foreground/50">(fixed)</span>}</label>
-                <Input value={form.role} disabled={!!editing} placeholder="devops" onChange={e => setForm({ ...form, role: e.target.value })} />
-              </div>
-              <div className="grid gap-1.5">
-                <label className="text-[13px] font-medium">Name</label>
-                <Input value={form.name} placeholder="e.g. Rin" onChange={e => setForm({ ...form, name: e.target.value })} />
-              </div>
-              <div className="grid gap-1.5">
-                <label className="text-[13px] font-medium">Title</label>
-                <Input value={form.title} placeholder="DevOps Engineer" onChange={e => setForm({ ...form, title: e.target.value })} />
-              </div>
-              <div className="grid gap-1.5">
-                <label className="text-[13px] font-medium">Years of experience</label>
-                <Input value={form.years} placeholder="14" onChange={e => setForm({ ...form, years: e.target.value })} />
-              </div>
-            </div>
-            <div className="grid gap-1.5">
-              <label className="text-[13px] font-medium">Expertise (สรุปสั้น)</label>
-              <Input value={form.expertise} placeholder="CI/CD, Docker, Kubernetes..." onChange={e => setForm({ ...form, expertise: e.target.value })} />
-            </div>
-            <div className="grid gap-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[13px] font-medium">Rules / System prompt (Markdown)</label>
-                <Button type="button" variant="ghost" size="sm" data-testid="md-toggle" onClick={() => setMdPreview(p => !p)}>
-                  {mdPreview ? <><Code2 className="h-3.5 w-3.5" /> Edit</> : <><Eye className="h-3.5 w-3.5" /> Preview</>}
-                </Button>
-              </div>
-              {mdPreview ? (
-                <div
-                  data-testid="md-preview"
-                  className="prose-invert min-h-[160px] rounded-md border bg-[#0d1420] p-3 text-[13px] [&_code]:rounded [&_code]:bg-secondary [&_code]:px-1 [&_li]:list-disc [&_ol]:list-decimal [&_p]:mb-2 [&_ul]:list-disc [&_ul]:pl-5"
-                  dangerouslySetInnerHTML={{ __html: marked.parse(form.rules_md || '_ไม่มีเนื้อหา_') }}
-                />
-              ) : (
-                <Textarea
-                  data-testid="md-editor"
-                  className="min-h-[160px] font-mono text-[12px]"
-                  placeholder={'# Rules\n\nYou are ... \n\n## Capabilities\n- can run shell commands\n- can open GitHub issues with `gh issue create`'}
-                  value={form.rules_md}
-                  onChange={e => setForm({ ...form, rules_md: e.target.value })}
-                />
-              )}
-            </div>
-            {formError && <div className="rounded-md bg-red-500/15 px-3 py-2 text-[12.5px] text-red-400">{formError}</div>}
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setEditorOpen(false)}>Cancel</Button>
-              <Button type="submit" disabled={saving} data-testid="save-persona">{saving ? 'Saving…' : editing ? 'Save Changes' : 'Create Persona'}</Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <PersonaEditor agent={editingAgent} open={editorOpen} onOpenChange={setEditorOpen} onSaved={load} />
     </>
   )
 }

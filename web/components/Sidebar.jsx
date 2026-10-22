@@ -1,11 +1,12 @@
 'use client'
 import { authFetch } from '@/lib/auth'
 
+import HumanInbox from '@/components/human-inbox'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
 import {
-  Bot, LayoutDashboard, KanbanSquare, Package, Users, FolderKanban, Sparkles, Wrench, Github, Settings,
+  Bot, LayoutDashboard, Waypoints, Package, Users, FolderKanban, Sparkles, Wrench, Plug, Github, Settings, ArrowRight,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -15,7 +16,7 @@ const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 const MAIN = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/board', label: 'Board', icon: KanbanSquare },
+  { href: '/board', label: 'Orchestrator', icon: Waypoints },
   { href: '/team', label: 'AI Team', icon: Users },
   { href: '/projects', label: 'Projects', icon: FolderKanban, match: '/projects' },
   { href: '/', label: 'Containers', icon: Package, match: '/containers' },
@@ -23,6 +24,7 @@ const MAIN = [
 
 const PLATFORM = [
   { href: '/ai-config', label: 'AI Config', icon: Sparkles },
+  { href: '/connectors', label: 'Connectors', icon: Plug },
   { href: '/skills', label: 'Skills', icon: Wrench },
   { href: 'https://github.com/9zax/ai-agent-platform', label: 'GitHub', icon: Github, external: true },
   { href: '/settings', label: 'Settings', icon: Settings },
@@ -61,6 +63,9 @@ export default function Sidebar() {
         </div>
       </div>
 
+      {/* Global inbox — need-human meeting alerts on every page */}
+      <HumanInbox />
+
       <nav className="mt-1 flex flex-col gap-0.5">
         <div className="px-2.5 pb-1.5 pt-3.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/60">
           Main
@@ -91,17 +96,35 @@ export default function Sidebar() {
         </div>
         {PLATFORM.map(item => {
           const Icon = item.icon
+          const active = !item.external && pathname === item.href
+          if (item.external) {
+            return (
+              <a
+                key={item.label}
+                href={item.href}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              >
+                <Icon className="h-[17px] w-[17px]" />
+                {item.label}
+              </a>
+            )
+          }
           return (
-            <a
+            <Link
               key={item.label}
               href={item.href}
-              target={item.external ? '_blank' : undefined}
-              rel={item.external ? 'noreferrer' : undefined}
-              className="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+              aria-current={active ? 'page' : undefined}
+              data-testid={`nav-${item.label.toLowerCase().replace(/\s+/g, '-')}`}
+              className={cn(
+                'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors',
+                active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
+              )}
             >
               <Icon className="h-[17px] w-[17px]" />
               {item.label}
-            </a>
+            </Link>
           )
         })}
       </nav>
@@ -137,7 +160,7 @@ export default function Sidebar() {
             </button>
           </div>
         ) : session?.auth_required ? (
-          <a href="/login" className="text-[12.5px] font-semibold text-primary">Sign in →</a>
+          <a href="/login" className="flex items-center gap-1 text-[12.5px] font-semibold text-primary">Sign in <ArrowRight className="h-3.5 w-3.5" /></a>
         ) : (
           <div>
             <div className="text-[12.5px] font-semibold">Admin</div>

@@ -3,46 +3,80 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VNC_PASSWORD=agent
 
-RUN apt-get update && apt-get install -y \
-    xfce4 \
+# Minimal XFCE core (no metapackage/goodies extras) + VNC stack + agent tools.
+# --no-install-recommends everywhere keeps the image small; fonts cover Latin + Thai.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    dbus-x11 \
+    xfce4-session \
+    xfwm4 \
+    xfce4-panel \
+    xfce4-settings \
+    xfdesktop4 \
     xfce4-terminal \
-    xfce4-goodies \
+    adwaita-icon-theme \
+    fonts-dejavu-core \
+    fonts-thai-tlwg \
     tightvncserver \
     novnc \
     websockify \
-    xterm \
     git \
     gh \
     curl \
     wget \
+    jq \
+    zip \
+    unzip \
+    ripgrep \
+    rsync \
+    openssh-client \
+    file \
+    tree \
+    less \
+    nano \
+    xz-utils \
     python3 \
     python3-pip \
-    nodejs \
-    npm \
     ca-certificates \
     x11-utils \
-    software-properties-common \
     && rm -rf /var/lib/apt/lists/*
 
-# Real browser: amd64 gets Google Chrome; arm64 (Apple Silicon) gets Firefox ESR
-# (Chrome has no arm64 Linux build, so the .deb cannot install there)
+# Node 22 for agents (Ubuntu 22.04's apt nodejs is v12; npm is bundled)
+RUN case "$(dpkg --print-architecture)" in \
+        arm64) NARCH=arm64 ;; \
+        *) NARCH=x64 ;; \
+    esac && \
+    curl -fsSL "https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-${NARCH}.tar.gz" \
+        | tar -xz -C /usr/local --strip-components=1 \
+    && node -v && npm -v
+
+# Real browser, exposed uniformly as /usr/local/bin/chromium:
+# - amd64 gets Google Chrome (official .deb)
+# - arm64 (Apple Silicon) gets Chromium via Playwright — Google ships no arm64
+#   Linux Chrome, and Ubuntu's chromium-browser package is a snap stub that
+#   cannot run in Docker.
 RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
-        wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+        curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
         apt-get update && \
-        apt-get install -y /tmp/chrome.deb && \
-        rm /tmp/chrome.deb; \
+        apt-get install -y --no-install-recommends /tmp/chrome.deb && \
+        rm /tmp/chrome.deb && \
+        ln -sf /usr/bin/google-chrome /usr/local/bin/chromium; \
     else \
-        add-apt-repository -y ppa:mozillateam/ppa && \
-        apt-get update && \
-        apt-get install -y --no-install-recommends firefox-esr; \
-    fi && rm -rf /var/lib/apt/lists/*
+        npx --yes playwright@latest install --with-deps --no-shell chromium && \
+        ln -sf /root/.cache/ms-playwright/chromium-*/chrome-linux*/chrome /usr/local/bin/chromium && \
+        rm -rf /root/.npm; \
+    fi && rm -rf /var/lib/apt/lists/* && chromium --version
+
+# Xvnc dies without the classic bitmap font 'fixed' (xfonts-base) — previously
+# pulled in via apt recommends. Kept as its own late layer so edits to the apt
+# list above never invalidate the big browser layer in the build cache.
+RUN apt-get update && apt-get install -y --no-install-recommends xfonts-base \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /root/.vnc /root/Desktop \
     && echo "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd \
     && chmod 600 /root/.vnc/passwd
 
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+COPY --chmod=755 start.sh /start.sh
 
 EXPOSE 6080
 

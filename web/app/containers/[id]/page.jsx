@@ -2,9 +2,10 @@
 
 import { authFetch, getToken } from '@/lib/auth'
 import { useParams, useRouter } from 'next/navigation'
+import dynamic from 'next/dynamic'
 import { useEffect, useRef, useState } from 'react'
 import {
-  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp,
+  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, ExternalLink, Monitor, Loader2, Figma, KeyRound,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -13,9 +14,18 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
 import { Input } from '@/components/ui/input'
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const VNC_URL = process.env.NEXT_PUBLIC_VNC_URL || 'http://localhost:6080'
+
+// xterm.js touches the DOM at import time — client only
+const TerminalPanel = dynamic(() => import('@/components/terminal-panel'), {
+  ssr: false,
+  loading: () => <div className="h-[382px] animate-pulse rounded-[10px] border bg-[#0d1420]" />,
+})
 
 const SKILLS = [
   { icon: Globe, label: 'Web Research' },
@@ -35,6 +45,58 @@ function fmtBytes(bytes) {
   return `${(bytes / 1024 ** i).toFixed(i > 1 ? 1 : 0)}${units[i]}`
 }
 
+// One connector tile — state/badge/buttons are identical for every connector;
+// only the copy (name, hint, status text) and the connect flow differ
+function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, busyKey, connectLabel, connectDisabled, connectTitle, onConnect, onDisconnect }) {
+  const state = conn?.state
+  return (
+    <div className="rounded-[10px] border bg-[#0d1420] p-3.5" data-testid={`connector-card-${ctype}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <Icon className="h-[18px] w-[18px] text-foreground" />
+          <div>
+            <div className="text-[13px] font-bold">{name}</div>
+            <div className="text-[11px] text-muted-foreground/70">{hint}</div>
+          </div>
+        </div>
+        <Badge
+          variant={state === 'connected' ? 'green' : state === 'pending' ? 'yellow' : state === 'unavailable' ? 'dead' : 'gray'}
+          data-testid={`connector-status-${ctype}`}
+        >
+          {state === 'connected' ? 'Connected' : state === 'pending' ? 'Pending…' : state === 'unavailable' ? 'Unavailable' : 'Not connected'}
+        </Badge>
+      </div>
+
+      <div className="mt-2.5 text-[12px] text-muted-foreground/80">{statusText}</div>
+
+      <div className="mt-3 flex gap-2">
+        {state === 'connected' ? (
+          <Button
+            variant="outline" size="sm"
+            className="border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-400"
+            disabled={busy !== ''}
+            onClick={onDisconnect}
+            data-testid={`connector-disconnect-${ctype}`}
+          >
+            {busy === `${ctype}-disconnect` || busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}
+          </Button>
+        ) : (
+          <Button
+            variant="outline" size="sm"
+            disabled={busy !== '' || connectDisabled}
+            title={connectTitle}
+            onClick={onConnect}
+            data-testid={`connector-connect-${ctype}`}
+          >
+            {busy === busyKey ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Icon className="h-3.5 w-3.5" />}
+            {busy === busyKey ? 'Connecting…' : connectLabel}
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function ContainerDetail() {
   const params = useParams()
   const router = useRouter()
@@ -49,16 +111,160 @@ export default function ContainerDetail() {
   const [files, setFiles] = useState(null)
   const [inspect, setInspect] = useState(null)
   const [vncState, setVncState] = useState('disconnected') // disconnected | connecting | connected | unavailable
+  const [vncSecret, setVncSecret] = useState('') // one secret: fetched from the platform after login, auto-auths noVNC
   const [vncScaled, setVncScaled] = useState(false)
   const [mode, setMode] = useState('ai') // 'ai' = LLM decides, 'shell' = run directly
   const [agentModel, setAgentModel] = useState('')
   const [authRequired, setAuthRequired] = useState(false) // true = must be logged in to touch containers
+  const [connectors, setConnectors] = useState(null) // [{ type, state, login?, reason?, user_code? }] — null = loading
+  const [flowDialog, setFlowDialog] = useState(false) // GitHub connect dialog (device flow | token)
+  const [flowTab, setFlowTab] = useState('device') // 'device' = browser flow, 'token' = paste a PAT
+  const [ghToken, setGhToken] = useState('')
+  const [figmaDialog, setFigmaDialog] = useState(false) // Figma connect dialog (token only)
+  const [figmaToken, setFigmaToken] = useState('')
+  const [flowError, setFlowError] = useState('') // error shown inside the connect dialogs
+  const [flowBusy, setFlowBusy] = useState('')
   const cmdBoxRef = useRef(null)
 
+  // GitHub connector state — polled every 3s (the orchestrator caches its probe
+  // for 10s, so this stays cheap) so status follows container start/stop and
+  // device-flow completion without a manual refresh
   useEffect(() => {
+    let alive = true
+    async function load() {
+      try {
+        const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors`)
+        const list = res.ok ? await res.json() : []
+        if (alive) setConnectors(Array.isArray(list) ? list : [])
+      } catch { /* keep last known */ }
+    }
+    load()
+    const t = setInterval(load, 3000)
+    return () => { alive = false; clearInterval(t) }
+  }, [id])
+
+  const github = connectors?.find(c => c.type === 'github') || null
+  const figma = connectors?.find(c => c.type === 'figma') || null
+
+  // GitHub auth method #1 — browser device flow
+  async function connectGithub() {
+    if (authRequired && !getToken()) return router.push('/login')
+    setFlowBusy('connect')
+    setError('')
+    setFlowError('')
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/connect`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setFlowTab('device')
+      setFlowDialog(true)
+      setConnectors(list => (list || []).some(c => c.type === 'github')
+        ? list.map(c => (c.type === 'github' ? { ...c, state: 'pending', user_code: data.user_code, verification_url: data.verification_url } : c))
+        : [...(list || []), { type: 'github', state: 'pending', user_code: data.user_code, verification_url: data.verification_url }])
+    } catch (err) {
+      setError(err.message)
+      setFlowError(err.message)
+    }
+    setFlowBusy('')
+  }
+
+  // GitHub auth method #2 — paste a personal access token (classic or
+  // fine-grained; repo scope is what git push needs)
+  async function connectGithubToken() {
+    if (!ghToken.trim()) return
+    setFlowBusy('gh-token')
+    setFlowError('')
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/connect-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: ghToken.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setGhToken('')
+      setFlowDialog(false)
+      setConnectors(list => (list || []).map(c => (c.type === 'github' ? { ...c, state: 'connected', login: data.login, user_code: undefined } : c)))
+    } catch (err) {
+      setFlowError(err.message)
+    }
+    setFlowBusy('')
+  }
+
+  async function disconnectGithub() {
+    if (authRequired && !getToken()) return router.push('/login')
+    setFlowBusy('disconnect')
+    setError('')
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/disconnect`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setConnectors(list => (list || []).map(c => (c.type === 'github' ? { ...c, state: 'disconnected', login: null } : c)))
+    } catch (err) {
+      setError(err.message)
+    }
+    setFlowBusy('')
+  }
+
+  // Figma — token-only connector (Figma has no device flow)
+  async function connectFigma() {
+    if (!figmaToken.trim()) return
+    setFlowBusy('figma-token')
+    setFlowError('')
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/figma/connect-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: figmaToken.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setFigmaToken('')
+      setFigmaDialog(false)
+      setConnectors(list => {
+        const item = { type: 'figma', state: 'connected', login: data.login }
+        return (list || []).some(c => c.type === 'figma')
+          ? (list || []).map(c => (c.type === 'figma' ? item : c))
+          : [...(list || []), item]
+      })
+    } catch (err) {
+      setFlowError(err.message)
+    }
+    setFlowBusy('')
+  }
+
+  async function disconnectFigma() {
+    if (authRequired && !getToken()) return router.push('/login')
+    setFlowBusy('figma-disconnect')
+    setError('')
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/figma/disconnect`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setConnectors(list => (list || []).map(c => (c.type === 'figma' ? { ...c, state: 'disconnected', login: null } : c)))
+    } catch (err) {
+      setError(err.message)
+    }
+    setFlowBusy('')
+  }
+
+  async function openBrowserInContainer() {
+    try {
+      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/open-browser`, { method: 'POST' })
+      if (!res.ok) throw new Error()
+    } catch { /* desktop browser optional — the URL works on any browser */ }
+  }
+
+  useEffect(() => {
+    // provider default first; a persona's own model (per-provider override) wins when this
+    // container belongs to one — matched by name or 12-char id
     authFetch(`${API}/agent/status`).then(r => r.json()).then(s => setAgentModel(s.model || '')).catch(() => {})
+    authFetch(`${API}/agents`).then(r => r.json()).then(list => {
+      const me = (Array.isArray(list) ? list : []).find(a => a.container?.name === id || a.container?.id === id)
+      if (me?.model) setAgentModel(me.model)
+    }).catch(() => {})
     authFetch(`${API}/config`).then(r => r.json()).then(c => setAuthRequired(!!c.auth_required)).catch(() => {})
-  }, [])
+  }, [id])
 
   // Live stats polling (every 5s) — only meaningful while running
   useEffect(() => {
@@ -135,7 +341,7 @@ export default function ContainerDetail() {
         if (data.mode === 'consult') {
           setLog(l => [...l, { consult: true, request: cmd, model: data.model, reply: data.reply }])
         } else {
-          setLog(l => [...l, { ai: true, request: cmd, model: data.model, command: data.command, output: data.output, exit_code: data.exit_code }])
+          setLog(l => [...l, { ai: true, request: cmd, model: data.model, command: data.command, output: data.output, exit_code: data.exit_code, repo: data.repo, repo_warning: data.repo_warning }])
         }
       } else {
         setLog(l => [...l, { command: cmd, output: data.output, exit_code: data.exit_code }])
@@ -157,6 +363,16 @@ export default function ContainerDetail() {
 
   async function doConnect() {
     setVncState('connecting')
+    // Single sign-on: logged-in users get the shared VNC secret (== ADMIN_PASSWORD)
+    // and noVNC is auto-authenticated with it — no second password prompt.
+    // Await it BEFORE mounting the iframe so the secret is always in the URL.
+    try {
+      const r = await authFetch(`${API}/vnc/secret`)
+      const { password } = r.ok ? await r.json() : { password: '' }
+      setVncSecret(password || '')
+    } catch {
+      setVncSecret('')
+    }
     try {
       await fetch(VNC_URL, { mode: 'no-cors', signal: AbortSignal.timeout(3000) })
       setVncState('connected')
@@ -165,32 +381,16 @@ export default function ContainerDetail() {
     }
   }
 
-  async function submitPassword(e) {
-    e.preventDefault()
-    setPwError('')
-    const res = await authFetch(`${API}/auth/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwInput }),
-    })
-    const data = await res.json()
-    if (data.ok) {
-      setPwPromptOpen(false)
-      await doConnect()
-    } else {
-      setPwError('รหัสผ่านไม่ถูกต้อง')
-    }
-  }
-
   const metrics = stats
     ? [
         { k: 'CPU', v: `${stats.cpu_percent}%`, bar: Math.min(100, stats.cpu_percent) },
         { k: 'Memory', v: fmtBytes(stats.mem_used), span: `/ ${fmtBytes(stats.mem_limit)}`, bar: stats.mem_limit ? Math.min(100, (stats.mem_used / stats.mem_limit) * 100) : 0 },
+        { k: 'Disk', v: stats.disk_used != null ? fmtBytes(stats.disk_used) : '—', span: stats.disk_total != null ? `/ ${fmtBytes(stats.disk_total)}` : '', bar: stats.disk_total ? Math.min(100, (stats.disk_used / stats.disk_total) * 100) : 0 },
         { k: 'Network ↓', v: fmtBytes(stats.net_rx), span: 'received', bar: 40 },
         { k: 'Network ↑', v: fmtBytes(stats.net_tx), span: 'sent', bar: 25 },
       ]
     : [
-        { k: 'CPU' }, { k: 'Memory' }, { k: 'Network ↓' }, { k: 'Network ↑' },
+        { k: 'CPU' }, { k: 'Memory' }, { k: 'Disk' }, { k: 'Network ↓' }, { k: 'Network ↑' },
       ]
 
   return (
@@ -244,12 +444,10 @@ export default function ContainerDetail() {
 
             {/* ---- Console tab ---- */}
             <TabsContent value="console" className="mt-0 p-4">
-              <div
-                className={`relative mx-auto flex aspect-[16/9.5] flex-col overflow-hidden rounded-[10px] bg-[linear-gradient(135deg,#2c1e4d_0%,#1a1030_45%,#0f1a2e_100%)] transition-all ${vncScaled ? 'w-[125%]' : 'w-full'}`}
-              >
+              <div className="relative mx-auto flex aspect-[16/9.5] flex-col overflow-hidden rounded-[10px] bg-[linear-gradient(135deg,#2c1e4d_0%,#1a1030_45%,#0f1a2e_100%)]">
                 {vncState === 'connected' ? (
                   <iframe
-                    src={`${VNC_URL}/vnc.html?autoconnect=1`}
+                    src={`${VNC_URL}/vnc.html?autoconnect=1&resize=${vncScaled ? 'off' : 'scale'}${vncSecret ? `&password=${encodeURIComponent(vncSecret)}` : ''}`}
                     className="h-full w-full border-0"
                     title="noVNC console"
                   />
@@ -280,7 +478,7 @@ export default function ContainerDetail() {
                           <div className="text-[34px] font-extrabold tracking-tight text-slate-200/90 [text-shadow:0_4px_30px_rgba(124,92,252,0.55)]">
                             Ubuntu Desktop
                           </div>
-                          <div className="text-[12px] text-slate-200/55">XFCE · Chrome · Terminal — streamed live from the agent container</div>
+                          <div className="text-[12px] text-slate-200/55">XFCE · Chromium · Terminal — streamed live from the agent container</div>
                         </>
                       )}
                     </div>
@@ -292,7 +490,7 @@ export default function ContainerDetail() {
                 {vncState === 'connected' ? (
                   <>
                     <Button variant="outline" className="h-8 text-[12px]" onClick={() => setVncScaled(s => !s)}>
-                      <MonitorUp className="h-3.5 w-3.5" /> {vncScaled ? 'Actual size' : 'Scale'}
+                      <MonitorUp className="h-3.5 w-3.5" /> {vncScaled ? 'Scale to fit' : 'Actual size'}
                     </Button>
                     <Button variant="outline" className="h-8 border-red-500/40 text-[12px] text-red-400 hover:bg-red-500/10 hover:text-red-400" onClick={() => setVncState('disconnected')}>
                       Disconnect
@@ -300,12 +498,12 @@ export default function ContainerDetail() {
                   </>
                 ) : (
                   <Button variant="outline" className="h-8 text-[12px]" disabled={vncState === 'connecting'} onClick={connectVnc} data-testid="vnc-connect">
-                    Connect{authRequired ? ' 🔒' : ''}
+                    Connect{authRequired ? <Lock className="h-3.5 w-3.5" /> : ''}
                   </Button>
                 )}
               </div>
 
-              <div className="mt-4 grid grid-cols-4 gap-3 border-t pt-4 max-[800px]:grid-cols-2">
+              <div className="mt-4 grid grid-cols-5 gap-3 border-t pt-4 max-[900px]:grid-cols-3 max-[600px]:grid-cols-2">
                 {metrics.map(m => (
                   <div key={m.k} data-testid="metric">
                     <div className="text-[11px] font-semibold text-muted-foreground/70">{m.k}</div>
@@ -338,6 +536,7 @@ export default function ContainerDetail() {
                     {[
                       ['CPU', `${stats.cpu_percent}%`, Math.min(100, stats.cpu_percent)],
                       ['Memory', `${fmtBytes(stats.mem_used)} / ${fmtBytes(stats.mem_limit)}`, stats.mem_limit ? (stats.mem_used / stats.mem_limit) * 100 : 0],
+                      ['Disk', stats.disk_used != null ? `${fmtBytes(stats.disk_used)} / ${fmtBytes(stats.disk_total)}` : '—', stats.disk_total ? (stats.disk_used / stats.disk_total) * 100 : 0],
                       ['Network ↓ (received)', fmtBytes(stats.net_rx), 40],
                       ['Network ↑ (sent)', fmtBytes(stats.net_tx), 25],
                     ].map(([k, v, bar]) => (
@@ -433,38 +632,36 @@ export default function ContainerDetail() {
                 </button>
                 <button
                   className={`rounded px-2.5 py-1 transition-colors ${mode === 'shell' ? 'bg-primary text-white' : 'text-muted-foreground'}`}
-                  onClick={() => setMode('shell')}
+                  onClick={() => { if (authRequired && !getToken()) return router.push('/login'); setMode('shell') }}
                 >
                   Shell
                 </button>
               </div>
             </div>
-            <div className="relative">
-              <Textarea
-                ref={cmdBoxRef}
-                placeholder={mode === 'ai'
-                  ? 'บอก AI ว่าต้องการอะไร เช่น "สร้างไฟล์ hello.txt ที่มีข้อความสวัสดี"...'
-                  : 'Type your shell command...'}
-                value={cmd}
-                onChange={e => setCmd(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendCommand() }}
-                className="min-h-[96px] pb-6"
-              />
-              <div className="absolute bottom-2.5 left-3.5 text-[10.5px] text-muted-foreground/60">{cmd.length} characters</div>
-            </div>
             {mode === 'ai' ? (
-              <div className="mt-2.5 flex gap-2">
-                <Button variant="outline" className="flex-1" disabled={busy !== '' || !cmd.trim()} onClick={() => sendCommand(true)} data-testid="consult-command">
-                  💡 Consult
-                </Button>
-                <Button className="flex-1" disabled={busy !== '' || !cmd.trim()} onClick={() => sendCommand(false)} data-testid="send-command">
-                  <Send className="h-4 w-4" /> {busy === 'exec' ? 'Working…' : 'Execute'}
-                </Button>
-              </div>
+              <>
+                <div className="relative">
+                  <Textarea
+                    ref={cmdBoxRef}
+                    placeholder='บอก AI ว่าต้องการอะไร เช่น "สร้างไฟล์ hello.txt ที่มีข้อความสวัสดี"...'
+                    value={cmd}
+                    onChange={e => setCmd(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendCommand() }}
+                    className="min-h-[96px] pb-6"
+                  />
+                  <div className="absolute bottom-2.5 left-3.5 text-[10.5px] text-muted-foreground/60">{cmd.length} characters</div>
+                </div>
+                <div className="mt-2.5 flex gap-2">
+                  <Button variant="outline" className="flex-1" disabled={busy !== '' || !cmd.trim()} onClick={() => sendCommand(true)} data-testid="consult-command">
+                    <Lightbulb className="h-4 w-4" /> Consult
+                  </Button>
+                  <Button className="flex-1" disabled={busy !== '' || !cmd.trim()} onClick={() => sendCommand(false)} data-testid="send-command">
+                    <Send className="h-4 w-4" /> {busy === 'exec' ? 'Working…' : 'Execute'}
+                  </Button>
+                </div>
+              </>
             ) : (
-              <Button className="mt-2.5 w-full" disabled={busy !== '' || !cmd.trim()} onClick={() => sendCommand(false)} data-testid="send-command">
-                <Send className="h-4 w-4" /> {busy === 'exec' ? 'Working…' : 'Send Command'}
-              </Button>
+              <TerminalPanel containerId={id} />
             )}
 
             {log.length > 0 && (
@@ -482,6 +679,12 @@ export default function ContainerDetail() {
                     ) : (
                       <>
                         <div className="text-primary">$ {entry.command}</div>
+                        {entry.repo && <div className="mt-0.5 text-[10px] text-sky-400">repo: {entry.repo}</div>}
+                        {entry.repo_warning && (
+                          <div className="mt-0.5 flex items-center gap-1 text-[10px] text-amber-400">
+                            <TriangleAlert className="h-3 w-3 shrink-0" /> {entry.repo_warning}
+                          </div>
+                        )}
                         {entry.output && <pre className="mt-1 whitespace-pre-wrap text-muted-foreground">{entry.output}</pre>}
                         <div className={`mt-1 ${entry.error ? 'text-red-400' : 'text-emerald-400'}`}>
                           {entry.error ? 'error' : `exit code ${entry.exit_code}`}
@@ -500,6 +703,61 @@ export default function ContainerDetail() {
           </Card>
 
           <Card className="mt-4 p-4">
+            <div className="mb-3.5 text-[13.5px] font-bold">Connectors</div>
+            {connectors === null ? (
+              <div className="py-2 text-[12.5px] text-muted-foreground/70">Loading connectors…</div>
+            ) : (
+              <div className="grid gap-3">
+                <ConnectorTile
+                  ctype="github"
+                  name="GitHub"
+                  hint="gh + git push/pull ในเครื่องนี้"
+                  icon={Github}
+                  conn={github}
+                  busy={flowBusy}
+                  busyKey="connect"
+                  connectLabel="Connect GitHub"
+                  connectDisabled={github?.state === 'unavailable'}
+                  connectTitle={github?.state === 'unavailable' ? github?.reason : undefined}
+                  onConnect={connectGithub}
+                  onDisconnect={disconnectGithub}
+                  statusText={
+                    <>
+                      {github?.state === 'connected' && github?.login && <span className="font-semibold text-emerald-400">@{github.login}</span>}
+                      {github?.state === 'connected' && !github?.login && <span className="text-emerald-400">authenticated</span>}
+                      {github?.state === 'pending' && 'รออนุมัติใน browser…'}
+                      {github?.state === 'disconnected' && 'ยังไม่ได้เชื่อมต่อ — Connect ผ่าน browser หรือวาง personal access token'}
+                      {github?.state === 'unavailable' && (github?.reason || 'connector unavailable')}
+                    </>
+                  }
+                />
+                <ConnectorTile
+                  ctype="figma"
+                  name="Figma"
+                  hint="Figma REST API — อ่าน design file ในเครื่องนี้"
+                  icon={Figma}
+                  conn={figma}
+                  busy={flowBusy}
+                  busyKey="figma-token"
+                  connectLabel="Connect Figma"
+                  connectDisabled={figma?.state === 'unavailable'}
+                  connectTitle={figma?.state === 'unavailable' ? figma?.reason : undefined}
+                  onConnect={() => { setFlowError(''); setFigmaDialog(true) }}
+                  onDisconnect={disconnectFigma}
+                  statusText={
+                    <>
+                      {figma?.state === 'connected' && figma?.login && <span className="font-semibold text-emerald-400">@{figma.login}</span>}
+                      {figma?.state === 'connected' && !figma?.login && <span className="text-emerald-400">authenticated</span>}
+                      {figma?.state === 'disconnected' && 'ยังไม่ได้เชื่อมต่อ — Connect ด้วย Figma personal access token'}
+                      {figma?.state === 'unavailable' && (figma?.reason || 'connector unavailable')}
+                    </>
+                  }
+                />
+              </div>
+            )}
+          </Card>
+
+          <Card className="mt-4 p-4">
             <div className="mb-3.5 text-[13.5px] font-bold">Available Skills</div>
             <div className="grid grid-cols-2 gap-2.5">
               {SKILLS.map(({ icon: Icon, label }) => (
@@ -512,6 +770,126 @@ export default function ContainerDetail() {
         </div>
       </div>
 
+      {/* GitHub connect — two auth methods: the browser device flow (code
+          approved in ANY browser — the user's or the container's own desktop —
+          one machine at a time) or pasting a personal access token */}
+      <Dialog open={flowDialog} onOpenChange={open => { setFlowDialog(open); if (!open) setGhToken('') }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Github className="h-4 w-4" /> Connect GitHub</DialogTitle>
+            <DialogDescription>เลือกวิธี login ให้เครื่องนี้ — ผ่าน browser หรือวาง personal access token</DialogDescription>
+          </DialogHeader>
+          <Tabs value={flowTab} onValueChange={setFlowTab} className="pt-1">
+            <TabsList className="grid w-full grid-cols-2">
+              <TabsTrigger value="device"><Globe className="mr-1.5 h-3.5 w-3.5" />Browser</TabsTrigger>
+              <TabsTrigger value="token"><KeyRound className="mr-1.5 h-3.5 w-3.5" />Token</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="device" className="grid gap-4 pt-4">
+              {github?.state === 'pending' ? (
+                <>
+                  <div className="text-[12.5px] text-muted-foreground">เปิด GitHub ใน browser แล้วกรอกรหัสนี้เพื่อ login ให้เครื่องนี้ (github.com/login/device)</div>
+                  <button
+                    type="button"
+                    className="mx-auto rounded-xl border border-primary/40 bg-primary/10 px-8 py-4 font-mono text-[28px] font-bold tracking-[0.12em] text-primary transition-colors hover:bg-primary/20"
+                    data-testid="connector-user-code"
+                    title="คลิกเพื่อคัดลอกรหัส"
+                    onClick={e => {
+                      navigator.clipboard?.writeText(github?.user_code || '')
+                      e.currentTarget.textContent = 'Copied ✓'
+                      setTimeout(() => { e.currentTarget.textContent = github?.user_code || '' }, 1200)
+                    }}
+                  >
+                    {github?.user_code || '····-····'}
+                  </button>
+                  <div className="flex items-center justify-center gap-2 text-[12.5px]">
+                    <a href={github?.verification_url || 'https://github.com/login/device'} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-semibold text-primary hover:underline">
+                      {github?.verification_url || 'https://github.com/login/device'} <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  </div>
+                  <div className="flex items-center justify-center gap-2 rounded-md bg-secondary px-3 py-2 text-[12.5px] text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                    Waiting for authorization… ระบบเชื่อมต่ออัตโนมัติเมื่ออนุมัติแล้ว
+                  </div>
+                  <DialogFooter className="items-center sm:justify-between">
+                    <Button type="button" variant="outline" onClick={openBrowserInContainer}>
+                      <Monitor className="h-3.5 w-3.5" /> เปิด browser ในเดสก์ท็อป container
+                    </Button>
+                    <Button type="button" variant="ghost" onClick={() => setFlowDialog(false)}>Close</Button>
+                  </DialogFooter>
+                </>
+              ) : (
+                <div className="grid gap-3 py-2">
+                  <div className="text-[12.5px] text-muted-foreground">ขั้นตอน browser ยังไม่เริ่ม หรือหมดอายุไปแล้ว</div>
+                  <Button type="button" onClick={connectGithub} disabled={flowBusy !== ''}>
+                    {flowBusy === 'connect' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Globe className="h-3.5 w-3.5" />}
+                    ขอรหัสใหม่
+                  </Button>
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="token" className="grid gap-3 pt-4">
+              <div className="text-[12.5px] leading-relaxed text-muted-foreground">
+                วาง GitHub personal access token (classic หรือ fine-grained — scope <span className="font-mono">repo</span> เพื่อ push ได้)
+                สร้างได้ที่ Settings → Developer settings → Personal access tokens
+              </div>
+              <Input
+                type="password" autoComplete="off" placeholder="ghp_… หรือ github_pat_…"
+                value={ghToken} onChange={e => setGhToken(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') connectGithubToken() }}
+                data-testid="connector-token-input-github"
+              />
+              {flowError && (
+                <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-400" data-testid="connector-flow-error">
+                  {flowError}
+                </div>
+              )}
+              <DialogFooter>
+                <Button type="button" variant="ghost" onClick={() => setFlowDialog(false)}>Cancel</Button>
+                <Button type="button" onClick={connectGithubToken} disabled={flowBusy !== '' || !ghToken.trim()} data-testid="connector-token-submit-github">
+                  {flowBusy === 'gh-token' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+                  Connect ด้วย token
+                </Button>
+              </DialogFooter>
+            </TabsContent>
+          </Tabs>
+        </DialogContent>
+      </Dialog>
+
+      {/* Figma connect — token-only (Figma has no device flow). The platform
+          validates the token once, then it lives only inside the container */}
+      <Dialog open={figmaDialog} onOpenChange={open => { setFigmaDialog(open); if (!open) setFigmaToken('') }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Figma className="h-4 w-4" /> Connect Figma</DialogTitle>
+            <DialogDescription>วาง Figma personal access token — สร้างได้ที่ Figma → Settings → Security → Personal access tokens</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 pt-2">
+            <div className="text-[12.5px] leading-relaxed text-muted-foreground">
+              token จะถูกเก็บในเครื่องนี้ที่ <span className="font-mono">~/.config/figma/token</span> พร้อม export <span className="font-mono">FIGMA_TOKEN</span> ให้ shell เรียก Figma REST API ได้ทันที
+            </div>
+            <Input
+              type="password" autoComplete="off" placeholder="figd_…"
+              value={figmaToken} onChange={e => setFigmaToken(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') connectFigma() }}
+              data-testid="connector-token-input-figma"
+            />
+            {flowError && (
+              <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-400" data-testid="connector-flow-error">
+                {flowError}
+              </div>
+            )}
+            <DialogFooter>
+              <Button type="button" variant="ghost" onClick={() => setFigmaDialog(false)}>Cancel</Button>
+              <Button type="button" onClick={connectFigma} disabled={flowBusy !== '' || !figmaToken.trim()} data-testid="connector-token-submit-figma">
+                {flowBusy === 'figma-token' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
+                Connect ด้วย token
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

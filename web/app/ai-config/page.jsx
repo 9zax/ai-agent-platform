@@ -29,7 +29,6 @@ export default function AIConfigPage() {
       ...config,
       ai_provider: p.id,
       ai_base_url: p.base_url,
-      ai_model: p.model,
     })
     setSaved(false)
   }
@@ -43,7 +42,6 @@ export default function AIConfigPage() {
       const body = {
         ai_provider: config.ai_provider,
         ai_base_url: config.ai_base_url,
-        ai_model: config.ai_model,
       }
       if (apiKey) body.ai_api_key = apiKey
       const res = await authFetch(`${API}/config`, {
@@ -93,7 +91,7 @@ export default function AIConfigPage() {
               <div className="mt-1 text-[11px] text-muted-foreground/70">{p.note}</div>
               <div className="mt-2 flex gap-1.5">
                 <Badge variant={p.local ? 'green' : 'gray'} className="text-[10px]">{p.local ? 'no key' : p.protocol}</Badge>
-                {p.model && <Badge variant="blue" className="font-mono text-[10px]">{p.model}</Badge>}
+                {p.model && <Badge variant="blue" className="font-mono text-[10px]" title="default ของ provider — ปรับต่อ agent ได้ที่หน้า AI Team">{p.model}</Badge>}
               </div>
             </button>
           ))}
@@ -106,10 +104,6 @@ export default function AIConfigPage() {
               <Input id="ai-base" value={config.ai_base_url} placeholder="https://..." onChange={e => setConfig({ ...config, ai_base_url: e.target.value })} />
             </div>
             <div className="grid gap-1.5">
-              <label htmlFor="ai-model" className="text-[13px] font-medium">Model</label>
-              <Input id="ai-model" value={config.ai_model} placeholder="model id" onChange={e => setConfig({ ...config, ai_model: e.target.value })} />
-            </div>
-            <div className="grid gap-1.5">
               <label htmlFor="ai-key" className="text-[13px] font-medium">
                 API Key {config.ai_api_key_masked && <span className="ml-1 font-mono text-[11px] text-muted-foreground/60">current: {config.ai_api_key_masked}</span>}
               </label>
@@ -118,10 +112,13 @@ export default function AIConfigPage() {
             {error && <div className="rounded-md bg-red-500/15 px-3 py-2 text-[12.5px] text-red-400">{error}</div>}
             <div className="flex items-center gap-3">
               <Button type="submit" disabled={saving}><Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save Provider Config'}</Button>
-              {saved && <span className="text-[12.5px] font-medium text-emerald-400" data-testid="saved-indicator">Saved ✓</span>}
+              {saved && <span className="flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="saved-indicator">Saved <Check className="h-3.5 w-3.5" /></span>}
             </div>
           </form>
         </Card>
+        <div className="mt-3 text-[12px] text-muted-foreground/70" data-testid="per-agent-model-hint">
+          เลือกโมเดลทำที่ระดับ agent — ตั้ง per-persona model ได้ที่หน้า <a className="text-primary underline" href="/team">AI Team</a>
+        </div>
       </div>
     </>
   )

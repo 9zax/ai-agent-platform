@@ -2,7 +2,7 @@
 
 import { authFetch } from '@/lib/auth'
 import { useEffect, useState } from 'react'
-import { Server, Package, ShieldCheck, KeyRound } from 'lucide-react'
+import { Server, Package, ShieldCheck, KeyRound, GitBranch, Check } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,9 +13,13 @@ const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 export default function SettingsPage() {
   const [health, setHealth] = useState(null)
   const [config, setConfig] = useState(null)
+  const [aiStatus, setAiStatus] = useState(null)
   const [password, setPassword] = useState('')
   const [pwSaving, setPwSaving] = useState(false)
   const [pwSaved, setPwSaved] = useState(false)
+  const [gitToken, setGitToken] = useState('')
+  const [gtSaving, setGtSaving] = useState(false)
+  const [gtSaved, setGtSaved] = useState(false)
 
   async function loadConfig() {
     authFetch(`${API}/config`).then(r => r.json()).then(setConfig).catch(() => setConfig(null))
@@ -23,6 +27,7 @@ export default function SettingsPage() {
 
   useEffect(() => {
     authFetch(`${API}/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null))
+    authFetch(`${API}/agent/status`).then(r => r.json()).then(setAiStatus).catch(() => setAiStatus(null))
     loadConfig()
   }, [])
 
@@ -44,12 +49,30 @@ export default function SettingsPage() {
     setPwSaving(false)
   }
 
+  async function saveGitToken(e) {
+    e.preventDefault()
+    if (!gitToken) return
+    setGtSaving(true)
+    setGtSaved(false)
+    const res = await authFetch(`${API}/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ git_token: gitToken }),
+    })
+    if (res.ok) {
+      setGitToken('')
+      setGtSaved(true)
+      await loadConfig()
+    }
+    setGtSaving(false)
+  }
+
   const rows = [
     ['Orchestrator', health ? 'Healthy' : 'Unreachable', health ? 'text-emerald-400' : 'text-red-400'],
     ['Docker socket', health?.docker ? 'Connected' : 'Not connected', health?.docker ? 'text-emerald-400' : 'text-amber-400'],
     ['API endpoint', API, ''],
-    ['AI provider', config?.ai_provider ?? '—', ''],
-    ['Model', config?.ai_model || config?.default_model || '—', ''],
+    ['AI provider', aiStatus?.provider || config?.ai_provider || '—', ''],
+    ['Model (provider default)', aiStatus?.model || '—', ''],
     ['Max containers', config?.max_containers ?? '—', ''],
     ['Auto-restart', config ? (config.auto_restart ? 'On' : 'Off') : '—', ''],
   ]
@@ -97,7 +120,33 @@ export default function SettingsPage() {
               {pwSaving ? 'Saving…' : 'Save'}
             </Button>
           </form>
-          {pwSaved && <div className="mt-2 text-[12.5px] font-medium text-emerald-400" data-testid="password-saved">Saved ✓</div>}
+          {pwSaved && <div className="mt-2 flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="password-saved">Saved <Check className="h-3.5 w-3.5" /></div>}
+        </Card>
+
+        <Card className="p-5">
+          <div className="mb-2 flex items-center gap-2 text-[14px] font-bold">
+            <GitBranch className="h-4 w-4 text-primary" /> Git Access
+          </div>
+          <div className="mb-3 text-[12.5px] leading-relaxed text-muted-foreground/80">
+            GitHub token สำหรับให้ agent <b>clone private repo</b> ลง container ได้ (แบบเดียวกับ bot ที่มี credential บนเครื่อง Linux ของตัวเอง) — ใช้ PAT สิทธิ์อ่าน (Contents: Read-only) ก็พอ
+          </div>
+          <div className="mb-3">
+            <Badge variant={config?.git_token_set ? 'green' : 'gray'} data-testid="git-token-status">
+              {config?.git_token_set ? 'Token set' : 'No token (public repos only)'}
+            </Badge>
+          </div>
+          <form onSubmit={saveGitToken} className="flex gap-2">
+            <Input
+              type="password"
+              value={gitToken}
+              placeholder="GitHub PAT (ghp_… / github_pat_…)"
+              onChange={e => setGitToken(e.target.value)}
+            />
+            <Button type="submit" disabled={gtSaving || !gitToken} data-testid="save-git-token">
+              {gtSaving ? 'Saving…' : 'Save'}
+            </Button>
+          </form>
+          {gtSaved && <div className="mt-2 flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="git-token-saved">Saved <Check className="h-3.5 w-3.5" /></div>}
         </Card>
 
         <Card className="p-5">

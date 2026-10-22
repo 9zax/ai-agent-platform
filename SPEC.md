@@ -1,7 +1,7 @@
 # AI Agent Platform — Specification & Progress
 
 > เอกสารนี้สำหรับ AI หรือนักพัฒนาที่ทำงานต่อจากจุดนี้  
-> อัปเดตล่าสุด: 2026-10-22
+> อัปเดตล่าสุด: 2026-10-23
 
 ## 1. Project Overview
 
@@ -25,16 +25,17 @@
   - `POST /containers` — สร้าง container จริง
   - `POST /containers/{id}/start|stop|restart` + `DELETE` — lifecycle จริง (guard เฉพาะ container ที่ platform สร้าง)
   - `POST /containers/{id}/exec` — รัน shell ใน container
+  - `GET /containers/{id}/terminal/ws` — **interactive terminal จริง (WebSocket ⇄ docker exec TTY + xterm.js ใน UI)**
   - `POST /containers/{id}/agent` — **ZAI GLM รับคำสั่งภาษาธรรมชาติ → เลือกคำสั่ง shell → รันจริง**
   - `GET /containers/{id}/stats|inspect|files` — สถิติจริง / metadata / ไฟล์ใน container
   - `GET/POST/DELETE /tasks` — task board จริง
   - `GET/PUT /config`, `GET /skills`, `PUT /skills/{id}` — config + skills จริง
 - [x] Web Dashboard (Next.js + Tailwind + shadcn/ui) เชื่อม API จริงทุกหน้า
   - Dashboard: ตาราง container สด, สร้าง container ผ่าน dialog, search/filter
-  - Container detail: noVNC console (connect จริง), metrics สดจาก docker stats, tabs Files/Analytics/Security/Networks ของจริง, Command Center (AI/Shell)
+  - Container detail: noVNC console (connect จริง), metrics สดจาก docker stats, tabs Files/Analytics/Security/Networks ของจริง, Command Center (AI สั่งงาน / Shell = terminal จริง xterm.js)
   - Board: Kanban + เพิ่ม task จริง
   - Skills / AI Config / Settings หน้าจริง ใช้งานได้
-- [x] Agent Base Image (Ubuntu + XFCE + noVNC + browser จริง + Terminal; Chrome บน amd64, Firefox ESR บน arm64)
+- [x] Agent Base Image (Ubuntu + XFCE แบบ minimal + noVNC + browser จริง + Terminal; Chrome บน amd64, Chromium ผ่าน Playwright บน arm64 — ตัด xfce4-goodies/xterm/software-properties-common ออกเพื่อลดขนาดภาพ)
 - [x] AI Integration: ZAI GLM (Anthropic-compatible endpoint) — model เปลี่ยนได้จากหน้า AI Config
 - [x] Safety guard: แก้ไขได้เฉพาะ container ที่ platform สร้างเท่านั้น (label `managed-by=ai-agent-platform`)
 - [x] E2E tests (Playwright) 30  tests ครอบทุก feature รวม full container lifecycle และ AI agent
@@ -43,9 +44,26 @@
 ### สิ่งที่ยังไม่ได้ทำ
 - [ ] Vision / Screenshot capability
 - [ ] GitHub OAuth + Permission approval flow
-- [ ] Persistent storage สำหรับ AI memory และ config (ตอนนี้ config/tasks/runs เก็บในหน่วยความจำ)
+- [ ] Persistent storage สำหรับ AI memory และ config (ส่วน **runs ทำแล้ว** — เก็บถาวรที่ `/data/runs.json` ผ่าน volume `agent-data` เห็นข้าม restart; เหลือ personas/tasks/config/skills ยังเก็บในหน่วยความจำ)
+- [x] **Agent activity + work history** (2026-10-23): กด node agent ใน React Flow → dialog 3 tab — **กำลังทำอะไรอยู่** (สถานะสด: working / speaking / รอคนตอบ / pending + งานที่ทีมกำลังทำ) · **ประวัติการทำงาน** (ทุก run ที่ agent นั้นร่วม พร้อมเวลา/ระยะเวลา/rev/meeting/excerpt ของ deliverable — ดึงจาก `GET /agents/{role}/activity`, ประวัติ persist ข้าม restart) · **แก้ไข persona** (form เดิม); run ทุกอันถูก persist เป็น `/data/runs.json` (atomic write) และ restore ตอน boot (run ที่ค้างกลางคันปิดเป็น `stopped`)
+- [x] **Meeting = แชทเรียลไทม์ + Need human** (2026-10-23): ช่วงถาม-ตอบในหน้า project เป็น chat thread จริง — bubble ซ้าย (agent) / ขวา (คุณ), เวลาต่อข้อความ, system note กลางการ์ด, **typing indicator** ระหว่างรอคำตอบ, auto-scroll; agent ที่ตอบไม่ได้จริง ๆ ASK ถึง `human` (หรือครบ cap ของ meeting) → run เข้าสถานะ **waiting_human** หยุดรอ แล้วคนตอบในกล่องแชท (`POST /runs/{id}/discussions/{d}/reply`) ทีมทำงานต่อ — มี timeout 1 ชม. (ผ่านไปแล้วทีมไปต่อพร้อม note), node/meeting บน canvas ขึ้นสถานะ rose "รอคุณตอบ"
+- [x] **Loop mode** (2026-10-23): ติ๊ก "ทำงานเป็น Loop" ตอนสั่งงาน (`{task, loop: true}`) → จบ run แล้ว **PO ประเมิน** goal เทียบกับสรุปทุกรอบ แล้วเขียน task ของรอบถัดไปเอง (หรือตอบ `DONE` จบ chain) — run ถัดไปถูก spawn อัตโนมัติ (จำกัด 8 รอบ), UI ตาม chain ผ่าน `next_run_id`, กด **หยุดทีม** (`POST /runs/{id}/stop`) ได้ทุกเมื่อ (งานที่เหลือเป็น skipped)
 - [x] ~~ระบบ Task Queue + Assignment อัตโนมัติของ Orchestrator~~ → **Team Run engine** (2026-10-22): `POST /projects/{id}/run` สั่งงานเดียวผ่านทีมทั้งโปรเจกต์ — agent แต่ละตัวทำงานตามลำดับ เห็นงานของคนก่อน (handoff) และเขียน deliverable ลง container จริง (`/workspace/run-xxx-{role}.md`); UI หน้า project มี Mission Control + timeline สด (poll `GET /runs/{id}`)
-- [x] ~~ระบบ Roles ที่ชัดเจน~~ → personas 6 บทบาท (PO, Research, FE, BE, UX/UI, QA) แก้ได้จากหน้า AI Team
+- [x] **Meeting loop — ทีมถามกลับกันได้** (2026-10-23): agent ที่ติดขัดจบคำตอบด้วยบล็อก `## ASK` + `to: role1, role2` → ระบบเปิดการ์ด **Team Meeting** (Discussion) — ผู้ถูกถามตอบทีละคน (เห็นสดทีละข้อความ), เจ้าของคำถามแก้ deliverable เป็น **rev 2** (เขียนทับไฟล์ใน container จริง), ถามต่อได้ (จำกัด 2 รอบ meeting แล้ว PO ตัดสิน), จบด้วย **PO เขียนสรุป mission**; React Flow แสดงสด: node ที่กำลังทำงาน (ฟ้า) / กำลังคุย (เหลือง) / ส่งงานแล้ว (เขียว) + การ์ด Meeting ลอยเชื่อมเส้น amber ถึงทุกคนที่เกี่ยวข้อง พร้อมแชทถาม-ตอบใน timeline
+- [x] ~~ระบบ Roles ที่ชัดเจน~~ → personas 9 บทบาท แก้ไขได้จากหน้า AI Team — flow ตาม process จริง: **PO (Mickey) เปิดโจทย์ → BA (Petch) วิเคราะห์ business → SA (Oat) ทำ system spec แล้วคุยกับ UX/UI (Sept, Chom), Dev (Zax, Bank, Earth) และ QA (Tara)** ทุกตัวทำงานร่วมกันในทีมเดียว
+- [x] Default project: **AI Agent Platform** (seed มาตอน startup) — ทีมทำงานกับตัว platform เอง (ไม่ใช่ Web Portal ทั่วไป) พร้อม flow BA→SA→PO→Specialists ในหน้า Projects
+- [x] **Repo-first workspace** (2026-10-23) — หลักการ "bot ทำงานบนเครื่อง Linux": ทุกคำสั่งรันใน container ของ agent จริง, project มี `repo_url` (แก้ได้ในหน้า Projects) และ orchestrator จะ `git clone` (depth 1) ลง `/workspace/<repo>` ให้ก่อนทำงาน — idempotent (มี clone อยู่แล้ว = ไม่แตะ working tree), ติดตั้ง git ให้เองถ้า image ไม่มี (apk/apt)
+  - Command Center (AI): clone repo ก่อน → รันคำสั่งด้วย cwd = repo → response แสดง `repo` path / `repo_warning`
+  - Team Run: clone ครั้งเดียวใน container แรกที่ running ก่อนเริ่ม relay → prompt ทุก persona อ้าง path repo จริง (cite real paths, ทำงานไฟล์ผ่าน repo เท่านั้น)
+  - Container ที่ platform สร้าง mount volume ร่วม `ai-agent-platform-workspace:/workspace` = ทั้งทีมแชร์ working tree เดียว (เหมือนทำงานบนเครื่องเดียว); compose ของ `agent-example` pin ชื่อ volume ให้ตรงกันด้วย
+  - **Private repo**: ตั้ง GitHub PAT (สิทธิ์อ่าน Contents) ที่หน้า **Settings → Git Access** → orchestrator แทรก token แบบ `x-access-token` ใน URL ตอน clone เท่านั้น (token ไม่โผล่ใน error/log; จะถูกเก็บใน `.git/config` ของ container ที่ clone)
+  - หมายเหตุ: container เก่าที่สร้างก่อน feature นี้ไม่มี bind `/workspace` (Docker ใส่ bind ย้อนหลังไม่ได้) — recreate ตัว agent ถ้าต้องการแชร์ volume; `ensure_repo` ยังทำงานกับ container เก่าได้ (clone ลง layer ของ container นั้น) เพียงแต่ไม่แชร์/ไม่ persist
+- [x] **Default tool belt ทุก container + tools manifest ใน prompt** (2026-10-23): หลักการ "ทุกเครื่อง Linux มี default เหมือนกัน และ AI รู้ว่ามีอะไรใช้ได้จริง"
+  - `ensure_tools` (orchestrator): ก่อน AI ทำงานทุกครั้ง — ติดตั้ง core tools ที่ขาดให้อัตโนมัติ (git, gh, curl, jq, ca-certificates — รองรับทั้ง apk/apt ใช้กับ image ใดก็ได้รวมถึง container เก่า), ลงทะเบียน GitHub PAT กับ `gh auth login --with-token` + `git config url.insteadOf` (agent clone/push private repo ได้เองโดยไม่ต้องฝัง token ใน URL), ตั้ง git identity default (AI Agent / agent@ai-agent-platform.local) ให้ commit ไม่พัง
+  - `tools_manifest` (orchestrator): probe ของจริงใน container (`command -v` + `--version` + สถานะ `gh auth status`) แล้วแปะเข้า system prompt เป็นสองรายการ: **tools ที่มีจริงพร้อม version + hint การใช้** และ **tools ที่ไม่มี (ห้ามใช้/ห้ามเดา)** — แก้ปัญหา AI hallucinate เครื่องมือ (เคส `gh: not found`)
+  - agent-base image เพิ่ม default tools: wget, jq, zip/unzip, ripgrep, rsync, openssh-client, file, tree, less, nano, xz-utils (เดิมมี git, gh, curl, python3+pip, Node 22, chromium อยู่แล้ว)
+  - persona rules ตัด hardcoded claim "`gh` CLI is installed" ออก (ต้นเหตุ hallucination) — ความจริงเรื่องเครื่องมือมาจาก manifest ที่ probe จริงเท่านั้น
+  - หมายเหตุ: ต้อง rebuild + recreate orchestrator จะได้ feature นี้; ส่วน agent container เก่าใช้ได้ทันทีผ่าน `ensure_tools` (auto-install) ไม่ต้อง recreate แต่ถ้าอยากได้ tools เต็มใน image (rg, rsync, chromium ฯลฯ) ต้อง rebuild agent-base แล้ว recreate ตัว agent
 
 ## 3. Architecture
 
@@ -79,8 +97,8 @@
 | ผู้ใช้ | 1 คน | - |
 | จำนวน Container | 5–10 | สร้างได้จาก UI แล้ว |
 | Runtime | Docker บน VPS | Production build ใช้งานได้ |
-| Desktop | เห็น browser + Terminal จริง (noVNC) | ✅ (Chrome amd64 / Firefox ESR arm64) |
-| Persistence | Mount volume | ยังไม่ implement |
+| Desktop | เห็น browser + Terminal จริง (noVNC) | ✅ (Chrome amd64 / Chromium arm64) |
+| Persistence | Mount volume | ✅ runs เก็บถาวรที่ /data/runs.json (volume agent-data) — เหลือ config/personas/tasks |
 | AI Model | Config จากหน้าเว็บ, เก็บใน container ได้ | ✅ config จากหน้า AI Config (ZAI GLM) |
 | AI Mode | อิสระ หรือควบคุมจากกลางได้ | บางส่วน (AI/Shell toggle ต่อ container) |
 | Vision | AI มองเห็นหน้าจอได้ (Screenshot) | ยังไม่ทำ |
@@ -91,14 +109,20 @@
 
 ## 5. Recommended Roles
 
-| บทบาท | หน้าที่ | จำนวนแนะนำ |
-|--------|--------|-------------|
-| Orchestrator | รับงาน แบ่งงาน ติดตาม ประสานงาน | 1 (บริการกลาง) |
-| Product Owner | รับ requirement เขียน User Story | 1 |
-| Backend Developer | พัฒนา API, Database, Logic | 1–2 |
-| Frontend Developer | พัฒนา UI และเชื่อมต่อ API | 1–2 |
-| QA / Tester | เขียนและรัน Test | 1 |
-| DevOps | CI/CD, Docker, Deployment | 1 |
+Flow การทำงานของทีม (ตาม process จริง): **PO เปิดโจทย์ → BA วิเคราะห์ business → SA แปลงเป็น system spec แล้ว brief ให้ UX/UI + Dev + QA (ทำงานร่วมกันใน mission เดียว)** — SA เป็นคนคุยกับ Dev เป็นหลัก, BA ตามเข้าเฉพาะตอน clarify business rules, PO ประสานทั้งทีม
+
+| บทบาท | ชื่อ Agent | หน้าที่ |
+|--------|-----------|--------|
+| Orchestrator | (บริการกลาง) | รับงาน แบ่งงาน ติดตาม ประสานงาน |
+| Product Owner | Mickey | เปิดโจทย์ กำหนด goal/priority และประสานงานทั้งทีม (มาก่อนทุกคน) |
+| Business Analyst | Petch | รับ goal จาก PO → business requirements, success metrics, ความเสี่ยง |
+| System Analyst | Oat | แปลง business → system spec (data model, API contract) และ brief ให้ทีมสร้าง |
+| UX/UI Designer | Sept | ฝั่ง UX — user flows, IA, wireframes, unhappy paths |
+| UX/UI Designer | Chom | ฝั่ง UI — visual design, design tokens, components |
+| Frontend Developer | Zax | พัฒนา UI และเชื่อมต่อ API |
+| Backend Developer | Bank | Services / API design, observability |
+| Backend Developer | Earth | Data, migrations, caching, CI/CD, reliability |
+| QA Engineer | Tara | Test strategy, E2E (Playwright), quality gates |
 
 ## 6. Technology Stack
 
@@ -117,7 +141,7 @@
    ทำให้หน้า Dashboard ดึงรายการ Container จริงและมีปุ่มสร้าง Container ใหม่
 
 2. **ปรับปรุง Agent Base**  
-   - เพิ่ม Chrome แทน Firefox (ถ้าต้องการ)  
+   - ~~เพิ่ม Chrome แทน Firefox~~ เสร็จแล้ว (2026-10-23): arm64 ใช้ Chromium จาก Playwright, ลดขนาดภาพด้วย XFCE minimal  
    - เตรียมจุดสำหรับใส่ AI Agent script
 
 3. **AI Integration**  
@@ -181,9 +205,9 @@ docker compose --profile example up -d agent-example
 | ego browser | ไม่ใช่สำหรับ container | ออกแบบให้ใช้ profile/login ของ user บนเครื่อง host — เหมาะกับ agent ฝั่ง host ไม่ใช่ sandbox แยก |
 | Hosted (Browserbase ฯลฯ) | กรณีพิเศษ | สะดวกแต่มีค่าใช้จ่าย + ข้อมูลออกนอกเครื่อง |
 
-**แนวทางของ platform นี้:** agent-base ติดตั้ง browser จริงไว้แล้ว (Chrome บน amd64 / Firefox ESR บน arm64 — Chrome ไม่มี arm64 Linux build) และมี `gh` CLI ให้เปิด GitHub issue ได้ตามที่ persona ประกาศไว้ใน rules; จะเพิ่ม headless Chromium + CDP endpoint ใน container เมื่อถึงขั้นตอน Vision/Screenshot
+**แนวทางของ platform นี้:** agent-base ติดตั้ง browser จริงไว้แล้ว (Chrome บน amd64 / Chromium บน arm64 — Chrome ไม่มี arm64 Linux build) และมี `gh` CLI ให้เปิด GitHub issue ได้ตามที่ persona ประกาศไว้ใน rules; จะเพิ่ม headless Chromium + CDP endpoint ใน container เมื่อถึงขั้นตอน Vision/Screenshot
 
 ---
 
 **Repository:** https://github.com/9zax/ai-agent-platform  
-**Last Updated:** 2026-10-22
+**Last Updated:** 2026-10-23

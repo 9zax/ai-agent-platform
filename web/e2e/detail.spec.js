@@ -19,15 +19,19 @@ test.describe('Container detail', () => {
     await expect(page.getByRole('tab', { name: 'Console' })).toHaveAttribute('aria-selected', 'false')
   })
 
-  test('command box counts characters', async ({ page }) => {
-    await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    await expect(page.getByText('0 characters')).toBeVisible()
-    await page.getByPlaceholder(/shell command/).fill('run tests')
+  test('command box counts characters (AI mode) and Shell opens a real terminal', async ({ page }) => {
+    // AI mode keeps the textarea with a live character counter
+    await page.getByPlaceholder(/บอก AI ว่าต้องการอะไร/).fill('run tests')
     await expect(page.getByText('9 characters')).toBeVisible()
+
+    // Shell mode swaps it for a real interactive terminal (xterm.js over WebSocket)
+    await page.getByRole('button', { name: 'Shell', exact: true }).click()
+    await expect(page.getByTestId('terminal')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByPlaceholder(/บอก AI ว่าต้องการอะไร/)).toHaveCount(0)
   })
 
   test('shows resource metrics', async ({ page }) => {
-    for (const metric of ['CPU', 'Memory', 'Network ↓', 'Network ↑']) {
+    for (const metric of ['CPU', 'Memory', 'Disk', 'Network ↓', 'Network ↑']) {
       await expect(page.getByTestId('metric').filter({ hasText: metric })).toBeVisible()
     }
   })

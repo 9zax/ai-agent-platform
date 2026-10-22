@@ -24,10 +24,11 @@ test.describe('AI Config', () => {
     await page.goto('/ai-config')
     await expect(page.getByTestId('provider-zai')).toBeVisible()
 
-    // Picking a template fills the base URL and model
+    // Picking a template fills the base URL (model config lives per-agent in AI Team, not here)
     await page.getByTestId('provider-anthropic').click()
     await expect(page.getByLabel('Base URL')).toHaveValue(/api\.anthropic\.com/)
-    await expect(page.getByLabel('Model')).not.toHaveValue('')
+    await expect(page.getByLabel('Model')).toHaveCount(0)
+    await expect(page.getByTestId('per-agent-model-hint')).toBeVisible()
 
     // Switch back to the default and save
     await page.getByTestId('provider-zai').click()

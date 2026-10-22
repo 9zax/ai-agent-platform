@@ -15,25 +15,21 @@ exec startxfce4
 EOF
 chmod +x /root/.vnc/xstartup
 
-# Browser desktop shortcut (Chrome on amd64, Firefox ESR on arm64)
-if command -v google-chrome >/dev/null 2>&1; then
+# Browser desktop shortcut (Google Chrome on amd64, Chromium on arm64 —
+# both are linked as /usr/local/bin/chromium in the Dockerfile)
+if command -v chromium >/dev/null 2>&1; then
+    if command -v google-chrome >/dev/null 2>&1; then
+        BROWSER_NAME="Google Chrome"; BROWSER_ICON="google-chrome"
+    else
+        BROWSER_NAME="Chromium"; BROWSER_ICON="web-browser"
+    fi
     cat > /root/Desktop/web-browser.desktop <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Google Chrome
-Exec=google-chrome --no-sandbox --disable-gpu --no-first-run
-Icon=google-chrome
-StartupNotify=true
-EOF
-else
-    cat > /root/Desktop/web-browser.desktop <<EOF
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Firefox
-Exec=env MOZ_ALLOW_RUN_AS_ROOT=1 firefox-esr
-Icon=firefox-esr
+Name=$BROWSER_NAME
+Exec=chromium --no-sandbox --disable-gpu --no-first-run
+Icon=$BROWSER_ICON
 StartupNotify=true
 EOF
 fi
@@ -49,13 +45,20 @@ StartupNotify=true
 EOF
 chmod +x /root/Desktop/*.desktop
 
-# Access is gated by the platform's web login — run Xvnc directly with NO -rfbauth
-# (the vncserver wrapper insists on a password; Xvnc itself starts authless without it)
-rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
-Xvnc :1 -geometry 1280x800 -depth 24 -localhost -rfbport 5901 &
-sleep 2
-DISPLAY=:1 startxfce4 &
+# One secret everywhere: when ADMIN_PASSWORD (from .env) is set, the VNC server uses it.
+# The web UI auto-authenticates logged-in users with the same secret — no second prompt.
+if [ -n "$ADMIN_PASSWORD" ]; then
+    printf '%s\n' "$ADMIN_PASSWORD" | vncpasswd -f > /root/.vnc/passwd
+    chmod 600 /root/.vnc/passwd
+    vncserver :1 -geometry 1280x800 -depth 24 -localhost
+else
+    # No password configured — run Xvnc directly without -rfbauth (authless)
+    rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null
+    Xvnc :1 -geometry 1280x800 -depth 24 -localhost -rfbport 5901 &
+    sleep 2
+    DISPLAY=:1 startxfce4 &
+fi
 websockify --web=/usr/share/novnc 6080 localhost:5901 &
 
-echo "noVNC ready at http://localhost:6080 (gated by platform login)"
+echo "noVNC ready at http://localhost:6080"
 tail -f /dev/null

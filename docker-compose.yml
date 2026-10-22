@@ -33,9 +33,9 @@ services:
     ports:
       - "6080:6080"
     volumes:
-      - agent-workspace:/workspace
+      - workspace:/workspace
     environment:
-      - VNC_PASSWORD=agent
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
     networks:
       - agent-net
     profiles:
@@ -43,7 +43,11 @@ services:
 
 volumes:
   agent-data:
-  agent-workspace:
+  # pinned name (no compose project prefix) so UI-created agent containers,
+  # which bind "ai-agent-platform-workspace" via the Docker API, share the same
+  # /workspace repo working tree as agent-example
+  workspace:
+    name: ai-agent-platform-workspace
 
 networks:
   agent-net:
