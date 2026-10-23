@@ -31,10 +31,15 @@ Give the team one task in plain language. The Product Owner opens the brief, the
 | **Anchored review comments** — quote a line, leave a note, resolve or reopen it. | **Docs workspace** — markdown editor, file uploads and preview per project, shared with the team. |
 | [![Skill test bench](docs/screenshots/skill-test-bench.png)](docs/screenshots/skill-test-bench.png) | [![Token pricing](docs/screenshots/ai-config-pricing.png)](docs/screenshots/ai-config-pricing.png) |
 | **Skill studio** — saved test inputs, real provider runs, and 20-run history per skill, plus version restore. | **Token pricing** — per-model USD per 1M tokens feeds the run ledger; an unpriced model fails closed when a budget is set. |
+| [![Task board](docs/screenshots/project-tasks.png)](docs/screenshots/project-tasks.png) | [![Task detail](docs/screenshots/project-task-detail.png)](docs/screenshots/project-task-detail.png) |
+| **Jira-like task board** — one mission = one project task; backlog → todo → in progress → review → done, with priority and subtask progress. | **Task detail** — description, live task fields, every role-scoped subtask from the latest run, run history and PO verdict. |
+| [![Subtask detail](docs/screenshots/project-subtask-detail.png)](docs/screenshots/project-subtask-detail.png) | **Task → subtask → route** — each subtask is a real mission step (`role-kind`). Open its full deliverable, agent, step cost/tokens, related meetings and sibling subtasks at its own URL, and switch to an older run with `?run=`. |
 
 ## ✨ Highlights
 
 - 🧑‍🚀 **9 role-playing agents, one real workflow** — PO → BA → SA → UX/UI → Dev → QA, each working in their *own* tmux session on your machine, each writing deliverables to a shared git working tree
+- 🧭 **Ownership board** — one glance answers *who holds this mission right now*: every owner's card names the slice they hold (Product brief / System spec / Frontend / Backend / Quality), its live status and elapsed time; FE and BE devs that run together sit in one marked **ขนานกัน** wave instead of implying a queue
+- 🗂 **One job = one task, split into subtasks** — every dispatch is a Jira-like project task (`tk-NNN`) on a five-column board; its subtasks are the run's real role-scoped steps, so each owner's deliverable has its own route (`/projects/<id>/tasks/<tk>/subtasks/<role-kind>`) and every historical run stays viewable via `?run=`. Status follows the mission automatically: running → in progress, delivered → done, FAIL/error → review
 - 🖥 **Live terminals** — every agent is a real shell in a tmux session (`agent-<role>`); you watch them work in the web terminal (xterm.js ⇄ WebSocket ⇄ PTY) or `tmux attach` directly — several viewers at once, nothing fights
 - 💸 **Budgets that actually bite** — every step records tokens and cost against the model's price; crossing the limit pauses the run as `waiting_human` and **only an explicit budget raise resumes it** — a chat reply cannot talk its way past the guardrail. Unpriced models fail closed
 - 🔍 **Review gate before push** — the PR stage stages the exact diff first, then waits for you: approve to push, or reject once and the Dev revises. The reviewed diff is the pushed diff, and retries re-enter the same gate
@@ -84,7 +89,7 @@ flowchart TD
     BUDGET -.-> HUMAN
 ```
 
-Everything streams live into Mission Control: agent nodes light up blue (working) / amber (meeting) / green (delivered), the timeline shows each step with its real output, and every run is persisted (`data/runs.json`) so history survives restarts.
+Everything streams live into Mission Control: agent nodes light up blue (working) / amber (meeting) / green (delivered), the ownership board shows who holds which slice (with the FE/BE parallel wave grouped together), the timeline shows each step with its real output, and every run is persisted (`data/runs.json`) so history survives restarts. Every mission is also a project task, so the same work can be tracked on the task board and opened subtask-by-subtask at stable URLs.
 
 ## 🏗 Architecture
 
@@ -118,7 +123,7 @@ flowchart TB
 
 | Component | Stack | What it does |
 |---|---|---|
-| **Web** ([web/](web/)) | Next.js 14 (App Router), Tailwind, shadcn/ui, React Flow, xterm.js | Dashboard, Mission Control, team & persona editor, org chart, routines, docs workspace, skills studio, AI config, connectors |
+| **Web** ([web/](web/)) | Next.js 14 (App Router), Tailwind, shadcn/ui, React Flow, xterm.js | Dashboard, Mission Control, task board + task/subtask drill-down, team & persona editor, org chart, routines, docs workspace, skills studio, AI config, connectors |
 | **Orchestrator** ([orchestrator/](orchestrator/)) | Rust, Axum 0.8, tokio, portable-pty — a single host binary | Agent (tmux session) lifecycle, the Team Run engine (missions, meetings, budget guard, review gate, PR/demo stages), cron scheduler, watchdog, auth, connectors, tools manifest. Exec seam lives in [src/hostexec.rs](orchestrator/src/hostexec.rs) |
 
 **Design principles**
@@ -176,7 +181,7 @@ Start agents from the AI Team page, open a project, set a goal/budget if you wan
 | `ADMIN_USER` | `admin` | Login username |
 | `ADMIN_PASSWORD` | *(empty)* | **Empty = auth off (loopback only).** Set it to require login for the whole platform |
 | `AAP_BIND` | `127.0.0.1:8000` (auth off) / `0.0.0.0:8000` (auth on) | Explicit listen address; override to expose on the LAN |
-| `DATA_DIR` | `./data` | Runs, projects, personas, config, routines, docs, skills, agents |
+| `DATA_DIR` | `./data` | Runs, projects, project tasks (`project-tasks.json`), personas, config, routines, docs, skills, agents |
 | `AAP_WORKSPACE` | `./workspace` | The team's shared working tree (cloned repos + deliverables) |
 | `AAP_WATCHDOG_STALL_SECS` | `2700` | Minutes-without-heartbeat threshold for the advisory run watchdog (min 60s) |
 
@@ -195,10 +200,10 @@ Start agents from the AI Team page, open a project, set a goal/budget if you wan
 
 ```bash
 make test    # runs the Playwright suite with .env credentials (needs the platform running)
-cd orchestrator && cargo test   # unit tests: cron parsing, next-run, pricing, harness, review, watchdog
+cd orchestrator && cargo test   # unit tests: cron parsing, next-run, pricing, harness, review, watchdog, task titles/prompts
 ```
 
-**18 spec files / ~56 Playwright cases** — auth gate, dashboard, agent detail, AI team + org view, projects, routines, docs workspace, board, connectors, inbox, skills studio, platform, plus mission dispatch, pause/resume, step retry and PR-auth flows.
+**19 spec files / ~59 Playwright cases** — auth gate, dashboard, agent detail, AI team + org view, projects, routines, docs workspace, board, connectors, inbox, skills studio, platform, plus mission dispatch, pause/resume, step retry, PR-auth flows and the task board → task drill-down.
 
 ## 📁 Repository layout
 
@@ -208,8 +213,8 @@ cd orchestrator && cargo test   # unit tests: cron parsing, next-run, pricing, h
 │       ├── main.rs      #   routes, run engine, budget/review gates, cron, persistence
 │       └── hostexec.rs  #   exec seam: tmux windows, headless fallback, timeouts
 ├── web/                 # Next.js dashboard
-│   ├── app/             # pages: dashboard, projects, containers, team, board, docs, skills, settings…
-│   ├── components/      # sidebar, agent detail, human inbox, terminal, persona editor, ui kit
+│   ├── app/             # pages: dashboard, projects (mission · tasks · task · subtask), containers, team, board, docs, skills, settings…
+│   ├── components/      # sidebar, agent detail, human inbox, terminal, persona editor, task-ui, ui kit
 │   └── e2e/             # Playwright specs + screenshot capture scripts
 ├── Makefile             # make build / run / test / migrate-state
 ├── docs/

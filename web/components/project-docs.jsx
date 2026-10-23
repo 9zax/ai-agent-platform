@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-const QUICK_FOLDERS = ['PO', 'BA', 'SA', 'General']
+const QUICK_FOLDERS = ['PO', 'BA', 'SA', 'Design', 'Dev', 'QA', 'General']
 const EMPTY_FORM = { title: '', folder: 'General', content_md: '' }
 
 function fmtDate(secs) {

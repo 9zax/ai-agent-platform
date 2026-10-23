@@ -136,9 +136,13 @@ fn seed_personas() -> Vec<Persona> {
     // it applies to the whole team): a demo must carry evidence — a screenshot
     // or short video of the actual result. Text-only reports don't count.
     let demo_rule = " Whenever you present or hand off finished work, attach a screenshot or a short video of the actual result — a text-only report is not a demo.";
+    // Same idea for documents: every deliverable is filed in the project's
+    // document space, so it must be a real, self-contained document — not a
+    // chat reply. The folder is chosen by role automatically.
+    let doc_rule = " Every deliverable you hand off is also a PROJECT DOCUMENT: start it with one H1 title and write it as a complete, self-contained markdown document (context, decisions, what you hand over) — the orchestrator files it in the project's document space for later missions to read. A chat-style status reply is not a document.";
     let mk = |role: &str, name: &str, title: &str, years: &str, expertise: &str, rules: &str, glm: &str, gemini: &str| Persona {
         role: role.into(), name: name.into(), title: title.into(), years: years.into(),
-        expertise: expertise.into(), rules_md: format!("{rules}{demo_rule}"),
+        expertise: expertise.into(), rules_md: format!("{rules}{demo_rule}{doc_rule}"),
         model_overrides: BTreeMap::from([
             (PROVIDERS[0].id.to_string(), glm.to_string()),
             ("gemini".to_string(), gemini.to_string()),
@@ -159,7 +163,7 @@ fn seed_personas() -> Vec<Persona> {
            "You are Petch, a Business Analyst with 15 years of experience. You take the PO's product goal and analyze the business side: stakeholders, processes, constraints, success criteria — and you flag risks and open questions instead of guessing. The team works test-first (TDD), so every requirement and success metric you hand over must be sharp enough to assert in a test: a business rule that cannot be checked is not a requirement, it is a guess. Your business requirements are what the SA designs from; you stay available to clarify business rules for the team.", "glm-5.3-flash", "gemini-3.8-flash"),
         mk("sa", "Oat", "System Analyst", "16",
            "System analysis, functional & non-functional requirements, data modeling, API contracts, integration design, architecture documentation",
-           "You are Oat, a System Analyst with 16 years of experience. You take Petch's business requirements and translate them into the system spec: functional specs, data models, API contracts and non-functional constraints. You are the bridge to the build side — you brief UX/UI, Dev and QA directly on your spec, and you never design a system the requirements don't justify. The team builds TDD-style, so every functional requirement and API contract you produce is written as a testable case (inputs, expected outputs, edge cases) — a spec the Devs cannot turn into a failing test first is not done.", "glm-5.3", "gemini-4-argon"),
+           "You are Oat, a System Analyst with 16 years of experience. You take Petch's business requirements and translate them into the system spec: functional specs, data models, API contracts and non-functional constraints. You are the bridge to the build side — you brief UX/UI, Dev and QA directly on your spec, and your spec always ends with a work split: the frontend dev and the backend devs each get their own independently testable slice plus the shared API contract between them, so they build in parallel instead of one waiting on the other. You never design a system the requirements don't justify. The team builds TDD-style, so every functional requirement and API contract you produce is written as a testable case (inputs, expected outputs, edge cases) — a spec the Devs cannot turn into a failing test first is not done.", "glm-5.3", "gemini-4-argon"),
         mk("ux-ui", "Sept", "UX/UI Designer", "14",
            "User research, information architecture, user flows, wireframing, usability testing, prototyping",
            "You are Sept, a UX/UI Designer with 14 years of experience — the UX half of the design pair. From the SA's spec you produce flows, information architecture and wireframes that cover the unhappy paths (empty/loading/error states), with every state spelled out explicitly so QA can turn each one into a test case. You design with evidence from users, not taste.", "glm-5.3-flash", "gemini-3.8-flash"),
@@ -238,6 +242,101 @@ struct Task {
     priority: String,
     agent: String,
     due: String,
+}
+
+/// A project task (Jira-like): one job the team is asked to deliver. Its
+/// subtasks are the run's steps — one per role/phase — so the task view never
+/// drifts from the work the orchestrator actually did.
+#[derive(Clone, Serialize, Deserialize)]
+struct ProjectTask {
+    /// "tk-NNN" (distinct from the legacy "t-NNN" board tasks)
+    id: String,
+    project_id: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    /// backlog | todo | in_progress | review | done
+    status: String,
+    /// low | medium | high | urgent
+    priority: String,
+    /// optional owning role ("" = the whole team)
+    #[serde(default)]
+    assignee: String,
+    created_at: u64,
+    updated_at: u64,
+    /// every run dispatched for this task (loop children included), oldest first
+    #[serde(default)]
+    run_ids: Vec<String>,
+    #[serde(default)]
+    latest_run_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProjectTaskCreate {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: String,
+    #[serde(default)]
+    assignee: String,
+    /// optional starting column (defaults to todo)
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ProjectTaskUpdate {
+    title: Option<String>,
+    description: Option<String>,
+    status: Option<String>,
+    priority: Option<String>,
+    assignee: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ProjectSubtaskQuery {
+    /// "?run=run-040" — view this subtask from a historical run of the task
+    run: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ProjectTaskRun {
+    #[serde(default, rename = "loop")]
+    run_loop: bool,
+}
+
+fn task_column(s: &str) -> Option<&'static str> {
+    match s {
+        "backlog" => Some("backlog"),
+        "todo" => Some("todo"),
+        "in_progress" => Some("in_progress"),
+        "review" => Some("review"),
+        "done" => Some("done"),
+        _ => None,
+    }
+}
+
+fn task_priority(s: &str) -> Option<&'static str> {
+    match s {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "urgent" => Some("urgent"),
+        _ => None,
+    }
+}
+
+/// The brief sent to the team: the full description when it already carries the
+/// title (auto-created from the composer), otherwise title + details.
+fn task_prompt(t: &ProjectTask) -> String {
+    let desc = t.description.trim();
+    if desc.is_empty() { return t.title.trim().to_string(); }
+    if desc.starts_with(t.title.trim()) { return desc.to_string(); }
+    format!("{}\n\n{}", t.title.trim(), desc)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -425,6 +524,12 @@ struct ProjectDoc {
     /// uploaded binary payload (None for markdown docs)
     #[serde(default)]
     file: Option<DocFile>,
+    /// mission run that authored this document (empty for hand-written docs)
+    #[serde(default)]
+    source_run: String,
+    /// persona role that authored it — one document per role per run
+    #[serde(default)]
+    source_role: String,
     created_at: u64,
     updated_at: u64,
 }
@@ -662,6 +767,9 @@ struct Run {
     project_id: String,
     project_name: String,
     task: String,
+    /// project task (tk-NNN) this run delivers — None for routines / legacy runs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
     /// running | waiting_human | done | error | stopped
     status: String,
     steps: Vec<RunStep>,
@@ -775,6 +883,8 @@ struct Store {
     /// review comments anchored to doc passages (persisted with docs.json)
     doc_comments: Vec<DocComment>,
     runs: Vec<Run>,
+    /// project tasks (Jira-like) — persisted, /data/project-tasks.json
+    project_tasks: Vec<ProjectTask>,
     /// scheduled routines (persisted, /data/routines.json)
     routines: Vec<Routine>,
     config: AiConfig,
@@ -799,6 +909,7 @@ struct Store {
     comment_counter: usize,
     run_counter: usize,
     routine_counter: usize,
+    ptask_counter: usize,
 }
 
 impl Default for Store {
@@ -818,6 +929,7 @@ impl Default for Store {
             docs: Vec::new(),
             doc_comments: Vec::new(),
             runs: Vec::new(),
+            project_tasks: Vec::new(),
             routines: Vec::new(),
             config: AiConfig::default(),
             sessions: HashMap::new(),
@@ -833,6 +945,7 @@ impl Default for Store {
             comment_counter: 0,
             run_counter: 0,
             routine_counter: 0,
+            ptask_counter: 0,
         }
     }
 }
@@ -2680,6 +2793,302 @@ async fn delete_task(State(app): State<App>, headers: axum::http::HeaderMap, Pat
 }
 
 // ---------------------------------------------------------------------------
+// Handlers — project tasks (Jira-like) + their run-derived subtasks
+// ---------------------------------------------------------------------------
+
+fn new_project_task(
+    store: &mut Store, project_id: &str, title: String, description: String,
+    priority: &str, status: &str,
+) -> ProjectTask {
+    store.ptask_counter += 1;
+    let now = now_secs();
+    let task = ProjectTask {
+        id: format!("tk-{:03}", store.ptask_counter),
+        project_id: project_id.to_string(),
+        title,
+        description,
+        status: status.to_string(),
+        priority: priority.to_string(),
+        assignee: String::new(),
+        created_at: now,
+        updated_at: now,
+        run_ids: Vec::new(),
+        latest_run_id: None,
+    };
+    store.project_tasks.push(task.clone());
+    save_project_tasks(store);
+    task
+}
+
+/// Composer text → a task title: first non-empty line, capped so board cards
+/// stay readable. The full text lives in the description.
+fn task_title_from(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or(text).trim();
+    if line.is_empty() { return "Untitled task".into(); }
+    let mut title: String = line.chars().take(120).collect();
+    if line.chars().count() > 120 { title.push('…'); }
+    title
+}
+
+fn latest_task_run<'a>(store: &'a Store, task: &ProjectTask) -> Option<&'a Run> {
+    task.latest_run_id.as_ref()
+        .and_then(|rid| store.runs.iter().find(|r| &r.id == rid))
+        .or_else(|| task.run_ids.iter().rev().find_map(|rid| store.runs.iter().find(|r| &r.id == rid)))
+}
+
+fn run_brief_json(run: &Run) -> Value {
+    json!({
+        "id": run.id,
+        "task": run.task,
+        "status": run.status,
+        "phase": run.phase,
+        "round": run.round,
+        "iteration": run.iteration,
+        "loop_mode": run.loop_mode,
+        "created_at": run.created_at,
+        "cost_usd": run.cost_usd,
+        "steps_total": run.steps.len(),
+        "steps_done": run.steps.iter().filter(|s| s.status == "done").count(),
+        "acceptance": run.acceptance,
+        "summary": run.summary,
+    })
+}
+
+fn subtask_id(step: &RunStep) -> String {
+    format!("{}-{}", step.role, step.kind)
+}
+
+fn step_brief_json(step: &RunStep) -> Value {
+    json!({
+        "id": subtask_id(step),
+        "role": step.role,
+        "name": step.name,
+        "title": step.title,
+        "kind": step.kind,
+        "status": step.status,
+        "rev": step.rev,
+        "started_at": step.started_at,
+        "finished_at": step.finished_at,
+        "input_tokens": step.input_tokens,
+        "output_tokens": step.output_tokens,
+        "cost_usd": step.cost_usd,
+        "harness": step.harness,
+        "deliverable": step.deliverable,
+        "output_len": step.output.chars().count(),
+        "preview": one_line(&step.output, 240),
+    })
+}
+
+fn task_json(store: &Store, task: &ProjectTask) -> Value {
+    let latest = latest_task_run(store, task);
+    let mut v = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    v["latest_run"] = latest.map(run_brief_json).unwrap_or(Value::Null);
+    v["active"] = json!(latest.is_some_and(|r| r.status == "running" || r.status == "waiting_human"));
+    v["subtasks"] = latest
+        .map(|r| json!(r.steps.iter().map(step_brief_json).collect::<Vec<_>>()))
+        .unwrap_or_else(|| json!([]));
+    v["subtask_counts"] = match latest {
+        Some(r) => {
+            let done = r.steps.iter().filter(|s| s.status == "done").count();
+            let working = r.steps.iter().filter(|s| s.status == "working").count();
+            json!({ "total": r.steps.len(), "done": done, "working": working })
+        }
+        None => json!({ "total": 0, "done": 0, "working": 0 }),
+    };
+    v
+}
+
+fn task_detail_json(store: &Store, task: &ProjectTask) -> Value {
+    let mut v = task_json(store, task);
+    let runs: Vec<Value> = task.run_ids.iter().rev()
+        .filter_map(|rid| store.runs.iter().find(|r| &r.id == rid))
+        .map(run_brief_json)
+        .collect();
+    v["runs"] = json!(runs);
+    v
+}
+
+async fn list_project_tasks(
+    State(app): State<App>, headers: axum::http::HeaderMap, Path(project_id): Path<String>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    let mut tasks: Vec<&ProjectTask> = store.project_tasks.iter()
+        .filter(|t| t.project_id == project_id)
+        .collect();
+    tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let out: Vec<Value> = tasks.iter().map(|t| task_json(&store, t)).collect();
+    Ok(json_ok(json!(out)))
+}
+
+async fn create_project_task(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path(project_id): Path<String>, Json(req): Json<ProjectTaskCreate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let title = req.title.trim().to_string();
+    if title.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Task title is required"));
+    }
+    let priority = if req.priority.trim().is_empty() { "medium" } else {
+        task_priority(req.priority.trim())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "priority must be low | medium | high | urgent"))?
+    };
+    let status = if req.status.trim().is_empty() { "todo" } else {
+        task_column(req.status.trim())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "status must be backlog | todo | in_progress | review | done"))?
+    };
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    let mut task = new_project_task(
+        &mut store, &project_id, title, req.description.trim().to_string(), priority, status,
+    );
+    task.assignee = req.assignee.trim().to_string();
+    if !task.assignee.is_empty() {
+        if let Some(t) = store.project_tasks.iter_mut().find(|t| t.id == task.id) {
+            t.assignee = task.assignee.clone();
+            save_project_tasks(&store);
+        }
+    }
+    let out = task_json(&store, &task);
+    Ok(json_ok(out))
+}
+
+async fn get_project_task(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, task_id)): Path<(String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    let task = store.project_tasks.iter()
+        .find(|t| t.id == task_id && t.project_id == project_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")))?;
+    Ok(json_ok(task_detail_json(&store, task)))
+}
+
+async fn update_project_task(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, task_id)): Path<(String, String)>, Json(req): Json<ProjectTaskUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let idx = store.project_tasks.iter()
+        .position(|t| t.id == task_id && t.project_id == project_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")))?;
+    if let Some(title) = req.title.as_deref() {
+        if title.trim().is_empty() {
+            return Err(err(StatusCode::BAD_REQUEST, "Task title cannot be empty"));
+        }
+        store.project_tasks[idx].title = title.trim().to_string();
+    }
+    if let Some(desc) = req.description { store.project_tasks[idx].description = desc.trim().to_string(); }
+    if let Some(status) = req.status.as_deref() {
+        let s = task_column(status.trim())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "status must be backlog | todo | in_progress | review | done"))?;
+        store.project_tasks[idx].status = s.into();
+    }
+    if let Some(priority) = req.priority.as_deref() {
+        let p = task_priority(priority.trim())
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "priority must be low | medium | high | urgent"))?;
+        store.project_tasks[idx].priority = p.into();
+    }
+    if let Some(assignee) = req.assignee { store.project_tasks[idx].assignee = assignee.trim().to_string(); }
+    store.project_tasks[idx].updated_at = now_secs();
+    let task = store.project_tasks[idx].clone();
+    save_project_tasks(&store);
+    Ok(json_ok(task_json(&store, &task)))
+}
+
+async fn delete_project_task(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, task_id)): Path<(String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let Some(task) = store.project_tasks.iter().find(|t| t.id == task_id && t.project_id == project_id) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")));
+    };
+    if latest_task_run(&store, task).is_some_and(|r| r.status == "running" || r.status == "waiting_human") {
+        return Err(err(StatusCode::CONFLICT, "This task has a live mission — stop it before deleting the task"));
+    }
+    store.project_tasks.retain(|t| !(t.id == task_id && t.project_id == project_id));
+    save_project_tasks(&store);
+    // Runs are kept: they are the agents' work history (same rule as projects).
+    Ok(json_ok(json!({ "deleted": task_id })))
+}
+
+async fn dispatch_project_task(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, task_id)): Path<(String, String)>, Json(req): Json<ProjectTaskRun>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let prompt = {
+        let store = app.store.lock().unwrap();
+        let task = store.project_tasks.iter()
+            .find(|t| t.id == task_id && t.project_id == project_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")))?;
+        task_prompt(task)
+    };
+    if prompt.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Task has no title or description to dispatch"));
+    }
+    let run = spawn_run_with(&app, &project_id, &prompt, req.run_loop, 1, "manual", None, Some(&task_id))?;
+    let store = app.store.lock().unwrap();
+    let task = store.project_tasks.iter().find(|t| t.id == task_id).map(|t| task_json(&store, t));
+    Ok(json_ok(json!({ "run": run, "task": task })))
+}
+
+async fn get_project_subtask(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, task_id, subtask)): Path<(String, String, String)>,
+    axum::extract::Query(q): axum::extract::Query<ProjectSubtaskQuery>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    let task = store.project_tasks.iter()
+        .find(|t| t.id == task_id && t.project_id == project_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")))?;
+    let run = match q.run.as_deref() {
+        Some(rid) if !rid.is_empty() => {
+            if !task.run_ids.iter().any(|x| x == rid) {
+                return Err(err(StatusCode::NOT_FOUND, format!("Run '{rid}' does not belong to task '{task_id}'")));
+            }
+            store.runs.iter().find(|r| r.id == rid)
+        }
+        _ => latest_task_run(&store, task),
+    }.ok_or_else(|| err(StatusCode::NOT_FOUND, "This task has not been dispatched yet — no subtasks"))?;
+    let step = run.steps.iter().find(|s| subtask_id(s) == subtask)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Subtask '{subtask}' not found in run '{}'", run.id)))?;
+    let mut step_val = serde_json::to_value(step).unwrap_or_else(|_| json!({}));
+    step_val["id"] = json!(subtask);
+    let agent = store.personas.iter().find(|p| p.role == step.role).map(|p| json!({
+        "role": p.role, "name": p.name, "title": p.title, "years": p.years,
+        "model_overrides": p.model_overrides, "harness": p.harness, "reports_to": p.reports_to,
+    }));
+    let discussions: Vec<&Discussion> = run.discussions.iter()
+        .filter(|d| d.from == step.role || d.to.iter().any(|r| r == &step.role))
+        .collect();
+    let runs: Vec<Value> = task.run_ids.iter().rev()
+        .filter_map(|rid| store.runs.iter().find(|r| &r.id == rid))
+        .map(run_brief_json)
+        .collect();
+    Ok(json_ok(json!({
+        "task": task_json(&store, task),
+        "run": run_brief_json(run),
+        "subtask": step_val,
+        "agent": agent,
+        "discussions": discussions,
+        "runs": runs,
+        "siblings": run.steps.iter().map(step_brief_json).collect::<Vec<_>>(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers — config & skills
 // ---------------------------------------------------------------------------
 
@@ -2867,13 +3276,16 @@ async fn run_skill_tests(
     Path(skill_id): Path<String>, Json(req): Json<SkillRunRequest>,
 ) -> ApiResult {
     app.require_auth(&headers)?;
-    let (skill, model) = {
+    // Resolve the skill first, then the model — provider_default_model() takes
+    // the same non-reentrant store lock, so it must run after the guard drops.
+    let (skill, requested_model) = {
         let store = app.store.lock().unwrap();
         let skill = store.skills.iter().find(|s| s.id == skill_id).cloned()
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
-        let model = req.model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| app.provider_default_model());
-        (skill, model)
+        (skill, req.model.clone())
     };
+    let model = requested_model.filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| app.provider_default_model());
     if model.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "No model configured — set one in AI Config"));
     }
@@ -3010,8 +3422,11 @@ async fn delete_project(State(app): State<App>, headers: axum::http::HeaderMap, 
         let _ = std::fs::remove_dir_all(docs_files_dir().join(did));
     }
     let _ = std::fs::remove_dir_all(docs_workspace_dir(&id));
+    // Tasks are project-scoped, so they go with it (their runs are kept as history).
+    store.project_tasks.retain(|t| t.project_id != id);
     save_projects(&store);
     save_docs(&store);
+    save_project_tasks(&store);
     Ok(json_ok(json!({ "deleted": id })))
 }
 
@@ -3065,6 +3480,8 @@ async fn create_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path
         title: req.title.trim().to_string(),
         content_md: req.content_md,
         file: None,
+        source_run: String::new(),
+        source_role: String::new(),
         created_at: now,
         updated_at: now,
     };
@@ -3289,6 +3706,8 @@ async fn upload_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path
         title,
         content_md: String::new(),
         file: None,
+        source_run: String::new(),
+        source_role: String::new(),
         created_at: now,
         updated_at: now,
     };
@@ -3323,6 +3742,9 @@ struct RunRequest {
     /// iteration is spawned automatically (until DONE / stop / the cap)
     #[serde(default, rename = "loop")]
     run_loop: bool,
+    /// reuse an existing project task instead of creating a new one (retry path)
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -3805,6 +4227,49 @@ fn load_tasks(store: &mut Store) {
     store.tasks = parsed.tasks;
 }
 
+fn save_project_tasks(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { tasks: &'a [ProjectTask], task_counter: usize }
+    write_json_atomic("project-tasks.json", &Persisted { tasks: &store.project_tasks, task_counter: store.ptask_counter }, false);
+}
+
+fn load_project_tasks(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] tasks: Vec<ProjectTask>, #[serde(default)] task_counter: usize }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("project-tasks.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: project-tasks.json is unreadable — starting with an empty task board");
+        return;
+    };
+    let max_id = parsed.tasks.iter()
+        .filter_map(|t| t.id.strip_prefix("tk-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.ptask_counter = store.ptask_counter.max(parsed.task_counter).max(max_id);
+    println!("restored {} project task(s)", parsed.tasks.len());
+    store.project_tasks = parsed.tasks;
+}
+
+/// After load_runs closed runs that died with the old process, tasks whose
+/// latest run is no longer live must not stay "in_progress" forever. Manual
+/// columns are left alone — only the auto-set in_progress state is reconciled.
+fn reconcile_project_tasks(store: &mut Store) {
+    let now = now_secs();
+    for task in store.project_tasks.iter_mut().filter(|t| t.status == "in_progress") {
+        let Some(run) = task.latest_run_id.as_ref()
+            .and_then(|rid| store.runs.iter().find(|r| &r.id == rid))
+        else { continue };
+        let next = match run.status.as_str() {
+            "running" | "waiting_human" => continue,
+            "done" => if run.acceptance.as_ref().is_some_and(|a| a.verdict == "fail") { "review" } else { "done" },
+            "error" => "review",
+            "stopped" => "todo",
+            _ => continue,
+        };
+        task.status = next.into();
+        task.updated_at = now;
+    }
+}
+
 fn save_routines(store: &Store) {
     #[derive(Serialize)]
     struct Persisted<'a> { routines: &'a [Routine], routine_counter: usize }
@@ -3937,7 +4402,7 @@ fn fire_routine(app: &App, routine: &Routine) -> Result<Run, ApiError> {
         save_routines(&store);
         return Err(err(StatusCode::CONFLICT, "project already has a running mission"));
     }
-    let result = spawn_run_with(app, &routine.project_id, &routine.task, routine.loop_mode, 1, "scheduled", Some(&routine.id));
+    let result = spawn_run_with(app, &routine.project_id, &routine.task, routine.loop_mode, 1, "scheduled", Some(&routine.id), None);
     let mut store = app.store.lock().unwrap();
     if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
         r.last_run_at = now;
@@ -4219,7 +4684,84 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
             if rev.is_some() { step.rev = rev; }
         }
     }
-    save_runs(&store);
+    // The deliverable is also the role's document for this mission — one doc
+    // per role per run, refreshed when a meeting round makes the agent revise.
+    let meta = store.runs.iter().find(|r| r.id == run_id).and_then(|r| {
+        r.steps.iter().find(|s| s.role == role && s.kind == "work")
+            .map(|s| (r.project_id.clone(), s.name.clone(), s.title.clone()))
+    });
+    if let Some((project_id, name, title)) = meta {
+        if save_step_doc(&mut store, &project_id, run_id, role, &name, &title, output) {
+            save_docs(&store);
+            materialize_project_docs(&store, &project_id);
+        }
+    }
+    save_runs(&store);}
+
+/// Folder in the project's Docs tab that owns a role's mission documents.
+fn doc_folder_for_role(role: &str) -> &'static str {
+    match role {
+        "po" => "PO",
+        "ba" => "BA",
+        "sa" => "SA",
+        "qa" => "QA",
+        r if r.starts_with("ux") => "Design",
+        r if r.starts_with("dev") => "Dev",
+        _ => "General",
+    }
+}
+
+/// Persist a completed work step as a project document (title from its H1,
+/// body without the code FILES block). Returns true when docs.json changed.
+fn save_step_doc(store: &mut Store, project_id: &str, run_id: &str, role: &str, name: &str, title: &str, output: &str) -> bool {
+    let body = strip_files(output).trim().to_string();
+    if body.is_empty() { return false; }
+    let doc_title = body.lines().map(str::trim).find_map(|l| l.strip_prefix("# ").map(str::trim))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(160).collect::<String>())
+        .unwrap_or_else(|| format!("{title} — {name} · {run_id}"));
+    let now = now_secs();
+    if let Some(doc) = store.docs.iter_mut().find(|d| d.project_id == project_id && d.source_run == run_id && d.source_role == role) {
+        if doc.title == doc_title && doc.content_md == body { return false; }
+        doc.title = doc_title;
+        doc.content_md = body;
+        doc.updated_at = now;
+        return true;
+    }
+    store.doc_counter += 1;
+    store.docs.push(ProjectDoc {
+        id: format!("d-{:03}", store.doc_counter),
+        project_id: project_id.to_string(),
+        folder: doc_folder_for_role(role).to_string(),
+        title: doc_title,
+        content_md: body,
+        file: None,
+        source_run: run_id.to_string(),
+        source_role: role.to_string(),
+        created_at: now,
+        updated_at: now,
+    });
+    true
+}
+
+/// Migration for installs that predate document capture: a project whose
+/// document space is still empty gets its newest finished run's deliverables
+/// filed under the role folders. Idempotent — projects that already have any
+/// document are left untouched.
+fn backfill_latest_run_docs(store: &mut Store) {
+    let projects: Vec<String> = store.projects.iter().map(|p| p.id.clone()).collect();
+    for project_id in projects {
+        if store.docs.iter().any(|d| d.project_id == project_id) { continue; }
+        let Some(run) = store.runs.iter()
+            .filter(|r| r.project_id == project_id
+                && r.steps.iter().any(|s| s.kind == "work" && s.status == "done" && !s.output.trim().is_empty()))
+            .max_by_key(|r| r.created_at)
+            .cloned() else { continue };
+        for step in run.steps.iter().filter(|s| s.kind == "work" && s.status == "done" && !s.output.trim().is_empty()) {
+            save_step_doc(store, &project_id, &run.id, &step.role, &step.name, &step.title, &step.output);
+        }
+        materialize_project_docs(store, &project_id);
+    }
 }
 
 /// True once POST /runs/{id}/stop flagged this run.
@@ -4607,6 +5149,7 @@ async fn harness_step(
 /// Close a run: mark remaining pending steps "skipped", set the final status/phase, persist.
 fn finish_run(app: &App, run_id: &str, status: &str) {
     let mut store = app.store.lock().unwrap();
+    let mut task_update: Option<(String, &'static str)> = None;
     if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
         if run.status != "running" && run.status != "waiting_human" { return; }
         for step in run.steps.iter_mut().filter(|s| s.status == "pending") {
@@ -4627,7 +5170,24 @@ fn finish_run(app: &App, run_id: &str, status: &str) {
             d.status = "resolved".into();
             d.answering = None;
         }
+        task_update = run.task_id.clone().map(|tid| {
+            let next = match status {
+                "done" if run.acceptance.as_ref().is_some_and(|a| a.verdict == "fail") => "review",
+                "done" => "done",
+                "error" => "review",
+                "stopped" => "todo",
+                _ => "in_progress",
+            };
+            (tid, next)
+        });
         save_runs(&store);
+    }
+    if let Some((tid, next)) = task_update {
+        if let Some(t) = store.project_tasks.iter_mut().find(|t| t.id == tid) {
+            t.status = next.into();
+            t.updated_at = now_secs();
+            save_project_tasks(&store);
+        }
     }
 }
 
@@ -4655,6 +5215,7 @@ async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome 
             .unwrap_or(0)
     };
     let deadline = now_secs() + HUMAN_TIMEOUT_SECS;
+    eprintln!("[trace] wait_for_human {run_id}/{disc_id} enter human_seen={human_seen}");
     loop {
         {
             let mut store = app.store.lock().unwrap();
@@ -4675,6 +5236,7 @@ async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome 
                     }
                     run.status = "running".into();
                     save_runs(&store);
+                    eprintln!("[trace] wait_for_human {run_id}/{disc_id} answered");
                     return HumanOutcome::Answered;
                 }
             }
@@ -5148,9 +5710,12 @@ async fn review_gate(
 
     for round in 0..MAX_REVIEW_ROUNDS {
         if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
+        eprintln!("[trace] review_gate {run_id} round {round} start");
         let disc_id = open_review(app, run_id, &files, &diff);
         if disc_id.is_empty() { return ReviewOutcome::Stopped; }
+        eprintln!("[trace] review_gate {run_id} opened {disc_id}, waiting");
         let status = wait_review(app, run_id, &disc_id).await;
+        eprintln!("[trace] review_gate {run_id} round {round} status {status}");
         // The review discussion is closed either way; the outcome is in Run.review.
         {
             let mut store = app.store.lock().unwrap();
@@ -5172,28 +5737,33 @@ async fn review_gate(
             "rejected" => {
                 let comment = review_state(app, run_id).1;
                 let goal_line = goal_ancestry_line(app, run_id, dev_role);
-                let system = work_system(&dev.2, &dev.0, &dev.1, true, project_name,
+                let system = work_system(&dev.2, &dev.0, &dev.1, dev_role, true, project_name,
                     &team_repo_line(&Some(repo_path.to_string())), "", &goal_line, run_id);
                 let user = format!(
                     "## Mission\n{task}\n\n## Reviewer comment\n{}\n\n## Diff under review\n```\n{}\n```\n\nApply the requested changes to the repo now — re-emit the FULL FILES block for every file you change. Then summarise what changed.",
                     if comment.is_empty() { "(no comment)" } else { &comment }, diff
                 );
                 if let Some(m) = dev.3.as_deref() {
+                    eprintln!("[trace] review_gate {run_id} revising with model {m}");
                     match llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
                         Ok(Some(output)) => {
+                            eprintln!("[trace] review_gate {run_id} revision answered ({} chars)", output.len());
                             let mut clean = strip_ask(&output);
                             apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
+                            eprintln!("[trace] review_gate {run_id} revision files applied");
                         }
                         // The budget guard stopped the run mid-revision.
                         Ok(None) => return ReviewOutcome::Stopped,
-                        Err(_) => {}
+                        Err(e) => eprintln!("[trace] review_gate {run_id} revision failed: {}", e.1),
                     }
                 }
                 if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
+                eprintln!("[trace] review_gate {run_id} collecting diff again");
                 match collect_repo_diff(app, &cid, repo_path).await {
                     Some((f, d)) => { files = f; diff = d; }
                     None => return ReviewOutcome::Skip("the Dev revision produced no changes — nothing was pushed".into()),
                 }
+                eprintln!("[trace] review_gate {run_id} diff recollected, next round");
             }
             _ => return ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into()),
         }
@@ -5621,12 +6191,13 @@ async fn llm_retry_usage(app: &App, model: &str, system: &str, user: &str, max: 
     let mut budget = max;
     let mut usage = LlmUsage::default();
     let mut last_err: Option<ApiError> = None;
-    // 5 attempts with growing backoff (~20s of waiting total) — provider blips
-    // (5xx, rate limits, even transient auth flaps that surface as 401) must
-    // not kill a whole mission step by step. Hard misconfiguration still fails
+    // 1 initial try + 5 retries, one every 2s (~10s of waiting total) — provider
+    // blips (5xx, rate limits, even transient auth flaps that surface as 401)
+    // must not kill a whole mission step. Hard misconfiguration still fails
     // fast on the first attempt below.
-    for attempt in 0..5u32 {
-        if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await; }
+    const ATTEMPTS: u32 = 6;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2)).await; }
         match app.llm_max_usage(model, system, user, budget).await {
             Ok((t, u)) if !t.trim().is_empty() => {
                 usage.input_tokens += u.input_tokens;
@@ -5649,7 +6220,7 @@ async fn llm_retry_usage(app: &App, model: &str, system: &str, user: &str, max: 
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer after 3 attempts"))))
+    Err(last_err.unwrap_or_else(|| err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer after 5 retries"))))
 }
 
 /// (name, title, rules, model) for a role, straight from the persona store —
@@ -5859,28 +6430,285 @@ fn goal_ancestry_line(app: &App, run_id: &str, role: &str) -> String {
     out
 }
 
-fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, goal_line: &str, run_id: &str) -> String {
+fn work_system(rules: &str, name: &str, title: &str, role: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, goal_line: &str, run_id: &str) -> String {
     let files_line = if files {
         format!("\nYou work on the REAL repository (already checked out in the team workspace). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
     } else {
         String::new()
     };
+    let doc_folder = doc_folder_for_role(role);
+    // The brief must SPLIT the build, and each builder must see only its slice:
+    // frontend and backend run in one parallel wave off the SA's contract.
+    let split_line = if role == "sa" {
+        "\nYour spec must end with a \"## Work Split\" section that assigns every builder a distinct, independently testable slice — FRONTEND (UI, client state, frontend tests) and BACKEND (API contract, services, data model, backend tests) — plus the shared API contract both sides build against. The frontend and backend devs build IN PARALLEL from this split: never hand a two-sided build to one dev, and never make one side wait for the other.\n"
+    } else if role.starts_with("dev-fe") {
+        "\nYou own the FRONTEND slice of this mission: UI, client state, styling and frontend tests. The backend devs build the API/data slice AT THE SAME TIME as you — code against the API contract in the SA spec instead of waiting for their code, and do not implement their slice.\n"
+    } else if role.starts_with("dev-be") {
+        "\nYou own the BACKEND slice of this mission: API contracts, services, data model/migrations, caching and backend tests. The frontend dev builds the UI AT THE SAME TIME as you — keep the contract exactly as the SA spec defines it and do not implement their slice.\n"
+    } else if role == "qa" {
+        "\nBoth dev slices land in the same working tree before you verify: check frontend and backend against the SA's shared API contract, not just each side in isolation.\n"
+    } else {
+        ""
+    };
     format!(
         "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line}{goal_line} \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, the frontend and backend devs build their slices IN PARALLEL against the SA's contract, then QA verifies the combined result; after QA verifies, the team ships for real — the dev team opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line}{goal_line}{split_line} \
 Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
-Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
-Answer in the same language the task is written in. Keep it under ~450 words (the ## FILES section does not count toward the limit). \
+Your reply IS a project document, not a chat message: start with exactly one H1 (`# <descriptive document title>`) and write a complete, self-contained markdown document (context, decisions, what you hand over) that a teammate who missed this conversation can read and act on. The orchestrator files it in the project's \"{doc_folder}\" document folder and later missions read it — a status note, a list of bullet points without explanation, or \"see above\" is NOT a document. \
+Inside that document, give your concrete work deliverable (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
+Answer in the same language the task is written in. Keep the document under ~450 words (the ## FILES section does not count toward the limit). \
 If something genuinely blocks your part or is unclear, you may end your reply with a section exactly titled \"## ASK\" containing a line \"to: role1, role2\" (teammates who must answer — \"all\" for the whole team, \"human\" for the user) and 1-3 concise questions. Use it sparingly: only when you cannot do your part correctly without the answer. Address \"human\" ONLY when the missing piece is information or a decision that neither you nor any teammate can produce (credentials, business intent, external approval) — the whole team pauses until the user replies."
     )
 }
 
+/// How much of a finished step later teammates see. Specs ARE the mission's
+/// contract, so they ride with a much larger cap — the old 1400-char cut
+/// silently dropped the SA's work split (the builders' assignments).
+fn handoff_cap(role: &str) -> usize {
+    match role {
+        "sa" => 5000,
+        "po" | "ba" => 2200,
+        _ => 1400,
+    }
+}
+
+/// Text of a finished deliverable as a teammate sees it. The SA's Work Split is
+/// at the END by contract, so a long spec is cut from the MIDDLE — truncating
+/// the tail is what dropped the builders' assignments in the first place.
+fn handoff_brief(role: &str, output: &str) -> String {
+    let body = strip_files(output);
+    let cap = handoff_cap(role);
+    if body.chars().count() <= cap { return body; }
+    if role == "sa" {
+        if let Some(idx) = body.find("## Work Split") {
+            let tail: String = body[idx..].chars().take(cap).collect();
+            let head: String = body[..idx]
+                .chars()
+                .take(cap.saturating_sub(tail.chars().count()))
+                .collect();
+            return format!("{head}\n\n[…middle truncated…]\n\n{tail}");
+        }
+    }
+    body.chars().take(cap).collect()
+}
+
+/// Done deliverables of `predecessors`, in run-step order (FILES stripped).
+fn build_handoff(run: &Run, predecessors: &[String]) -> String {
+    let set: BTreeSet<&str> = predecessors.iter().map(String::as_str).collect();
+    let mut handoff = String::new();
+    for s in run.steps.iter().filter(|s| s.kind == "work" && s.status == "done"
+        && !s.output.is_empty() && set.contains(s.role.as_str()))
+    {
+        let brief = handoff_brief(&s.role, &s.output);
+        handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
+    }
+    handoff
+}
+
+/// Round-1 work stages. Everyone keeps the listed order except consecutive
+/// builder roles: every `dev*` agent (whose manager is not another dev in this
+/// run) forms ONE parallel wave with its neighbours — frontend + backend build
+/// against the same SA contract — while a dev reporting to another dev (the
+/// backend pair) waits one wave so it can build on its partner's schema. QA
+/// stays after the build waves. Non-adjacent devs keep the plain order, so a
+/// hand-mixed flow can never run a builder before the brief listed before it.
+fn plan_work_stages(
+    roles: &[(String, String, String)],
+    managers: &HashMap<String, String>,
+) -> Vec<Vec<(String, String, String)>> {
+    let is_dev = |role: &str| role.starts_with("dev");
+    let devs: Vec<&(String, String, String)> = roles.iter().filter(|(r, _, _)| is_dev(r)).collect();
+    let mut levels: HashMap<String, usize> = HashMap::new();
+    for (role, _, _) in &devs {
+        let mut level = 0usize;
+        let mut cur = role.clone();
+        for _ in 0..8 {
+            let Some(mgr) = managers.get(&cur) else { break };
+            if !is_dev(mgr) { break }
+            level = level.max(levels.get(mgr).copied().unwrap_or(0) + 1);
+            cur = mgr.clone();
+        }
+        levels.insert(role.clone(), level);
+    }
+
+    let mut stages: Vec<Vec<(String, String, String)>> = Vec::new();
+    let mut i = 0;
+    while i < roles.len() {
+        if !is_dev(&roles[i].0) {
+            stages.push(vec![roles[i].clone()]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < roles.len() && is_dev(&roles[i].0) { i += 1; }
+        let group = &roles[start..i];
+        if group.len() == 1 {
+            stages.push(vec![group[0].clone()]);
+            continue;
+        }
+        let max_level = group.iter()
+            .map(|(r, _, _)| levels.get(r).copied().unwrap_or(0))
+            .max().unwrap_or(0);
+        for level in 0..=max_level {
+            let wave: Vec<(String, String, String)> = group.iter()
+                .filter(|(r, _, _)| levels.get(r).copied().unwrap_or(0) == level)
+                .cloned()
+                .collect();
+            if !wave.is_empty() { stages.push(wave); }
+        }
+    }
+    stages
+}
+
+/// Roles whose deliverables a step must see: everyone in earlier stages.
+fn handoff_predecessors(
+    roles: &[(String, String, String)],
+    managers: &HashMap<String, String>,
+    role: &str,
+) -> Vec<String> {
+    let stages = plan_work_stages(roles, managers);
+    let Some(idx) = stages.iter().position(|s| s.iter().any(|(r, _, _)| r == role)) else {
+        return Vec::new();
+    };
+    stages[..idx].iter().flatten().map(|(r, _, _)| r.clone()).collect()
+}
+
+/// Register (or re-register) an ASK as a discussion; false when it targets no one.
+fn raise_run_discussion(
+    app: &App, run_id: &str, roles: &[(String, String, String)],
+    from: &str, to: &[String], topic: &str, round: u32,
+) -> bool {
+    let targets = resolve_targets(to, roles, from);
+    if targets.is_empty() { return false; }
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        run.discussions.push(Discussion {
+            id: format!("d-{:03}", run.discussions.len() + 1),
+            kind: String::new(),
+            from: from.into(),
+            to: targets,
+            topic: topic.into(),
+            status: "open".into(),
+            answering: None,
+            messages: Vec::new(),
+            round,
+            created_at: now_secs(),
+        });
+    }
+    save_runs(&store);
+    true
+}
+
+/// One teammate's relay deliverable: mark the step live, prompt with the
+/// handoff + the slices running beside it, apply FILES, close the step.
+/// `false` = the run must wind down (stop / budget pause / empty answer).
+#[allow(clippy::too_many_arguments)]
+async fn relay_work(
+    app: &App, run_id: &str, role: &str, title: &str,
+    roles: &[(String, String, String)], handoff: &str,
+    peers: &[(String, String, String)],
+    repo_path: Option<&str>, repo_line: &str, repo_note: &str,
+    docs_section: &str, docs_line: &str, task: &str, project_name: &str,
+) -> bool {
+    let (pname, _ptitle, rules, model) = persona_of(app, role);
+
+    {
+        let mut store = app.store.lock().unwrap();
+        if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+            .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work"))
+        {
+            step.status = "working".into();
+            step.model = model.clone();
+            step.started_at = now_secs();
+        }
+        save_runs(&store);
+    }
+
+    let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
+    let goal_line = goal_ancestry_line(app, run_id, role);
+    let system = work_system(&rules, &pname, &title, role, ships_files, project_name, repo_line, docs_line, &goal_line, run_id);
+    let peer_names: Vec<String> = peers.iter()
+        .filter(|(r, _, _)| r != role)
+        .map(|(_, n, t)| format!("{n} ({t})"))
+        .collect();
+    let peers_line = if peer_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Working in parallel\n{} {} working on this mission at the same time as you. \
+Stay strictly inside the slice assigned to you — do not duplicate or redo their work. \
+If your slice needs something from theirs, build against the contract in the spec; raise a ## ASK only if that contract is missing.",
+            peer_names.join(", "),
+            if peer_names.len() == 1 { "is" } else { "are" },
+        )
+    };
+    let user = if handoff.is_empty() {
+        format!("## Task from the user\n{task}{repo_note}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.{peers_line}")
+    } else {
+        format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).{peers_line}")
+    };
+
+    let cap = if ships_files { 6000 } else { 1400 };
+    let (harness, hcmd) = persona_harness(app, role);
+    let external = harness != "native";
+    let result = if external {
+        harness_step(app, run_id, role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+    } else {
+        match model.as_deref() {
+            Some(m) => llm_step(app, run_id, role, "work", m, &system, &user, cap).await,
+            None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+        }
+    };
+
+    let mut continue_run = true;
+    match result {
+        Ok(Some(output)) if !output.is_empty() => {
+            let mut clean = strip_ask(&output);
+            if external {
+                mark_harness_step(app, run_id, role, &harness);
+            } else {
+                // External harnesses edit the repo directly — no FILES to apply.
+                apply_files_note(app, repo_path, role, &mut clean).await;
+            }
+            deliver_and_close(app, run_id, role, &clean, None).await;
+            if let Some((to, topic)) = parse_ask(&output) {
+                raise_run_discussion(app, run_id, roles, role, &to, &topic, 1);
+            }
+        }
+        Ok(None) => { wind_down_or_pause(app, run_id); continue_run = false; }
+        Ok(Some(_)) => {
+            let mut store = app.store.lock().unwrap();
+            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+                .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work"))
+            {
+                step.status = "error".into();
+                step.output = "Model returned an empty answer".into();
+                step.finished_at = now_secs();
+            }
+            save_runs(&store);
+        }
+        Err(e) => {
+            let mut store = app.store.lock().unwrap();
+            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+                .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work"))
+            {
+                step.status = "error".into();
+                step.output = e.1;
+                step.finished_at = now_secs();
+            }
+            save_runs(&store);
+        }
+    }
+    continue_run
+}
+
 /// Team run engine with a meeting loop.
 ///
-/// Round 1 is a relay: each persona produces its piece of work, sees what
-/// earlier teammates produced, and (when it has a running container) writes its
-/// deliverable into that container as a real file. Any agent may end its reply
-/// with an "## ASK" block — a blocking question addressed to specific teammates.
+/// Round 1 is a staged relay: each persona produces its piece of work, sees what
+/// earlier stages produced, and (when it has a running container) writes its
+/// deliverable into that container as a real file. Builders (frontend/backend)
+/// run as one parallel wave. Any agent may end its reply with an "## ASK" block
+/// — a blocking question addressed to specific teammates.
 ///
 /// Each ASK opens a live meeting: the addressed teammates answer one by one,
 /// then the asker revises their deliverable with the answers. A revision may
@@ -5928,126 +6756,65 @@ async fn execute_run(app: App, run_id: String) {
         prepare_project_docs(&store, &project_id)
     };
 
-    // Register (or re-register) an ASK as a discussion; returns false when it targets no one.
-    let raise_discussion = |from: &str, to: &[String], topic: &str, round: u32| -> bool {
-        let targets = resolve_targets(to, &roles, from);
-        if targets.is_empty() { return false; }
-        let mut store = app.store.lock().unwrap();
-        if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
-            run.discussions.push(Discussion {
-                id: format!("d-{:03}", run.discussions.len() + 1),
-                kind: String::new(),
-                from: from.into(),
-                to: targets,
-                topic: topic.into(),
-                status: "open".into(),
-                answering: None,
-                messages: Vec::new(),
-                round,
-                created_at: now_secs(),
-            });
-        }
-        save_runs(&store);
-        true
+    // ---- Round 1: staged relay — each teammate delivers, may raise an ASK.
+    // The brief runs in order (PO → BA → SA → UX/UI); then the builders fan out:
+    // frontend and backend work the SAME wave against the SA's contract, so one
+    // side never waits for the other. QA verifies the combined result after.
+    let managers: HashMap<String, String> = {
+        let store = app.store.lock().unwrap();
+        store.personas.iter().map(|p| (p.role.clone(), p.reports_to.clone())).collect()
     };
-
-    // Persist a deliverable into the agent's container and mark the step done.
-    // (standalone fn — see deliver_and_close below)
-
-    // ---- Round 1: relay — each teammate delivers, may raise an ASK ----
-    for (role, name, title) in &roles {
+    let stages = plan_work_stages(&roles, &managers);
+    let repo_note_line = repo_note.as_deref().unwrap_or("");
+    let mut completed: Vec<String> = Vec::new();
+    for stage in &stages {
         // Stop checkpoint: the user pressed Stop — skip everything still pending.
         if stop_requested(&app, &run_id) {
             finish_run(&app, &run_id, "stopped");
             return;
         }
-        let (role, _name, title) = (role.clone(), name.clone(), title.clone());
-        let (pname, _ptitle, rules, model) = persona_of(&app, &role);
-
-        // step → working (records the model this step will run with, even if it later errors)
-        {
-            let mut store = app.store.lock().unwrap();
-            if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
-                step.status = "working".into();
-                step.model = model.clone();
-                step.started_at = now_secs();
-            }
-            save_runs(&store);
-        }
-
-        // Handoff context: what earlier teammates already produced
-        let mut handoff = String::new();
-        {
+        let handoff = {
             let store = app.store.lock().unwrap();
-            if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
-                for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
-                    if s.status == "done" && !s.output.is_empty() {
-                        // FILES listings are stripped — teammates need the summary,
-                        // not full file bodies (the repo tree has the real files)
-                        let brief: String = strip_files(&s.output).chars().take(1400).collect();
-                        handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
-                    }
-                }
-            }
-        }
-
-        // dev/UX teammates with a repo ship real files — their reply may carry a
-        // FILES block, which needs a far larger completion budget than prose
-        let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
-        let goal_line = goal_ancestry_line(&app, &run_id, &role);
-        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
-        let first_note = repo_note.as_deref().unwrap_or("");
-        let user = if handoff.is_empty() {
-            format!("## Task from the user\n{task}{first_note}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
-        } else {
-            format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+            store.runs.iter().find(|r| r.id == run_id)
+                .map(|r| build_handoff(r, &completed))
+                .unwrap_or_default()
         };
-
-        let cap = if ships_files { 6000 } else { 1400 };
-        let (harness, hcmd) = persona_harness(&app, &role);
-        let external = harness != "native";
-        let result = if external {
-            harness_step(&app, &run_id, &role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+        let peers: Vec<(String, String, String)> = if stage.len() > 1 { stage.clone() } else { Vec::new() };
+        // External CLI harnesses edit the shared working tree directly — two of
+        // them in one wave would race on the same files. Native agents deliver
+        // through the orchestrator (FILES), so only they fan out.
+        let all_native = stage.iter().all(|(r, _, _)| persona_harness(&app, r).0 == "native");
+        if stage.len() > 1 && all_native {
+            let futures = stage.iter().map(|(role, _name, title)| relay_work(
+                &app, &run_id, role, title, &roles, &handoff, &peers,
+                repo_path.as_deref(), &repo_line, repo_note_line,
+                &docs_section, &docs_line, &task, &project_name,
+            ));
+            let outcomes = futures_util::future::join_all(futures).await;
+            if outcomes.iter().any(|ok| !*ok) { return; }
         } else {
-            match model.as_deref() {
-                Some(m) => llm_step(&app, &run_id, &role, "work", m, &system, &user, cap).await,
-                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
-            }
-        };
-        match result {
-            Ok(Some(output)) if !output.is_empty() => {
-                let mut clean = strip_ask(&output);
-                if external {
-                    mark_harness_step(&app, &run_id, &role, &harness);
+            // A one-role stage — or a wave that must stay serial (external
+            // harnesses) — hands each next role what the previous one delivered.
+            for (role, _name, title) in stage {
+                let step_handoff = if stage.len() > 1 {
+                    let store = app.store.lock().unwrap();
+                    store.runs.iter().find(|r| r.id == run_id)
+                        .map(|r| build_handoff(r, &completed))
+                        .unwrap_or_default()
                 } else {
-                    // External harnesses edit the repo directly — no FILES to apply.
-                    apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                    handoff.clone()
+                };
+                if !relay_work(&app, &run_id, role, title, &roles, &step_handoff, &[],
+                    repo_path.as_deref(), &repo_line, repo_note_line,
+                    &docs_section, &docs_line, &task, &project_name).await
+                {
+                    return;
                 }
-                deliver_and_close(&app, &run_id, &role, &clean, None).await;
-                if let Some((to, topic)) = parse_ask(&output) {
-                    raise_discussion(&role, &to, &topic, 1);
-                }
+                completed.push(role.clone());
             }
-            Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
-            Ok(Some(_)) => {
-                let mut store = app.store.lock().unwrap();
-                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
-                    step.status = "error".into();
-                    step.output = "Model returned an empty answer".into();
-                    step.finished_at = now_secs();
-                }
-                save_runs(&store);
-            }
-            Err(e) => {
-                let mut store = app.store.lock().unwrap();
-                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
-                    step.status = "error".into();
-                    step.output = e.1;
-                    step.finished_at = now_secs();
-                }
-                save_runs(&store);
-            }
+            continue;
         }
+        completed.extend(stage.iter().map(|(r, _, _)| r.clone()));
     }
 
     // ---- Meeting loop: answer → revise, until nothing is open (bounded) ----
@@ -6200,7 +6967,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             // a dev/UX asker may re-emit their FILES block with fixes applied
             let rev_files = repo_path.is_some() && (d.from.starts_with("dev") || d.from.starts_with("ux"));
             let goal_line = goal_ancestry_line(&app, &run_id, &d.from);
-            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
+            let system = work_system(&arules, &aname, &atitle, &d.from, rev_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
             let user = format!(
                 "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words — re-emit the full \"## FILES\" section too if your files changed). If you are still blocked you may end with another \"## ASK\" section.",
                 d.topic,
@@ -6226,7 +6993,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                     deliver_and_close(&app, &run_id, &d.from, &clean, Some(meeting_round + 1)).await;
                     // The question as asked is answered either way; a still-blocked asker raises a NEW discussion.
                     match parse_ask(&output) {
-                        Some((to, topic)) => { raise_discussion(&d.from, &to, &topic, meeting_round + 1); }
+                        Some((to, topic)) => { raise_run_discussion(&app, &run_id, &roles, &d.from, &to, &topic, meeting_round + 1); }
                         None => {}
                     }
                 }
@@ -6357,9 +7124,11 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
 
     // Loop mode: the PO looks at the whole chain so far and either writes the
     // next iteration's task or declares the goal done.
-    let (loop_mode, iteration) = {
+    let (loop_mode, iteration, parent_task_id) = {
         let store = app.store.lock().unwrap();
-        store.runs.iter().find(|r| r.id == run_id).map(|r| (r.loop_mode, r.iteration)).unwrap_or((false, 1))
+        store.runs.iter().find(|r| r.id == run_id)
+            .map(|r| (r.loop_mode, r.iteration, r.task_id.clone()))
+            .unwrap_or((false, 1, None))
     };
     if loop_mode && !all_error && !stop_requested(&app, &run_id) && iteration < MAX_LOOP_ITERATIONS {
         let (pname, _ptitle, prules, pmodel) = persona_of(&app, "po");
@@ -6387,7 +7156,7 @@ Reply with EITHER the concrete task for the next iteration (one sentence, same l
                 let next = next.trim().trim_matches('`').to_string();
                 if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600 {
                     let next_task = next.lines().last().unwrap_or(&next).to_string();
-                    if let Ok(child) = spawn_run_with(&app, &project_id, &next_task, true, iteration + 1, "loop", None) {
+                    if let Ok(child) = spawn_run_with(&app, &project_id, &next_task, true, iteration + 1, "loop", None, parent_task_id.as_deref()) {
                         let mut store = app.store.lock().unwrap();
                         if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
                             run.next_run_id = Some(child.id.clone());
@@ -6450,12 +7219,16 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
             {
                 let store = app.store.lock().unwrap();
                 if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
-                    for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
-                        if s.status == "done" && !s.output.is_empty() {
-                            let brief: String = strip_files(&s.output).chars().take(1400).collect();
-                            handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
-                        }
-                    }
+                    // Same stage plan as round 1: a retried builder sees the
+                    // stages before the build wave, not its parallel peers.
+                    let work_roles: Vec<(String, String, String)> = run.steps.iter()
+                        .filter(|s| s.kind == "work")
+                        .map(|s| (s.role.clone(), s.name.clone(), s.title.clone()))
+                        .collect();
+                    let managers: HashMap<String, String> = store.personas.iter()
+                        .map(|p| (p.role.clone(), p.reports_to.clone())).collect();
+                    let preds = handoff_predecessors(&work_roles, &managers, &role);
+                    handoff = build_handoff(run, &preds);
                 }
             }
             {
@@ -6468,7 +7241,7 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
             }
             let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
             let goal_line = goal_ancestry_line(&app, &run_id, &role);
-            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
+            let system = work_system(&rules, &pname, &title, &role, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
             let user = if handoff.is_empty() {
                 format!("## Task from the user\n{task}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
             } else {
@@ -6562,15 +7335,11 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
 /// `execute_run` in the background. Shared by the API handler and the loop
 /// engine (each loop iteration spawns the next run this way). Returns the
 /// stored run — its `.id` is what links a loop chain via `next_run_id`.
-fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32) -> Result<Run, ApiError> {
-    spawn_run_with(app, project_id, task, loop_mode, iteration, "manual", None)
-}
-
-/// Same as spawn_run, with an explicit trigger (manual / scheduled / loop) and
-/// routine provenance. Scheduled runs snapshot the project goal + budget.
+/// Spawn one run with an explicit trigger (manual / scheduled / loop), routine
+/// provenance and the project task this run delivers.
 fn spawn_run_with(
     app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32,
-    trigger: &str, routine_id: Option<&str>,
+    trigger: &str, routine_id: Option<&str>, task_id: Option<&str>,
 ) -> Result<Run, ApiError> {
     let run = {
         let mut store = app.store.lock().unwrap();
@@ -6578,6 +7347,12 @@ fn spawn_run_with(
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")))?;
         let (project_name, agents) = (p.name.clone(), p.agents.clone());
         let (goal, mut budget_usd) = (p.goal.clone(), p.budget_usd);
+        if let Some(tid) = task_id {
+            if !store.project_tasks.iter().any(|t| t.id == tid && t.project_id == project_id) {
+                return Err(err(StatusCode::NOT_FOUND,
+                    format!("Task '{tid}' not found in project '{project_id}'")));
+            }
+        }
         if agents.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no team — add agents on the flow first"));
         }
@@ -6625,6 +7400,7 @@ fn spawn_run_with(
             project_id: project_id.to_string(),
             project_name,
             task: task.to_string(),
+            task_id: task_id.map(str::to_string),
             status: "running".into(),
             steps,
             phase: "working".into(),
@@ -6651,6 +7427,16 @@ fn spawn_run_with(
         };
         store.runs.push(run.clone());
         save_runs(&store);
+        if let Some(tid) = task_id {
+            let now = now_secs();
+            if let Some(t) = store.project_tasks.iter_mut().find(|t| t.id == tid && t.project_id == project_id) {
+                t.run_ids.push(run.id.clone());
+                t.latest_run_id = Some(run.id.clone());
+                t.status = "in_progress".into();
+                t.updated_at = now;
+                save_project_tasks(&store);
+            }
+        }
         run
     };
     let bg_app = app.clone();
@@ -6661,13 +7447,49 @@ fn spawn_run_with(
 
 async fn run_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<RunRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let task = req.task.trim().to_string();
-    if task.is_empty() {
+    let task_text = req.task.trim().to_string();
+    if task_text.is_empty() && req.task_id.is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "task is required"));
     }
+    // Every manual dispatch is a real task (Jira-like): reuse the given task on
+    // retry, otherwise mint one from the composer text. The run links back via
+    // task_id, and its steps become the task's subtasks.
+    let created = req.task_id.is_none();
+    let (task_id, prompt) = {
+        let mut store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+        match req.task_id.as_deref() {
+            Some(tid) => {
+                let t = store.project_tasks.iter()
+                    .find(|t| t.id == tid && t.project_id == id)
+                    .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Task '{tid}' not found in project '{id}'")))?;
+                (t.id.clone(), task_prompt(t))
+            }
+            None => {
+                let title = task_title_from(&task_text);
+                let t = new_project_task(&mut store, &id, title, task_text.clone(), "medium", "todo");
+                (t.id.clone(), task_text.clone())
+            }
+        }
+    };
     // Heavy lifting happens in the background; the UI polls GET /runs/{id}
-    let run = spawn_run(&app, &id, &task, req.run_loop, 1)?;
-    Ok(json_ok(serde_json::to_value(run).unwrap()))
+    let run = match spawn_run_with(&app, &id, &prompt, req.run_loop, 1, "manual", None, Some(&task_id)) {
+        Ok(run) => run,
+        Err(e) => {
+            // A dispatch that never started must not leave a phantom todo task.
+            if created {
+                let mut store = app.store.lock().unwrap();
+                store.project_tasks.retain(|t| !(t.id == task_id && t.run_ids.is_empty()));
+                save_project_tasks(&store);
+            }
+            return Err(e);
+        }
+    };
+    let mut out = serde_json::to_value(run).unwrap_or_else(|_| json!({}));
+    out["task_id"] = json!(task_id);
+    Ok(json_ok(out))
 }
 
 #[derive(Deserialize)]
@@ -7421,7 +8243,11 @@ async fn main() {
             load_tasks(&mut store);    // board tasks (tasks.json)
             load_projects(&mut store); // projects survive restarts (projects.json) — BEFORE load_runs, whose counter salvage scans store.projects
             load_runs(&mut store); // work history survives restarts (runs.json)
+            load_project_tasks(&mut store); // Jira-like tasks survive restarts (project-tasks.json)
+            reconcile_project_tasks(&mut store); // a run closed by the restart must not leave its task in_progress
             load_docs(&mut store); // document space + comments survive restarts (docs.json)
+            backfill_latest_run_docs(&mut store); // field docs for missions that predate doc capture
+            save_docs(&store);
             load_routines(&mut store); // scheduled routines (routines.json)
             load_paused(&mut store); // paused-registry survives restarts (paused.json)
             load_agents(&mut store); // agent registry survives restarts (agents.json)
@@ -7484,6 +8310,10 @@ async fn main() {
         .route("/tasks/{task_id}", delete(delete_task))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).put(update_project).delete(delete_project))
+        .route("/projects/{id}/tasks", get(list_project_tasks).post(create_project_task))
+        .route("/projects/{id}/tasks/{task_id}", get(get_project_task).put(update_project_task).delete(delete_project_task))
+        .route("/projects/{id}/tasks/{task_id}/run", post(dispatch_project_task))
+        .route("/projects/{id}/tasks/{task_id}/subtasks/{subtask_id}", get(get_project_subtask))
         .route("/projects/{id}/docs", get(list_docs).post(create_doc))
         .route("/projects/{id}/docs/upload",
                post(upload_doc).layer(axum::extract::DefaultBodyLimit::max(DOC_UPLOAD_MAX_BYTES + 65536)))
@@ -7541,6 +8371,7 @@ mod tests {
             project_id: "p-test".into(),
             project_name: "Test".into(),
             task: "task".into(),
+            task_id: None,
             status: status.into(),
             steps: Vec::new(),
             phase: "work".into(),
@@ -7565,6 +8396,73 @@ mod tests {
             watchdog_note: None,
             watchdog_at: 0,
         }
+    }
+
+    fn work_row(role: &str, name: &str, title: &str, status: &str, output: &str) -> RunStep {
+        RunStep {
+            role: role.into(), name: name.into(), title: title.into(), kind: "work".into(),
+            status: status.into(), output: output.into(), model: None, container: None,
+            deliverable: None, rev: None, started_at: 0, finished_at: 0, harness: None,
+            input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
+        }
+    }
+
+    fn role_rows(roles: &[&str]) -> Vec<(String, String, String)> {
+        roles.iter().map(|r| (r.to_string(), r.to_string(), r.to_string())).collect()
+    }
+
+    fn seeded_managers() -> HashMap<String, String> {
+        [
+            ("ba", "po"), ("sa", "ba"), ("ux-ui", "sa"), ("ux-ui-2", "ux-ui"),
+            ("dev-fe", "sa"), ("dev-be", "sa"), ("dev-be-2", "dev-be"), ("qa", "sa"),
+        ].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn builders_run_as_one_parallel_wave() {
+        let roles = role_rows(&["po", "ba", "sa", "ux-ui", "ux-ui-2", "dev-fe", "dev-be", "dev-be-2", "qa"]);
+        let stages: Vec<Vec<String>> = plan_work_stages(&roles, &seeded_managers()).iter()
+            .map(|s| s.iter().map(|(r, _, _)| r.clone()).collect())
+            .collect();
+        assert_eq!(stages, vec![
+            vec!["po"], vec!["ba"], vec!["sa"], vec!["ux-ui"], vec!["ux-ui-2"],
+            // frontend + backend build together …
+            vec!["dev-fe", "dev-be"],
+            // … the paired backend waits for its partner's schema, then QA
+            vec!["dev-be-2"], vec!["qa"],
+        ]);
+        // A retried frontend step must not see the parallel backend's output.
+        let preds = handoff_predecessors(&roles, &seeded_managers(), "dev-fe");
+        assert!(!preds.contains(&"dev-be".to_string()));
+        assert!(preds.contains(&"sa".to_string()));
+    }
+
+    #[test]
+    fn handoff_keeps_the_full_spec_but_not_parallel_peers() {
+        let mut run = test_run("running");
+        let long_spec = format!("# Spec\n\n{}\n\n## Work Split\nFRONTEND + BACKEND", "x".repeat(9000));
+        run.steps.push(work_row("sa", "Oat", "System Analyst", "done", &long_spec));
+        run.steps.push(work_row("dev-be", "Bank", "Backend Developer", "done", "BACKEND ONLY"));
+        let handoff = build_handoff(&run, &["sa".to_string(), "dev-be".to_string()]);
+        // an over-cap spec is cut in the middle — the trailing split survives
+        assert!(handoff.contains("[…middle truncated…]"));
+        assert!(handoff.contains("## Work Split"));
+        assert!(handoff.contains("FRONTEND + BACKEND"));
+        // … and a builder handoff excludes the parallel peer entirely.
+        let fe_handoff = build_handoff(&run, &handoff_predecessors(
+            &role_rows(&["sa", "dev-fe", "dev-be"]), &seeded_managers(), "dev-fe",
+        ));
+        assert!(!fe_handoff.contains("BACKEND ONLY"));
+    }
+
+    #[test]
+    fn dev_prompts_scope_each_builder_to_its_own_slice() {
+        let fe = work_system("rules", "Zax", "Frontend Developer", "dev-fe", true, "P", "", "", "", "run-1");
+        assert!(fe.contains("FRONTEND slice"));
+        let be = work_system("rules", "Bank", "Backend Developer", "dev-be", true, "P", "", "", "", "run-1");
+        assert!(be.contains("BACKEND slice"));
+        let sa = work_system("rules", "Oat", "System Analyst", "sa", false, "P", "", "", "", "run-1");
+        assert!(sa.contains("Work Split"));
     }
 
     #[test]
@@ -7634,6 +8532,32 @@ mod tests {
     }
 
     #[test]
+    fn step_docs_use_role_folder_and_upsert() {
+        let mut store = Store::default();
+        let out = "# Spec v1\n\nBody";
+        assert!(save_step_doc(&mut store, "p-001", "run-999", "sa", "Oat", "System Analyst", out));
+        assert_eq!(store.docs.len(), 1);
+        assert_eq!(store.docs[0].folder, "SA");
+        assert_eq!(store.docs[0].title, "Spec v1");
+        assert_eq!(store.docs[0].source_role, "sa");
+
+        // a meeting revision updates the same doc instead of stacking a new one
+        assert!(save_step_doc(&mut store, "p-001", "run-999", "sa", "Oat", "System Analyst", "# Spec v2\n\nNew body"));
+        assert_eq!(store.docs.len(), 1);
+        assert_eq!(store.docs[0].title, "Spec v2");
+        assert_eq!(store.docs[0].content_md, "# Spec v2\n\nNew body");
+        // identical output is a no-op
+        assert!(!save_step_doc(&mut store, "p-001", "run-999", "sa", "Oat", "System Analyst", "# Spec v2\n\nNew body"));
+
+        // code FILES blocks never leak into the document body
+        save_step_doc(&mut store, "p-001", "run-999", "dev-fe", "Zax", "Frontend Developer",
+            "# UI\n\nRationale\n\n## FILES\n### a.jsx\n```\ncode\n```");
+        let dev_doc = store.docs.iter().find(|d| d.source_role == "dev-fe").unwrap();
+        assert_eq!(dev_doc.folder, "Dev");
+        assert!(!dev_doc.content_md.contains("```"));
+    }
+
+    #[test]
     fn harness_templates_and_binary_validation() {
         let claude = harness_template("claude", "").unwrap();
         assert!(claude.contains("{prompt_file}"));
@@ -7645,6 +8569,33 @@ mod tests {
         assert!(valid_binary_name("claude"));
         assert!(!valid_binary_name("claude; rm -rf /"));
         assert!(!valid_binary_name(""));
+    }
+
+    fn project_task(title: &str, description: &str) -> ProjectTask {
+        ProjectTask {
+            id: "tk-001".into(), project_id: "p-001".into(), title: title.into(),
+            description: description.into(), status: "todo".into(), priority: "medium".into(),
+            assignee: String::new(), created_at: 1, updated_at: 1,
+            run_ids: Vec::new(), latest_run_id: None,
+        }
+    }
+
+    #[test]
+    fn task_prompt_keeps_composer_text_and_prepends_title_once() {
+        let auto = project_task("Redesign dashboard", "Redesign dashboard\n\nMore detail");
+        assert_eq!(task_prompt(&auto), "Redesign dashboard\n\nMore detail");
+        let manual = project_task("Fix login", "Users get a 401 after reset.");
+        assert_eq!(task_prompt(&manual), "Fix login\n\nUsers get a 401 after reset.");
+        let title_only = project_task("Only title", "   ");
+        assert_eq!(task_prompt(&title_only), "Only title");
+    }
+
+    #[test]
+    fn task_title_and_subtask_ids_are_stable() {
+        assert_eq!(task_title_from("\n  First line  \nsecond"), "First line");
+        assert_eq!(task_title_from("   "), "Untitled task");
+        assert_eq!(task_title_from(&"x".repeat(150)).chars().count(), 121);
+        assert_eq!(subtask_id(&work_row("dev-fe", "Zax", "Frontend", "done", "out")), "dev-fe-work");
     }
 
     #[test]

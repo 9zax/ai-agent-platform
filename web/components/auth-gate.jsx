@@ -8,7 +8,7 @@
 import { useEffect, useState } from 'react'
 import { usePathname } from 'next/navigation'
 import Link from 'next/link'
-import { Bot, Lock, Loader2 } from 'lucide-react'
+import { Bot, Lock, Loader2, Menu, X } from 'lucide-react'
 import { getToken } from '@/lib/auth'
 import Sidebar from '@/components/Sidebar'
 import { Button } from '@/components/ui/button'
@@ -19,6 +19,10 @@ export default function AuthGate({ children }) {
   const pathname = usePathname()
   // 'checking' → probe in flight; 'open' → auth off or session valid; 'locked' → sign-in required
   const [state, setState] = useState('checking')
+  const [navOpen, setNavOpen] = useState(false)
+
+  // Close the mobile drawer whenever the route changes.
+  useEffect(() => { setNavOpen(false) }, [pathname])
 
   useEffect(() => {
     let alive = true
@@ -75,8 +79,41 @@ export default function AuthGate({ children }) {
 
   return (
     <div className="flex min-h-screen">
-      <Sidebar />
-      <div className="flex min-w-0 flex-1 flex-col">{children}</div>
+      {/* Mobile drawer — the sidebar is 248px fixed, so below lg it slides in
+          over the content instead of squeezing it off-screen. */}
+      <div
+        className={`fixed inset-y-0 left-0 z-50 -translate-x-full transition-transform duration-300 ease-out lg:sticky lg:top-0 lg:z-auto lg:h-screen lg:translate-x-0 ${
+          navOpen ? 'translate-x-0' : ''
+        }`}
+      >
+        <Sidebar />
+      </div>
+      {navOpen && (
+        <button
+          aria-label="Close navigation"
+          className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden"
+          onClick={() => setNavOpen(false)}
+        />
+      )}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-white/[0.06] bg-background/85 px-4 py-2.5 backdrop-blur-xl lg:hidden">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-violet-400 via-primary to-indigo-600 text-white shadow-[0_8px_20px_-8px_rgba(139,92,246,0.8)]">
+              <Bot className="h-4 w-4" />
+            </span>
+            <span className="truncate text-[13px] font-semibold text-white">AI Agent Platform</span>
+          </div>
+          <button
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.03] text-muted-foreground transition-colors hover:text-white"
+            aria-label={navOpen ? 'Close navigation' : 'Open navigation'}
+            aria-expanded={navOpen}
+            onClick={() => setNavOpen(o => !o)}
+          >
+            {navOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
+          </button>
+        </header>
+        {children}
+      </div>
     </div>
   )
 }

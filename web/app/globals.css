@@ -39,6 +39,7 @@
     @apply bg-background text-foreground font-sans antialiased;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
     letter-spacing: -0.011em;
+    overflow-x: hidden;
     background-image:
       radial-gradient(920px 520px at 8% -12%, rgba(139, 92, 246, 0.13), transparent 62%),
       radial-gradient(780px 460px at 102% -6%, rgba(56, 189, 248, 0.06), transparent 62%);
@@ -93,11 +94,11 @@
 @layer components {
   /* Shared page chrome — keeps headers and content rhythm identical page to page */
   .page-header {
-    @apply flex flex-wrap items-start justify-between gap-4 px-8 pb-6 pt-8;
+    @apply flex flex-wrap items-start justify-between gap-4 px-4 pb-5 pt-6 sm:px-6 lg:px-8 lg:pb-6 lg:pt-8;
   }
 
   .page-body {
-    @apply px-8 pb-10;
+    @apply px-4 pb-10 sm:px-6 lg:px-8;
   }
 
   .page-title {
@@ -362,3 +363,90 @@
   70%, 100% { transform: scale(2.1); opacity: 0; }
 }
 .ping-soft { animation: ping-soft 2s cubic-bezier(0, 0, 0.2, 1) infinite; }
+
+/* ---------- Project command center ---------- */
+
+/* Cards settle into place on first paint; pair with an inline animation-delay
+   for a staggered entrance (see .stagger-1 … .stagger-6). */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(10px) scale(.995); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.rise-in { animation: rise-in .42s cubic-bezier(.2, .7, .3, 1) both; }
+.stagger-1 { animation-delay: .03s; }
+.stagger-2 { animation-delay: .07s; }
+.stagger-3 { animation-delay: .11s; }
+.stagger-4 { animation-delay: .15s; }
+.stagger-5 { animation-delay: .19s; }
+.stagger-6 { animation-delay: .23s; }
+
+/* Live progress: a light band sweeps across the filled track to signal work
+   is still happening without moving the actual value. */
+.progress-live { position: relative; overflow: hidden; }
+.progress-live::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.55), transparent);
+  background-size: 220% 100%;
+  animation: sweep 2.2s linear infinite;
+  pointer-events: none;
+}
+@keyframes sweep {
+  from { background-position: 180% 0; }
+  to { background-position: -80% 0; }
+}
+
+/* Stage rail node glow — a slow breathe rather than a harsh blink. */
+@keyframes stage-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(96,165,250,.38); }
+  50% { box-shadow: 0 0 0 6px rgba(96,165,250,0); }
+}
+.stage-live { animation: stage-breathe 1.9s ease-in-out infinite; }
+
+/* Smooth open/close without measuring content height. */
+.collapse-shell {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .3s cubic-bezier(.2, .7, .3, 1);
+}
+.collapse-shell[data-open='true'] { grid-template-rows: 1fr; }
+.collapse-inner { min-height: 0; overflow: hidden; }
+
+/* Agent card halo while an agent is working / speaking. */
+@keyframes node-halo {
+  0%, 100% { opacity: .35; transform: scale(.98); }
+  50% { opacity: .8; transform: scale(1.02); }
+}
+.node-halo { animation: node-halo 2.4s ease-in-out infinite; }
+
+/* Dispatch button sheen. */
+.btn-sheen { position: relative; overflow: hidden; }
+.btn-sheen::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -60%;
+  width: 45%;
+  height: 100%;
+  transform: skewX(-18deg);
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.28), transparent);
+  transition: left .55s cubic-bezier(.2, .7, .3, 1);
+}
+.btn-sheen:hover::after { left: 120%; }
+
+/* Pending-human attention dot */
+@keyframes attention {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(251,113,133,.45); }
+  50% { box-shadow: 0 0 0 5px rgba(251,113,133,0); }
+}
+.attention-dot { animation: attention 1.6s ease-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise-in, .stage-live, .node-halo, .progress-live::after, .ping-soft,
+  .typing-dot, .chat-in, .toast-in, .revert-flash, .attention-dot {
+    animation: none !important;
+  }
+  .collapse-shell { transition: none; }
+}
