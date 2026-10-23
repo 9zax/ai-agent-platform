@@ -10,6 +10,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -110,7 +111,18 @@ struct Persona {
     /// model override per provider id (absent/empty = use the provider's default model)
     #[serde(rename = "model_overrides", default)]
     model_overrides: BTreeMap<String, String>,
+    /// role id of this persona's manager ("" = top of the org)
+    #[serde(default)]
+    reports_to: String,
+    /// native = built-in provider loop; claude/codex/custom = external CLI harness
+    #[serde(default = "default_harness")]
+    harness: String,
+    /// command template for a custom harness ({prompt_file}, {model}, {role} placeholders)
+    #[serde(default)]
+    harness_command: String,
 }
+
+fn default_harness() -> String { "native".into() }
 
 fn seed_personas() -> Vec<Persona> {
     // Per-role model overrides, one per provider family the seeds cover:
@@ -131,11 +143,14 @@ fn seed_personas() -> Vec<Persona> {
             (PROVIDERS[0].id.to_string(), glm.to_string()),
             ("gemini".to_string(), gemini.to_string()),
         ]),
+        reports_to: String::new(),
+        harness: default_harness(),
+        harness_command: String::new(),
     };
     // Order = collaboration flow: the PO opens the mission, BA analyzes the
     // business side, SA turns it into the system spec and briefs every
     // specialist (UX/UI, Dev, QA) who then work together on the same run.
-    vec![
+    let mut team = vec![
         mk("po", "Mickey", "Product Owner", "16",
            "Product strategy, user stories, backlog grooming, roadmap, prioritization (RICE/MoSCoW), stakeholder alignment",
            "You are Mickey, a Product Owner with 16 years of experience shipping B2B and B2C products. You go FIRST: you turn the user's ask into a clear product goal with priorities and scope boundaries, then hand it to the BA and SA for analysis. You stay the hub of the team — UX/UI, Dev and QA all get their direction from you. The whole team works test-first (TDD), and it starts with you: every story you accept carries acceptance criteria written as concrete Given/When/Then test cases — a story the team cannot turn into a failing test first is NOT ready. You think in outcomes, not features.", "glm-5.3", "gemini-4-argon"),
@@ -163,7 +178,20 @@ fn seed_personas() -> Vec<Persona> {
         mk("qa", "Tara", "QA Engineer", "14",
            "Test strategy, E2E automation (Playwright), API testing, contract testing, CI quality gates, exploratory testing",
            "You are Tara, a QA Engineer with 14 years of experience. You verify the team's work against the PO's acceptance criteria and the SA's spec — and in this team's TDD flow you are where it starts: you turn the acceptance criteria into failing acceptance/E2E tests BEFORE the Devs implement, so 'done' is defined by tests, not opinions, and the Devs always have a red test to make green. You think in risk, write tests that fail for the right reason, automate the boring 80%, and explore the dangerous 20% humans find.", "glm-5.3-flash", "gemini-3.8-flash"),
-    ]
+    ];
+    // Org-lite: the reporting line every agent sees in its prompt.
+    let bosses = [
+        ("ba", "po"), ("sa", "ba"),
+        ("ux-ui", "sa"), ("ux-ui-2", "ux-ui"),
+        ("dev-fe", "sa"), ("dev-be", "sa"), ("dev-be-2", "dev-be"),
+        ("qa", "sa"),
+    ];
+    for p in &mut team {
+        if let Some((_, boss)) = bosses.iter().find(|(role, _)| *role == p.role) {
+            p.reports_to = (*boss).to_string();
+        }
+    }
+    team
 }
 
 /// The platform's own default project — the team works on ai-agent-platform
@@ -193,10 +221,13 @@ fn seed_project() -> Project {
             link("sa", "dev-be"), link("sa", "dev-be-2"), link("sa", "qa"),
         ],
         positions,
+        goal: "Make ai-agent-platform the best way for one developer to run a real AI software team on their own machine.".into(),
+        budget_usd: Some(10.0),
+        budget_alert_pct: 80,
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Task {
     id: String,
     title: String,
@@ -209,12 +240,90 @@ struct Task {
     due: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct SkillTestRun {
+    id: String,
+    input: String,
+    output: String,
+    model: String,
+    at: u64,
+    #[serde(default)]
+    cost_usd: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SkillSnapshot {
+    version: u32,
+    name: String,
+    description: String,
+    enabled: bool,
+    at: u64,
+}
+
+fn default_skill_version() -> u32 { 1 }
+
+fn seed_skill(id: &str, name: &str, description: &str, enabled: bool) -> Skill {
+    Skill {
+        id: id.into(), name: name.into(), description: description.into(), enabled,
+        version: 1, test_inputs: Vec::new(), test_runs: Vec::new(), history: Vec::new(),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Skill {
     id: String,
     name: String,
     description: String,
     enabled: bool,
+    #[serde(default = "default_skill_version")]
+    version: u32,
+    /// saved inputs for the Skill Studio test bench
+    #[serde(default)]
+    test_inputs: Vec<String>,
+    /// results of the last N test runs (newest first, capped)
+    #[serde(default)]
+    test_runs: Vec<SkillTestRun>,
+    /// previous versions (newest first, capped)
+    #[serde(default)]
+    history: Vec<SkillSnapshot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Routine {
+    id: String,
+    project_id: String,
+    name: String,
+    task: String,
+    /// 5-field cron in local time: minute hour dom month dow
+    cron: String,
+    enabled: bool,
+    #[serde(default)]
+    loop_mode: bool,
+    #[serde(default)]
+    last_run_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run_id: Option<String>,
+    #[serde(default)]
+    last_result: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DocComment {
+    id: String,
+    project_id: String,
+    doc_id: String,
+    author: String,
+    /// the passage this comment is anchored to (quoted text)
+    #[serde(default)]
+    quote: String,
+    body: String,
+    /// open | resolved
+    status: String,
+    created_at: u64,
+    #[serde(default)]
+    resolved_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -248,7 +357,18 @@ struct Project {
     /// react flow node positions per role
     #[serde(default)]
     positions: HashMap<String, Position>,
+    /// the standing "why" injected into every step of a mission
+    #[serde(default)]
+    goal: String,
+    /// per-run spend ceiling in USD (None/0 = unlimited)
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    /// warn once when spend crosses this percentage of the budget
+    #[serde(default = "default_budget_alert_pct")]
+    budget_alert_pct: u8,
 }
+
+fn default_budget_alert_pct() -> u8 { 80 }
 
 #[derive(Deserialize)]
 struct ProjectCreate {
@@ -257,6 +377,10 @@ struct ProjectCreate {
     description: String,
     #[serde(default)]
     repo_url: String,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    budget_usd: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -268,6 +392,9 @@ struct ProjectUpdate {
     #[serde(default)] agents: Option<Vec<String>>,
     #[serde(default)] links: Option<Vec<ProjectLink>>,
     #[serde(default)] positions: Option<HashMap<String, Position>>,
+    #[serde(default)] goal: Option<String>,
+    #[serde(default)] budget_usd: Option<Option<f64>>,
+    #[serde(default)] budget_alert_pct: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +453,30 @@ struct DocQuery {
     raw: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Deserialize)]
+struct DocCommentCreate {
+    body: String,
+    #[serde(default)]
+    quote: String,
+    #[serde(default)]
+    author: String,
+}
+
+#[derive(Deserialize)]
+struct DocCommentUpdate {
+    /// open | resolved
+    status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ModelPrice {
+    #[serde(default)]
+    input_per_mtok: f64,
+    #[serde(default)]
+    output_per_mtok: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct AiConfig {
     default_image: String,
     max_containers: u32,
@@ -343,6 +493,33 @@ struct AiConfig {
     auto_pause_enabled: bool,
     /// idle threshold in seconds before the sweeper stops a container
     idle_timeout_secs: u64,
+    /// per-model USD per million tokens (approximate — edit in AI Config)
+    #[serde(default)]
+    pricing: BTreeMap<String, ModelPrice>,
+    #[serde(default)]
+    default_input_per_mtok: f64,
+    #[serde(default)]
+    default_output_per_mtok: f64,
+}
+
+fn seeded_pricing() -> BTreeMap<String, ModelPrice> {
+    let mut m = BTreeMap::new();
+    let mut put = |id: &str, input: f64, output: f64| {
+        m.insert(id.to_string(), ModelPrice { input_per_mtok: input, output_per_mtok: output });
+    };
+    // Approximate public list prices. Users can correct them in AI Config;
+    // budget enforcement is only as accurate as this table.
+    put("glm-5.3", 0.6, 2.2);
+    put("glm-5.3-flash", 0.3, 1.2);
+    put("glm-4.5-air", 0.2, 0.8);
+    put("claude-opus-5-5", 15.0, 75.0);
+    put("claude-sonnet-5-5", 3.0, 15.0);
+    put("claude-haiku-5-5", 0.8, 4.0);
+    put("gpt-5.5", 1.25, 10.0);
+    put("gemini-4-argon", 1.25, 10.0);
+    put("gemini-3.8-flash", 0.3, 1.0);
+    put("gemini-3.5-flash-lite", 0.1, 0.4);
+    m
 }
 
 impl Default for AiConfig {
@@ -358,6 +535,9 @@ impl Default for AiConfig {
             admin_password_hash: String::new(),
             auto_pause_enabled: true,
             idle_timeout_secs: 900,
+            pricing: seeded_pricing(),
+            default_input_per_mtok: 0.0,
+            default_output_per_mtok: 0.0,
         }
     }
 }
@@ -394,6 +574,41 @@ struct RunStep {
     started_at: u64,
     #[serde(default)]
     finished_at: u64,
+    /// external CLI harness used for this step (None = built-in provider loop)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    /// estimated USD for this step (token-based; 0 for unmetered harnesses)
+    #[serde(default)]
+    cost_usd: f64,
+    /// false = external harness / unpriced model — cost is not a real measurement
+    #[serde(default = "default_true")]
+    metered: bool,
+    /// false = model missing from the price table — cost shows as an estimate only
+    #[serde(default = "default_true")]
+    priced: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// Pre-push review state for a mission (diff approval gate).
+#[derive(Clone, Serialize, Deserialize)]
+struct RunReview {
+    /// pending | approved | rejected | timed_out
+    status: String,
+    #[serde(default)]
+    diff: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    requested_at: u64,
+    #[serde(default)]
+    decided_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -474,7 +689,32 @@ struct Run {
     /// the run this loop chain continued into (UI follows it when the parent finishes)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_run_id: Option<String>,
+    /// manual | scheduled | loop | retry
+    #[serde(default = "default_trigger")]
+    trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routine_id: Option<String>,
+    /// project goal snapshot — history survives later goal edits
+    #[serde(default)]
+    goal: String,
+    /// per-run budget snapshot (None = unlimited)
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    #[serde(default)]
+    cost_usd: f64,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    /// true once the budget alert threshold has been reported for this run
+    #[serde(default)]
+    cost_alerted: bool,
+    /// pre-push diff review (None = gate not reached / skipped)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review: Option<RunReview>,
 }
+
+fn default_trigger() -> String { "manual".into() }
 
 /// Short-lived cache for GET /models — avoids hammering the provider each editor open
 struct ModelsCache {
@@ -526,7 +766,11 @@ struct Store {
     projects: Vec<Project>,
     /// per-project document space (persisted, /data/docs.json)
     docs: Vec<ProjectDoc>,
+    /// review comments anchored to doc passages (persisted with docs.json)
+    doc_comments: Vec<DocComment>,
     runs: Vec<Run>,
+    /// scheduled routines (persisted, /data/routines.json)
+    routines: Vec<Routine>,
     config: AiConfig,
     /// login sessions: token → username (web UI auth, ADMIN_USER/ADMIN_PASSWORD from env)
     sessions: HashMap<String, String>,
@@ -546,7 +790,9 @@ struct Store {
     task_counter: usize,
     project_counter: usize,
     doc_counter: usize,
+    comment_counter: usize,
     run_counter: usize,
+    routine_counter: usize,
 }
 
 impl Default for Store {
@@ -555,16 +801,18 @@ impl Default for Store {
             personas: seed_personas(),
             tasks: Vec::new(),
             skills: vec![
-                Skill { id: "web-research".into(), name: "Web Research".into(), description: "Search, crawl and summarize web sources".into(), enabled: true },
-                Skill { id: "code-gen".into(), name: "Code Gen".into(), description: "Generate and refactor code from natural language".into(), enabled: true },
-                Skill { id: "data-analysis".into(), name: "Data Analysis".into(), description: "Analyze datasets and produce reports and charts".into(), enabled: true },
-                Skill { id: "file-ops".into(), name: "File Ops".into(), description: "Read, write and organize files in the workspace".into(), enabled: true },
-                Skill { id: "api-testing".into(), name: "API Testing".into(), description: "Call APIs and validate responses against schemas".into(), enabled: true },
-                Skill { id: "image-analysis".into(), name: "Image Analysis".into(), description: "Inspect and describe images".into(), enabled: false },
+                seed_skill("web-research", "Web Research", "Search, crawl and summarize web sources", true),
+                seed_skill("code-gen", "Code Gen", "Generate and refactor code from natural language", true),
+                seed_skill("data-analysis", "Data Analysis", "Analyze datasets and produce reports and charts", true),
+                seed_skill("file-ops", "File Ops", "Read, write and organize files in the workspace", true),
+                seed_skill("api-testing", "API Testing", "Call APIs and validate responses against schemas", true),
+                seed_skill("image-analysis", "Image Analysis", "Inspect and describe images", false),
             ],
             projects: vec![seed_project()],
             docs: Vec::new(),
+            doc_comments: Vec::new(),
             runs: Vec::new(),
+            routines: Vec::new(),
             config: AiConfig::default(),
             sessions: HashMap::new(),
             models_cache: None,
@@ -576,7 +824,9 @@ impl Default for Store {
             task_counter: 0,
             project_counter: 1,
             doc_counter: 0,
+            comment_counter: 0,
             run_counter: 0,
+            routine_counter: 0,
         }
     }
 }
@@ -639,6 +889,9 @@ struct PersonaUpdate {
     #[serde(default)] rules_md: Option<String>,
     /// model override for the CURRENT active provider: None = untouched, Some("") = clear, Some(m) = set
     #[serde(default)] model: Option<String>,
+    #[serde(default)] reports_to: Option<String>,
+    #[serde(default)] harness: Option<String>,
+    #[serde(default)] harness_command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -678,6 +931,9 @@ struct ConfigUpdate {
     admin_password: Option<String>,
     auto_pause_enabled: Option<bool>,
     idle_timeout_secs: Option<u64>,
+    #[serde(default)] pricing: Option<BTreeMap<String, ModelPrice>>,
+    #[serde(default)] default_input_per_mtok: Option<f64>,
+    #[serde(default)] default_output_per_mtok: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -700,7 +956,33 @@ struct SkillCreate {
 
 #[derive(Deserialize)]
 struct SkillUpdate {
-    enabled: bool,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SkillTestsInput {
+    inputs: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SkillRunRequest {
+    /// override the saved bench inputs for this run
+    inputs: Option<Vec<String>>,
+    /// override the model (defaults to the active provider's default)
+    model: Option<String>,
+}
+
+/// Token usage reported by one provider call (0/0 when the provider omits it).
+#[derive(Clone, Copy, Default)]
+struct LlmUsage {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -976,6 +1258,12 @@ impl App {
     }
 
     async fn llm_max(&self, model: &str, system: &str, user_text: &str, max_tokens: u32) -> Result<String, ApiError> {
+        self.llm_max_usage(model, system, user_text, max_tokens).await.map(|(text, _)| text)
+    }
+
+    /// Same call as `llm_max`, plus the provider-reported token usage so the
+    /// caller can add it to the run's cost ledger.
+    async fn llm_max_usage(&self, model: &str, system: &str, user_text: &str, max_tokens: u32) -> Result<(String, LlmUsage), ApiError> {
         let (api_key, base, template) = self.ai_credentials();
         if api_key.is_empty() && !template.local {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "No API key configured — set one in AI Config"));
@@ -1022,6 +1310,20 @@ impl App {
         let data: Value = resp.json().await
             .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("AI request failed: {e}")))?;
 
+        let usage = if template.protocol == "openai" {
+            LlmUsage {
+                input_tokens: data.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: data.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        } else {
+            LlmUsage {
+                input_tokens: data.pointer("/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    + data.pointer("/usage/cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    + data.pointer("/usage/cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: data.pointer("/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        };
+
         // content arrives as a plain string or, on some OpenAI-compatible
         // servers, as an array of typed parts — accept both shapes
         let text = if template.protocol == "openai" {
@@ -1043,7 +1345,7 @@ impl App {
             }).unwrap_or_default()
         };
         let text = text.trim().to_string();
-        if !text.is_empty() { return Ok(text); }
+        if !text.is_empty() { return Ok((text, usage)); }
 
         // 200 but no usable text — name the likely cause instead of a bare
         // empty string, so callers (llm_retry) and the UI can react to it
@@ -2208,6 +2510,7 @@ async fn list_agents(State(app): State<App>, headers: axum::http::HeaderMap) -> 
             "role": p.role, "name": p.name, "title": p.title, "years": p.years,
             "expertise": p.expertise, "rules_md": p.rules_md,
             "model": model, "model_overrides": p.model_overrides,
+            "reports_to": p.reports_to, "harness": p.harness, "harness_command": p.harness_command,
             "container": running.get(&p.role),
         })
     }).collect();
@@ -2219,11 +2522,22 @@ async fn create_persona(State(app): State<App>, Json(mut p): Json<Persona>) -> A
     if p.role.is_empty() || p.name.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "role and name are required"));
     }
+    if !matches!(p.harness.as_str(), "native" | "claude" | "codex" | "custom") {
+        return Err(err(StatusCode::BAD_REQUEST, "harness must be native, claude, codex or custom"));
+    }
+    if p.harness == "custom" && p.harness_command.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "custom harness needs a command template"));
+    }
+    if p.reports_to == p.role { p.reports_to.clear(); }
     let mut store = app.store.lock().unwrap();
+    if !p.reports_to.is_empty() && !store.personas.iter().any(|x| x.role == p.reports_to) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("Unknown manager role '{}'", p.reports_to)));
+    }
     if store.personas.iter().any(|x| x.role == p.role) {
         return Err(err(StatusCode::CONFLICT, format!("Persona '{}' already exists", p.role)));
     }
     store.personas.push(p.clone());
+    save_personas(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(p).unwrap()))
 }
@@ -2231,6 +2545,19 @@ async fn create_persona(State(app): State<App>, Json(mut p): Json<Persona>) -> A
 async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(req): Json<PersonaUpdate>) -> ApiResult {
     let mut store = app.store.lock().unwrap();
     let provider_id = store.config.ai_provider.clone();
+    // Validate the harness transition against the FINAL state before mutating.
+    let current = store.personas.iter().find(|p| p.role == role)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")))?;
+    let next_harness = req.harness.clone().unwrap_or_else(|| current.harness.clone());
+    let next_command = req.harness_command.as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| current.harness_command.clone());
+    if !matches!(next_harness.as_str(), "native" | "claude" | "codex" | "custom") {
+        return Err(err(StatusCode::BAD_REQUEST, "harness must be native, claude, codex or custom"));
+    }
+    if next_harness == "custom" && next_command.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "custom harness needs a command template"));
+    }
     let p = store.personas.iter_mut().find(|p| p.role == role)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")))?;
     if let Some(v) = req.name { if !v.is_empty() { p.name = v; } }
@@ -2238,6 +2565,11 @@ async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(r
     if let Some(v) = req.years { p.years = v; }
     if let Some(v) = req.expertise { p.expertise = v; }
     if let Some(v) = req.rules_md { p.rules_md = v; }
+    if let Some(v) = req.reports_to {
+        p.reports_to = if v == role { String::new() } else { v };
+    }
+    if let Some(v) = req.harness { p.harness = v; }
+    if let Some(v) = req.harness_command { p.harness_command = v.trim().to_string(); }
     if let Some(v) = req.model {
         // unlike the other fields, an empty string here MEANS "clear the override"
         let v = v.trim().to_string();
@@ -2245,6 +2577,7 @@ async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(r
         else { p.model_overrides.insert(provider_id, v); }
     }
     let out = p.clone();
+    save_personas(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
@@ -2256,6 +2589,7 @@ async fn delete_persona(State(app): State<App>, Path(role): Path<String>) -> Api
     if store.personas.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")));
     }
+    save_personas(&store);
     Ok(json_ok(json!({ "deleted": role })))
 }
 
@@ -2307,6 +2641,7 @@ async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> Api
         due: req.due,
     };
     store.tasks.push(task.clone());
+    save_tasks(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(task).unwrap()))
 }
@@ -2318,6 +2653,7 @@ async fn delete_task(State(app): State<App>, Path(task_id): Path<String>) -> Api
     if store.tasks.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")));
     }
+    save_tasks(&store);
     Ok(json_ok(json!({ "deleted": task_id })))
 }
 
@@ -2343,6 +2679,9 @@ fn config_json(cfg: &AiConfig) -> Value {
         "admin_password_set": !cfg.admin_password_hash.is_empty(),
         "auto_pause_enabled": cfg.auto_pause_enabled,
         "idle_timeout_secs": cfg.idle_timeout_secs,
+        "pricing": cfg.pricing,
+        "default_input_per_mtok": cfg.default_input_per_mtok,
+        "default_output_per_mtok": cfg.default_output_per_mtok,
         "auth_required": auth_enabled(),
     })
 }
@@ -2371,6 +2710,18 @@ async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) ->
         if let Some(v) = req.admin_password { cfg.admin_password_hash = sha256_hex(v.trim()); }
         if let Some(v) = req.auto_pause_enabled { cfg.auto_pause_enabled = v; }
         if let Some(v) = req.idle_timeout_secs { cfg.idle_timeout_secs = v.max(60); }
+        if let Some(v) = req.pricing {
+            cfg.pricing = v.into_iter()
+                .filter(|(k, _)| !k.trim().is_empty())
+                .map(|(k, p)| (k, ModelPrice {
+                    input_per_mtok: p.input_per_mtok.max(0.0),
+                    output_per_mtok: p.output_per_mtok.max(0.0),
+                }))
+                .collect();
+        }
+        if let Some(v) = req.default_input_per_mtok { cfg.default_input_per_mtok = v.max(0.0); }
+        if let Some(v) = req.default_output_per_mtok { cfg.default_output_per_mtok = v.max(0.0); }
+        save_config(&store);
     }
     let cfg = app.store.lock().unwrap().config.clone();
     Ok(json_ok(config_json(&cfg)))
@@ -2396,8 +2747,12 @@ async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> A
     if store.skills.iter().any(|s| s.id == id) {
         return Err(err(StatusCode::CONFLICT, format!("Skill '{id}' already exists")));
     }
-    let skill = Skill { id, name: req.name, description: req.description, enabled: true };
+    let skill = Skill {
+        id, name: req.name, description: req.description, enabled: true,
+        version: 1, test_inputs: Vec::new(), test_runs: Vec::new(), history: Vec::new(),
+    };
     store.skills.push(skill.clone());
+    save_skills(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(skill).unwrap()))
 }
@@ -2406,9 +2761,126 @@ async fn update_skill(State(app): State<App>, Path(skill_id): Path<String>, Json
     let mut store = app.store.lock().unwrap();
     let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
-    skill.enabled = req.enabled;
+    let old = (skill.name.clone(), skill.description.clone(), skill.enabled);
+    if let Some(name) = req.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "name cannot be empty")); }
+        skill.name = name.to_string();
+    }
+    if let Some(desc) = req.description.as_deref() {
+        skill.description = desc.to_string();
+    }
+    if let Some(enabled) = req.enabled {
+        skill.enabled = enabled;
+    }
+    if old != (skill.name.clone(), skill.description.clone(), skill.enabled) {
+        // Keep the previous version so the history is auditable.
+        skill.history.insert(0, SkillSnapshot {
+            version: skill.version,
+            name: old.0,
+            description: old.1,
+            enabled: old.2,
+            at: now_secs(),
+        });
+        skill.history.truncate(20);
+        skill.version += 1;
+    }
     let out = skill.clone();
+    save_skills(&store);
     drop(store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+/// Restore a previous snapshot; the current state is snapshotted first so the
+/// restore itself is undoable.
+async fn restore_skill(State(app): State<App>, Path((skill_id, version)): Path<(String, u32)>) -> ApiResult {
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    let snap = skill.history.iter().find(|h| h.version == version).cloned()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Version {version} not found for skill '{skill_id}'")))?;
+    skill.history.insert(0, SkillSnapshot {
+        version: skill.version,
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        enabled: skill.enabled,
+        at: now_secs(),
+    });
+    skill.history.truncate(20);
+    skill.version += 1;
+    skill.name = snap.name;
+    skill.description = snap.description;
+    skill.enabled = snap.enabled;
+    let out = skill.clone();
+    save_skills(&store);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+/// Save the Skill Studio test bench inputs (trimmed, non-empty, max 20).
+async fn set_skill_tests(State(app): State<App>, Path(skill_id): Path<String>, Json(req): Json<SkillTestsInput>) -> ApiResult {
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    skill.test_inputs = req.inputs.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(20)
+        .collect();
+    let out = skill.clone();
+    save_skills(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+/// Run the skill against its saved inputs (or a provided set) and keep the
+/// newest 20 results. These are real provider calls, priced per token.
+async fn run_skill_tests(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path(skill_id): Path<String>, Json(req): Json<SkillRunRequest>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let (skill, model) = {
+        let store = app.store.lock().unwrap();
+        let skill = store.skills.iter().find(|s| s.id == skill_id).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+        let model = req.model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| app.provider_default_model());
+        (skill, model)
+    };
+    if model.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "No model configured — set one in AI Config"));
+    }
+    let inputs: Vec<String> = req.inputs.unwrap_or_else(|| skill.test_inputs.clone())
+        .into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(10).collect();
+    if inputs.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Save at least one test input first"));
+    }
+    let system = format!(
+        "You are the reusable skill '{}'. {}\n\nApply this skill to the user's input. Reply with the result only — no preamble.",
+        skill.name, skill.description
+    );
+    let (ip, op, _) = model_price(&app, &model);
+    let mut new_runs = Vec::new();
+    for input in inputs {
+        let (output, cost) = match app.llm_max_usage(&model, &system, &input, 800).await {
+            Ok((text, usage)) => (text, usage_cost(usage, ip, op)),
+            Err(e) => (format!("⚠️ {}", e.1), 0.0),
+        };
+        new_runs.push(SkillTestRun {
+            id: format!("st-{}", app.seq.fetch_add(1, Ordering::SeqCst)),
+            input,
+            output,
+            model: model.clone(),
+            at: now_secs(),
+            cost_usd: cost,
+        });
+    }
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    new_runs.extend(skill.test_runs.clone());
+    skill.test_runs = new_runs.into_iter().take(20).collect();
+    let out = skill.clone();
+    save_skills(&store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
@@ -2419,6 +2891,7 @@ async fn delete_skill(State(app): State<App>, Path(skill_id): Path<String>) -> A
     if store.skills.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")));
     }
+    save_skills(&store);
     Ok(json_ok(json!({ "deleted": skill_id })))
 }
 
@@ -2443,6 +2916,9 @@ async fn create_project(State(app): State<App>, headers: axum::http::HeaderMap, 
         agents: Vec::new(),
         links: Vec::new(),
         positions: HashMap::new(),
+        goal: req.goal,
+        budget_usd: req.budget_usd.filter(|b| *b > 0.0),
+        budget_alert_pct: 80,
     };
     store.projects.push(project.clone());
     save_projects(&store);
@@ -2478,6 +2954,9 @@ async fn update_project(State(app): State<App>, headers: axum::http::HeaderMap, 
     if let Some(v) = req.agents { p.agents = v; }
     if let Some(v) = req.links { p.links = v; }
     if let Some(v) = req.positions { p.positions = v; }
+    if let Some(v) = req.goal { p.goal = v; }
+    if let Some(v) = req.budget_usd { p.budget_usd = v.filter(|b| *b > 0.0); }
+    if let Some(v) = req.budget_alert_pct { p.budget_alert_pct = v.clamp(1, 100); }
     let out = p.clone();
     save_projects(&store);
     drop(store);
@@ -2520,14 +2999,23 @@ fn project_docs_sorted(store: &Store, project_id: &str) -> Vec<ProjectDoc> {
 
 async fn list_docs(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let docs = {
+    let (docs, open_counts) = {
         let store = app.store.lock().unwrap();
         if !store.projects.iter().any(|p| p.id == id) {
             return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
         }
-        project_docs_sorted(&store, &id)
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for c in store.doc_comments.iter().filter(|c| c.project_id == id && c.status == "open") {
+            *counts.entry(c.doc_id.clone()).or_default() += 1;
+        }
+        (project_docs_sorted(&store, &id), counts)
     };
-    Ok(json_ok(serde_json::to_value(&docs).unwrap()))
+    let out: Vec<Value> = docs.iter().map(|d| {
+        let mut v = serde_json::to_value(d).unwrap_or_else(|_| json!({}));
+        v["open_comments"] = json!(open_counts.get(&d.id).copied().unwrap_or(0));
+        v
+    }).collect();
+    Ok(json_ok(json!(out)))
 }
 
 async fn create_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<DocCreate>) -> ApiResult {
@@ -2629,11 +3117,94 @@ async fn delete_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path
     if store.docs.len() == before {
         return Err(err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")));
     }
+    store.doc_comments.retain(|c| !(c.doc_id == doc_id && c.project_id == id));
     let _ = std::fs::remove_dir_all(docs_files_dir().join(&doc_id));
     save_docs(&store);
     materialize_project_docs(&store, &id);
     drop(store);
     Ok(json_ok(json!({ "deleted": doc_id })))
+}
+
+/// Inline comments anchored to a document passage. Open comments are injected
+/// into every relay prompt so the team actually addresses them.
+async fn list_doc_comments(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id)): Path<(String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    let comments: Vec<DocComment> = store.doc_comments.iter()
+        .filter(|c| c.project_id == project_id && c.doc_id == doc_id)
+        .cloned().collect();
+    Ok(json_ok(json!(comments)))
+}
+
+async fn create_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id)): Path<(String, String)>,
+    Json(req): Json<DocCommentCreate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let body = req.body.trim().to_string();
+    if body.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "comment body is required"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.docs.iter().any(|d| d.id == doc_id && d.project_id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")));
+    }
+    store.comment_counter += 1;
+    let comment = DocComment {
+        id: format!("c-{:03}", store.comment_counter),
+        project_id,
+        doc_id,
+        author: if req.author.trim().is_empty() { "you".into() } else { req.author.trim().to_string() },
+        quote: req.quote.trim().chars().take(400).collect(),
+        body: body.chars().take(4000).collect(),
+        status: "open".into(),
+        created_at: now_secs(),
+        resolved_at: 0,
+    };
+    let out = comment.clone();
+    store.doc_comments.push(comment);
+    save_docs(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn update_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id, comment_id)): Path<(String, String, String)>,
+    Json(req): Json<DocCommentUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let status = req.status.trim().to_lowercase();
+    if status != "open" && status != "resolved" {
+        return Err(err(StatusCode::BAD_REQUEST, "status must be 'open' or 'resolved'"));
+    }
+    let mut store = app.store.lock().unwrap();
+    let comment = store.doc_comments.iter_mut()
+        .find(|c| c.id == comment_id && c.doc_id == doc_id && c.project_id == project_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Comment '{comment_id}' not found")))?;
+    comment.status = status.clone();
+    comment.resolved_at = if status == "resolved" { now_secs() } else { 0 };
+    let out = comment.clone();
+    save_docs(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn delete_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id, comment_id)): Path<(String, String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let before = store.doc_comments.len();
+    store.doc_comments.retain(|c| !(c.id == comment_id && c.doc_id == doc_id && c.project_id == project_id));
+    if store.doc_comments.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Comment '{comment_id}' not found")));
+    }
+    save_docs(&store);
+    Ok(json_ok(json!({ "deleted": comment_id })))
 }
 
 /// Multipart upload — `folder` (optional text field) + one `file` field.
@@ -2900,8 +3471,13 @@ fn save_docs(store: &Store) {
     struct Persisted<'a> {
         docs: &'a [ProjectDoc],
         doc_counter: usize,
+        comments: &'a [DocComment],
+        comment_counter: usize,
     }
-    let payload = match serde_json::to_string_pretty(&Persisted { docs: &store.docs, doc_counter: store.doc_counter }) {
+    let payload = match serde_json::to_string_pretty(&Persisted {
+        docs: &store.docs, doc_counter: store.doc_counter,
+        comments: &store.doc_comments, comment_counter: store.comment_counter,
+    }) {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -2921,6 +3497,10 @@ fn load_docs(store: &mut Store) {
         docs: Vec<ProjectDoc>,
         #[serde(default)]
         doc_counter: usize,
+        #[serde(default)]
+        comments: Vec<DocComment>,
+        #[serde(default)]
+        comment_counter: usize,
     }
     let Ok(raw) = std::fs::read_to_string(docs_file()) else { return };
     let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
@@ -2931,8 +3511,13 @@ fn load_docs(store: &mut Store) {
         .filter_map(|d| d.id.strip_prefix("d-").and_then(|n| n.parse::<usize>().ok()))
         .max().unwrap_or(0);
     store.doc_counter = store.doc_counter.max(parsed.doc_counter).max(max_id);
-    println!("restored {} document(s) from {}", parsed.docs.len(), docs_file().display());
+    let max_cid = parsed.comments.iter()
+        .filter_map(|c| c.id.strip_prefix("dc-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.comment_counter = store.comment_counter.max(parsed.comment_counter).max(max_cid);
+    println!("restored {} document(s) and {} comment(s) from {}", parsed.docs.len(), parsed.comments.len(), docs_file().display());
     store.docs = parsed.docs;
+    store.doc_comments = parsed.comments;
 }
 
 // ---------------------------------------------------------------------------
@@ -3027,6 +3612,297 @@ fn load_agents(store: &mut Store) {
         println!("restored {} agent(s) from {}", parsed.agents.len(), agents_file().display());
     }
     store.agents = parsed.agents;
+}
+
+/// Generic atomic JSON write for the smaller registries (tmp + rename).
+/// `private` = 0600 (config.json holds provider keys / the Git token).
+fn write_json_atomic<T: Serialize>(name: &str, value: &T, private: bool) -> bool {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return false; }
+    let payload = match serde_json::to_string_pretty(value) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    if std::fs::write(&tmp, payload).is_err() { return false; }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    let ok = std::fs::rename(&tmp, &path).is_ok();
+    if !ok {
+        eprintln!("warning: could not persist {}", path.display());
+    }
+    ok
+}
+
+// ---------------------------------------------------------------------------
+// Personas / skills / tasks / config / routines persistence. These used to be
+// in-memory only; the org features (budgets, org chart, skill bench) make them
+// durable. Same tmp+rename contract as runs.json.
+// ---------------------------------------------------------------------------
+
+fn save_personas(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { personas: &'a [Persona] }
+    write_json_atomic("personas.json", &Persisted { personas: &store.personas }, false);
+}
+
+fn load_personas(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] personas: Vec<Persona> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("personas.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: personas.json is unreadable — keeping seeded personas");
+        return;
+    };
+    if parsed.personas.is_empty() { return; }
+    println!("restored {} persona(s)", parsed.personas.len());
+    store.personas = parsed.personas;
+}
+
+fn save_config(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { config: &'a AiConfig }
+    write_json_atomic("config.json", &Persisted { config: &store.config }, true);
+}
+
+fn load_config(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] config: Option<AiConfig> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("config.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: config.json is unreadable — keeping defaults");
+        return;
+    };
+    if let Some(cfg) = parsed.config {
+        println!("restored provider config from config.json");
+        store.config = cfg;
+    }
+}
+
+fn save_skills(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { skills: &'a [Skill] }
+    write_json_atomic("skills.json", &Persisted { skills: &store.skills }, false);
+}
+
+fn load_skills(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] skills: Vec<Skill> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("skills.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: skills.json is unreadable — keeping seeded skills");
+        return;
+    };
+    println!("restored {} skill(s)", parsed.skills.len());
+    store.skills = parsed.skills;
+}
+
+fn save_tasks(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { tasks: &'a [Task], task_counter: usize }
+    write_json_atomic("tasks.json", &Persisted { tasks: &store.tasks, task_counter: store.task_counter }, false);
+}
+
+fn load_tasks(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] tasks: Vec<Task>, #[serde(default)] task_counter: usize }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("tasks.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: tasks.json is unreadable — starting with an empty board");
+        return;
+    };
+    let max_id = parsed.tasks.iter()
+        .filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.task_counter = store.task_counter.max(parsed.task_counter).max(max_id);
+    println!("restored {} task(s)", parsed.tasks.len());
+    store.tasks = parsed.tasks;
+}
+
+fn save_routines(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { routines: &'a [Routine], routine_counter: usize }
+    write_json_atomic("routines.json", &Persisted { routines: &store.routines, routine_counter: store.routine_counter }, false);
+}
+
+fn load_routines(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] routines: Vec<Routine>, #[serde(default)] routine_counter: usize }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("routines.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: routines.json is unreadable — starting with no routines");
+        return;
+    };
+    let max_id = parsed.routines.iter()
+        .filter_map(|r| r.id.strip_prefix("rt-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.routine_counter = store.routine_counter.max(parsed.routine_counter).max(max_id);
+    println!("restored {} routine(s)", parsed.routines.len());
+    store.routines = parsed.routines;
+}
+
+// ---------------------------------------------------------------------------
+// Cron — 5-field local-time schedules for routines
+// ---------------------------------------------------------------------------
+
+struct CronSpec {
+    minutes: Vec<u32>,
+    hours: Vec<u32>,
+    doms: Vec<u32>,
+    months: Vec<u32>,
+    dows: Vec<u32>,
+}
+
+/// One field: `*`, `n`, `a-b`, lists `1,15`, steps `*/5` / `1-30/2`.
+fn parse_cron_field(spec: &str, min: u32, max: u32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let (range, step) = match part.split_once('/') {
+            Some((r, s)) => (r, s.parse::<u32>().ok()?),
+            None => (part, 1),
+        };
+        if step == 0 { return None; }
+        let (lo, hi) = if range == "*" {
+            (min, max)
+        } else if let Some((a, b)) = range.split_once('-') {
+            (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)
+        } else {
+            let v = range.parse::<u32>().ok()?;
+            (v, v)
+        };
+        if lo < min || hi > max || lo > hi { return None; }
+        let mut v = lo;
+        while v <= hi { out.push(v); v += step; }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+fn cron_parse(expr: &str) -> Option<CronSpec> {
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 5 { return None; }
+    let mut dows = parse_cron_field(f[4], 0, 7)?;
+    dows = dows.into_iter().map(|d| if d == 7 { 0 } else { d }).collect();
+    dows.sort_unstable();
+    dows.dedup();
+    Some(CronSpec {
+        minutes: parse_cron_field(f[0], 0, 59)?,
+        hours: parse_cron_field(f[1], 0, 23)?,
+        doms: parse_cron_field(f[2], 1, 31)?,
+        months: parse_cron_field(f[3], 1, 12)?,
+        dows,
+    })
+}
+
+fn cron_matches_day(spec: &CronSpec, t: &chrono::DateTime<Local>) -> bool {
+    let dom_any = spec.doms.len() == 31;
+    let dow_any = spec.dows.len() == 7;
+    let dom_ok = spec.doms.contains(&t.day());
+    let dow_ok = spec.dows.contains(&t.weekday().num_days_from_sunday());
+    if dom_any && dow_any { true }
+    else if dom_any { dow_ok }
+    else if dow_any { dom_ok }
+    else { dom_ok || dow_ok } // classic cron: both restricted → OR
+}
+
+/// First occurrence strictly after `after_secs` (local time). Scans at most
+/// two years ahead so a nonsense-but-valid cron cannot loop forever.
+fn next_run_at(expr: &str, after_secs: u64) -> Option<u64> {
+    let spec = cron_parse(expr)?;
+    let mut t = Local.timestamp_opt(after_secs as i64, 0).single()?
+        .with_second(0)?.with_nanosecond(0)?;
+    t += chrono::Duration::minutes(1);
+    for _ in 0..(366 * 2 * 24 * 60u32) {
+        if spec.months.contains(&t.month())
+            && spec.hours.contains(&t.hour())
+            && spec.minutes.contains(&t.minute())
+            && cron_matches_day(&spec, &t)
+        {
+            return Some(t.timestamp() as u64);
+        }
+        t += chrono::Duration::minutes(1);
+    }
+    None
+}
+
+/// Fire one routine now: skip when its project already has a live run, else
+/// spawn the run and record the outcome on the routine.
+fn fire_routine(app: &App, routine: &Routine) -> Result<Run, ApiError> {
+    let busy = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().any(|r| r.project_id == routine.project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+    };
+    let now = now_secs();
+    if busy {
+        let mut store = app.store.lock().unwrap();
+        if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
+            r.last_run_at = now;
+            r.last_result = "skipped: project busy".into();
+        }
+        save_routines(&store);
+        return Err(err(StatusCode::CONFLICT, "project already has a running mission"));
+    }
+    let result = spawn_run_with(app, &routine.project_id, &routine.task, routine.loop_mode, 1, "scheduled", Some(&routine.id));
+    let mut store = app.store.lock().unwrap();
+    if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
+        r.last_run_at = now;
+        match &result {
+            Ok(run) => {
+                r.last_run_id = Some(run.id.clone());
+                r.last_result = "started".into();
+            }
+            Err(e) => r.last_result = format!("error: {}", e.1),
+        }
+    }
+    save_routines(&store);
+    result
+}
+
+/// Background scheduler: ticks every 30 s, fires enabled routines whose next
+/// occurrence has passed. Restart-safe — occurrences missed while the process
+/// was down are recorded but not replayed.
+async fn routine_scheduler(app: App) {
+    let mut boot = true;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let now = now_secs();
+        let due = {
+            let mut store = app.store.lock().unwrap();
+            let routines = store.routines.clone();
+            let mut due = Vec::new();
+            let mut changed = false;
+            for r in routines {
+                if !r.enabled { continue; }
+                let base = if r.last_run_at > 0 { r.last_run_at } else { r.created_at.max(1) };
+                let Some(next) = next_run_at(&r.cron, base) else { continue };
+                if next > now { continue; }
+                if boot {
+                    if let Some(x) = store.routines.iter_mut().find(|x| x.id == r.id) {
+                        x.last_run_at = now;
+                        x.last_result = "missed while orchestrator was down".into();
+                    }
+                    changed = true;
+                } else {
+                    due.push(r);
+                }
+            }
+            if changed { save_routines(&store); }
+            due
+        };
+        boot = false;
+        for r in due {
+            if let Err(e) = fire_routine(&app, &r) {
+                eprintln!("routine {} did not start: {}", r.id, e.1);
+            }
+        }
+    }
 }
 
 /// Directory name for a cloned repo URL: last path segment, ".git" stripped,
@@ -3257,6 +4133,288 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
 /// True once POST /runs/{id}/stop flagged this run.
 fn stop_requested(app: &App, run_id: &str) -> bool {
     app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).map(|r| r.stop_requested).unwrap_or(false)
+}
+
+/// USD per million tokens for a model: the editable table first, then the
+/// configured default. `false` = no price known, so the step's cost is not a
+/// real estimate (UI marks it).
+fn model_price(app: &App, model: &str) -> (f64, f64, bool) {
+    let cfg = app.store.lock().unwrap().config.clone();
+    if let Some(p) = cfg.pricing.get(model) {
+        return (p.input_per_mtok, p.output_per_mtok, true);
+    }
+    if cfg.default_input_per_mtok > 0.0 || cfg.default_output_per_mtok > 0.0 {
+        return (cfg.default_input_per_mtok, cfg.default_output_per_mtok, false);
+    }
+    (0.0, 0.0, false)
+}
+
+fn usage_cost(usage: LlmUsage, input_per_mtok: f64, output_per_mtok: f64) -> f64 {
+    usage.input_tokens as f64 * input_per_mtok / 1_000_000.0
+        + usage.output_tokens as f64 * output_per_mtok / 1_000_000.0
+}
+
+/// Add one provider call's usage to the run ledger (and to the step when it
+/// belongs to one) and persist. Raises the soft alert once, without stopping.
+fn record_usage(app: &App, run_id: &str, role: &str, kind: &str, model: &str, usage: LlmUsage) {
+    let (ip, op, priced) = model_price(app, model);
+    let cost = usage_cost(usage, ip, op);
+    let mut store = app.store.lock().unwrap();
+    let alert_pct = store.runs.iter().find(|r| r.id == run_id)
+        .and_then(|r| store.projects.iter().find(|p| p.id == r.project_id))
+        .map(|p| p.budget_alert_pct.clamp(1, 100) as f64 / 100.0)
+        .unwrap_or(0.8);
+    let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) else { return };
+    run.input_tokens += usage.input_tokens;
+    run.output_tokens += usage.output_tokens;
+    run.cost_usd += cost;
+    if !kind.is_empty() {
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind) {
+            step.input_tokens += usage.input_tokens;
+            step.output_tokens += usage.output_tokens;
+            step.cost_usd += cost;
+            if !priced { step.priced = false; }
+        }
+    }
+    if !run.cost_alerted {
+        if let Some(budget) = run.budget_usd.filter(|b| *b > 0.0) {
+            if run.cost_usd >= budget * alert_pct {
+                run.cost_alerted = true;
+            }
+        }
+    }
+    save_runs(&store);
+}
+
+/// Open the budget pause discussion (once per run) and return its id.
+fn raise_budget_discussion(app: &App, run_id: &str, cost: f64, budget: f64) -> String {
+    let mut store = app.store.lock().unwrap();
+    let disc_id = format!("d-{:03}", store.runs.iter().find(|r| r.id == run_id).map(|r| r.discussions.len() + 1).unwrap_or(1));
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = "waiting_human".into();
+        run.phase = "budget".into();
+        run.discussions.push(Discussion {
+            id: disc_id.clone(),
+            kind: "budget".into(),
+            from: "orchestrator".into(),
+            to: vec!["human".into()],
+            topic: format!("งบประมาณของ mission นี้ถูกใช้ครบแล้ว — ใช้ไป ${cost:.4} จาก ${budget:.2}. เพิ่มงบเพื่อให้ทีมทำงานต่อ หรือกด Stop เพื่อหยุด mission"),
+            status: "need_human".into(),
+            answering: Some("human".into()),
+            messages: vec![MeetingMessage {
+                from: "orchestrator".into(),
+                text: format!("💸 spend ${cost:.4} reached the ${budget:.2} budget — waiting for you to raise it (reply in chat alone does NOT raise it; use the Raise budget action)."),
+                at: now_secs(),
+            }],
+            round: 0,
+            created_at: now_secs(),
+        });
+    }
+    save_runs(&store);
+    disc_id
+}
+
+/// Cost guardrail checked before every provider/harness call in a run.
+/// `true` = keep going, `false` = the run must wind down (user stopped it or
+/// the budget pause timed out).
+async fn guard_budget(app: &App, run_id: &str) -> bool {
+    loop {
+        let (cost, budget, existing) = {
+            let store = app.store.lock().unwrap();
+            match store.runs.iter().find(|r| r.id == run_id) {
+                Some(run) => (
+                    run.cost_usd,
+                    run.budget_usd,
+                    run.discussions.iter().rev()
+                        .find(|d| d.kind == "budget" && d.status != "resolved")
+                        .map(|d| d.id.clone()),
+                ),
+                None => return false,
+            }
+        };
+        let budget = match budget.filter(|b| *b > 0.0) {
+            Some(b) => b,
+            None => return true,
+        };
+        if cost < budget { return true; }
+        let disc_id = existing.unwrap_or_else(|| raise_budget_discussion(app, run_id, cost, budget));
+        escalate_to_human(app, run_id, &disc_id, "increase the run budget to continue spending");
+        match wait_for_human(app, run_id, &disc_id).await {
+            HumanOutcome::Answered => {
+                // A chat reply alone does not raise the budget — only
+                // POST /runs/{id}/budget does. Re-check and re-pause if needed.
+                let (cost_now, budget_now) = {
+                    let store = app.store.lock().unwrap();
+                    store.runs.iter().find(|r| r.id == run_id)
+                        .map(|r| (r.cost_usd, r.budget_usd))
+                        .unwrap_or((cost, Some(budget)))
+                };
+                if budget_now.unwrap_or(0.0) > cost_now {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                            d.status = "resolved".into();
+                            d.answering = None;
+                        }
+                    }
+                    save_runs(&store);
+                    return true;
+                }
+            }
+            HumanOutcome::Stopped | HumanOutcome::TimedOut => {
+                // Unlike a normal meeting, continuing past this point keeps
+                // spending money — stop the run instead.
+                finish_run(app, run_id, "stopped");
+                return false;
+            }
+        }
+    }
+}
+
+/// One LLM call inside a run: budget guard, retry, usage ledger. `kind` "" =
+/// call not attached to a step (meeting answers, PR text, PO summary).
+/// `Ok(None)` = the guard stopped the run — the caller must wind down.
+async fn llm_step(app: &App, run_id: &str, role: &str, kind: &str, model: &str, system: &str, user: &str, max: u32) -> Result<Option<String>, ApiError> {
+    if !guard_budget(app, run_id).await {
+        return Ok(None);
+    }
+    let (text, usage) = llm_retry_usage(app, model, system, user, max).await?;
+    record_usage(app, run_id, role, kind, model, usage);
+    Ok(Some(text))
+}
+
+// ---------------------------------------------------------------------------
+// BYO CLI harnesses — a persona may "think" through an installed CLI agent
+// ---------------------------------------------------------------------------
+
+/// External harness calls are allowed this long before they are killed.
+const HARNESS_TIMEOUT_SECS: u64 = 30 * 60;
+
+fn persona_harness(app: &App, role: &str) -> (String, String) {
+    let store = app.store.lock().unwrap();
+    store.personas.iter().find(|p| p.role == role)
+        .map(|p| (p.harness.clone(), p.harness_command.clone()))
+        .unwrap_or_else(|| ("native".into(), String::new()))
+}
+
+/// Command template for a persona: its own override wins; otherwise the
+/// preset for `claude` / `codex`; native has none.
+fn harness_template(harness: &str, custom: &str) -> Option<String> {
+    if !custom.trim().is_empty() { return Some(custom.trim().to_string()); }
+    match harness {
+        "claude" => Some("claude -p \"$(cat {prompt_file})\"".into()),
+        "codex" => Some("codex exec \"$(cat {prompt_file})\"".into()),
+        _ => None,
+    }
+}
+
+fn harness_binary(template: &str) -> String {
+    template.split_whitespace().next().unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'').to_string()
+}
+
+fn valid_binary_name(bin: &str) -> bool {
+    !bin.is_empty() && bin.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+fn binary_installed(bin: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {} >/dev/null 2>&1", bin))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn list_harnesses(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
+    let claude_cmd = harness_template("claude", "").unwrap_or_default();
+    let codex_cmd = harness_template("codex", "").unwrap_or_default();
+    let claude_bin = harness_binary(&claude_cmd);
+    let codex_bin = harness_binary(&codex_cmd);
+    Ok(json_ok(json!([
+        { "id": "native", "label": "Built-in provider loop", "command": "", "binary": "", "installed": true },
+        { "id": "claude", "label": "Claude Code CLI", "command": claude_cmd, "binary": claude_bin, "installed": binary_installed(&claude_bin) },
+        { "id": "codex", "label": "Codex CLI", "command": codex_cmd, "binary": codex_bin, "installed": binary_installed(&codex_bin) },
+        { "id": "custom", "label": "Custom command", "command": "", "binary": "", "installed": true },
+    ])))
+}
+
+fn mark_harness_step(app: &App, run_id: &str, role: &str, harness: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+        .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work"))
+    {
+        step.harness = Some(harness.into());
+        step.metered = false;
+        step.priced = false;
+    }
+    save_runs(&store);
+}
+
+/// Run one step through an external CLI harness. The prompt is written 0600 to
+/// the data dir; the harness runs on the host through the agent's session with
+/// a 30-minute cap. Output is unmetered (cost unknown), so it is recorded only
+/// as the step's harness/metered flags — never as token spend.
+async fn harness_step(
+    app: &App, run_id: &str, role: &str, harness: &str, custom: &str,
+    model: &str, system: &str, user: &str,
+) -> Result<Option<String>, ApiError> {
+    if !guard_budget(app, run_id).await { return Ok(None); }
+    let template = harness_template(harness, custom).ok_or_else(|| err(
+        StatusCode::BAD_REQUEST,
+        format!("persona harness '{harness}' has no command — set a command template or switch it to native"),
+    ))?;
+    let binary = harness_binary(&template);
+    if !valid_binary_name(&binary) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("invalid harness command '{template}'")));
+    }
+    let (cid, _) = app.agent_container(role).await.ok_or_else(|| err(
+        StatusCode::CONFLICT,
+        format!("no running session for {role} — start the agent first so its CLI harness can run"),
+    ))?;
+    let (code, _) = app.exec_in(&cid, &format!("command -v {binary} >/dev/null 2>&1")).await
+        .unwrap_or((-1, String::new()));
+    if code != 0 {
+        return Err(err(StatusCode::FAILED_DEPENDENCY, format!(
+            "harness '{harness}' is not installed on this machine (missing `{binary}`) — install it or switch this persona to native"
+        )));
+    }
+    let tmp = data_dir().join("tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    let n = app.seq.fetch_add(1, Ordering::SeqCst);
+    let prompt_file = tmp.join(format!("harness-{n}.md"));
+    std::fs::write(&prompt_file, format!("{system}\n\n{user}\n")).map_err(|e| err(
+        StatusCode::INTERNAL_SERVER_ERROR, format!("could not write harness prompt: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600));
+    }
+    let cmd = template
+        .replace("{prompt_file}", &prompt_file.to_string_lossy())
+        .replace("{model}", model)
+        .replace("{role}", role);
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(HARNESS_TIMEOUT_SECS),
+        hostexec::run(&cid, &cmd, &[]),
+    ).await;
+    let _ = std::fs::remove_file(&prompt_file);
+    match run {
+        Ok(Ok((0, out))) => {
+            let out = out.trim().to_string();
+            if out.is_empty() {
+                Err(err(StatusCode::BAD_GATEWAY, format!("harness '{harness}' returned an empty answer")))
+            } else {
+                Ok(Some(out))
+            }
+        }
+        Ok(Ok((code, out))) => Err(err(StatusCode::BAD_GATEWAY, format!(
+            "harness '{harness}' exited {code}: {}", one_line(&out, 400)))),
+        Ok(Err(e)) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("harness failed: {e}"))),
+        Err(_) => Err(err(StatusCode::GATEWAY_TIMEOUT, format!(
+            "harness '{harness}' timed out after {} min", HARNESS_TIMEOUT_SECS / 60))),
+    }
 }
 
 /// Close a run: mark remaining pending steps "skipped", set the final status/phase, persist.
@@ -3579,7 +4737,8 @@ async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &st
             role: role.into(), name: name_of(role), title: title.into(), kind: kind.into(),
             status: "pending".into(), output: String::new(),
             model: None, container: None, deliverable: None, rev: None,
-            started_at: 0, finished_at: 0,
+            started_at: 0, finished_at: 0, harness: None,
+            input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
         };
         run.steps.push(mk(dev_role, "pr", "Open Pull Request"));
         run.steps.push(mk(po_role, "demo", "Acceptance Demo"));
@@ -3646,6 +4805,176 @@ fn parse_pr_text(reply: &str, task: &str, run_id: &str) -> (String, String) {
 /// Real PR: mission branch in the dev's container, deliverables copied into
 /// missions/<run_id>/, commit, push, `gh pr create`. Missing preconditions →
 /// skipped with the honest reason; failed actions → error with the real output.
+/// Max characters of `git diff` persisted for the review card.
+const REVIEW_DIFF_MAX: usize = 16_000;
+/// One human review, then (on reject) one Dev revision, then a second review.
+const MAX_REVIEW_ROUNDS: u32 = 2;
+
+enum ReviewOutcome {
+    /// approved (or nothing to review) — the PR stage may run
+    Proceed,
+    /// not approved — skip the PR with this honest reason
+    Skip(String),
+    /// user pressed Stop during a review pause
+    Stopped,
+}
+
+/// Stage the shared working tree and capture the exact diff the PR would push.
+/// None = no session / no repo / no changes — the gate is skipped and the PR
+/// stage reports the same honest reason.
+async fn collect_repo_diff(app: &App, cid: &str, repo_path: &str) -> Option<(Vec<String>, String)> {
+    let script = format!(
+        "cd '{repo_path}' || exit 10; \
+         git add -A >/dev/null 2>&1 || true; \
+         git status --porcelain --untracked-files=all; \
+         echo '---STAT---'; \
+         git diff --cached --stat; \
+         echo '---PATCH---'; \
+         git diff --cached --no-color"
+    );
+    let (code, out) = app.exec_in(cid, &script).await.ok()?;
+    if code != 0 { return None; }
+    let (files_part, rest) = out.split_once("---STAT---").unwrap_or((out.as_str(), ""));
+    let files: Vec<String> = files_part.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    if files.is_empty() { return None; }
+    let diff: String = rest.chars().take(REVIEW_DIFF_MAX).collect();
+    Some((files, diff))
+}
+
+fn review_state(app: &App, run_id: &str) -> (String, String) {
+    let store = app.store.lock().unwrap();
+    store.runs.iter().find(|r| r.id == run_id)
+        .and_then(|r| r.review.as_ref())
+        .map(|r| (r.status.clone(), r.comment.clone()))
+        .unwrap_or((String::new(), String::new()))
+}
+
+fn set_review_status(app: &App, run_id: &str, status: &str, comment: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if let Some(review) = run.review.as_mut() {
+            review.status = status.into();
+            if !comment.is_empty() { review.comment = comment.into(); }
+            review.decided_at = now_secs();
+        }
+    }
+    save_runs(&store);
+}
+
+/// Persist the pending review and open the need-human discussion for it.
+fn open_review(app: &App, run_id: &str, files: &[String], diff: &str) -> String {
+    let mut store = app.store.lock().unwrap();
+    let disc_id = format!("d-{:03}", store.runs.iter().find(|r| r.id == run_id).map(|r| r.discussions.len() + 1).unwrap_or(1));
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        run.review = Some(RunReview {
+            status: "pending".into(),
+            diff: diff.to_string(),
+            files: files.to_vec(),
+            comment: String::new(),
+            requested_at: now_secs(),
+            decided_at: 0,
+        });
+        run.status = "waiting_human".into();
+        run.phase = "review".into();
+        let listing = files.iter().take(25).cloned().collect::<Vec<_>>().join("\n");
+        run.discussions.push(Discussion {
+            id: disc_id.clone(),
+            kind: "review".into(),
+            from: "orchestrator".into(),
+            to: vec!["human".into()],
+            topic: format!("ตรวจ diff ก่อน push/PR — {} ไฟล์ที่เปลี่ยน", files.len()),
+            status: "need_human".into(),
+            answering: Some("human".into()),
+            messages: vec![MeetingMessage {
+                from: "orchestrator".into(),
+                text: format!("🔍 the team is ready to push. Review the diff in Mission Control, then Approve or Reject with a comment.\n\n```\n{listing}\n```"),
+                at: now_secs(),
+            }],
+            round: 0,
+            created_at: now_secs(),
+        });
+    }
+    save_runs(&store);
+    disc_id
+}
+
+/// Wait for the human's decision on the pending review.
+async fn wait_review(app: &App, run_id: &str, disc_id: &str) -> String {
+    match wait_for_human(app, run_id, disc_id).await {
+        HumanOutcome::Answered => review_state(app, run_id).0,
+        HumanOutcome::TimedOut => {
+            set_review_status(app, run_id, "timed_out", "");
+            "timed_out".into()
+        }
+        HumanOutcome::Stopped => "stopped".into(),
+    }
+}
+
+/// Pre-push review gate. Approve → Proceed; first reject → Dev revises once
+/// and a second review opens; second reject/timeout/Stop → Skip.
+async fn review_gate(
+    app: &App, run_id: &str, dev_role: &str, repo_url: &str, repo_path: &str,
+    task: &str, project_name: &str,
+) -> ReviewOutcome {
+    let (cid, _) = match app.agent_container(dev_role).await {
+        Some(x) => x,
+        None => return ReviewOutcome::Proceed, // PR stage reports the missing session
+    };
+    if repo_url.trim().is_empty() { return ReviewOutcome::Proceed; }
+    let (mut files, mut diff) = match collect_repo_diff(app, &cid, repo_path).await {
+        Some(x) => x,
+        None => return ReviewOutcome::Proceed,
+    };
+    step_transition(app, run_id, dev_role, "pr", "working", "waiting for diff review").await;
+    let dev = persona_of(app, dev_role);
+
+    for round in 0..MAX_REVIEW_ROUNDS {
+        let disc_id = open_review(app, run_id, &files, &diff);
+        let status = wait_review(app, run_id, &disc_id).await;
+        // The review discussion is closed either way; the outcome is in Run.review.
+        {
+            let mut store = app.store.lock().unwrap();
+            if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                    d.status = "resolved".into();
+                    d.answering = None;
+                }
+            }
+            save_runs(&store);
+        }
+        match status.as_str() {
+            "approved" => return ReviewOutcome::Proceed,
+            "stopped" => return ReviewOutcome::Stopped,
+            "timed_out" => return ReviewOutcome::Skip("diff review timed out — nothing was pushed".into()),
+            "rejected" if round + 1 >= MAX_REVIEW_ROUNDS => {
+                return ReviewOutcome::Skip("rejected by the reviewer a second time — nothing was pushed".into());
+            }
+            "rejected" => {
+                let comment = review_state(app, run_id).1;
+                let goal_line = goal_ancestry_line(app, run_id, dev_role);
+                let system = work_system(&dev.2, &dev.0, &dev.1, true, project_name,
+                    &team_repo_line(&Some(repo_path.to_string())), "", &goal_line, run_id);
+                let user = format!(
+                    "## Mission\n{task}\n\n## Reviewer comment\n{}\n\n## Diff under review\n```\n{}\n```\n\nApply the requested changes to the repo now — re-emit the FULL FILES block for every file you change. Then summarise what changed.",
+                    if comment.is_empty() { "(no comment)" } else { &comment }, diff
+                );
+                if let Some(m) = dev.3.as_deref() {
+                    if let Ok(Some(output)) = llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
+                        let mut clean = strip_ask(&output);
+                        apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
+                    }
+                }
+                match collect_repo_diff(app, &cid, repo_path).await {
+                    Some((f, d)) => { files = f; diff = d; }
+                    None => return ReviewOutcome::Skip("the Dev revision produced no changes — nothing was pushed".into()),
+                }
+            }
+            _ => return ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into()),
+        }
+    }
+    ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into())
+}
+
 async fn run_pr_stage(
     app: &App, run_id: &str, dev_role: &str, repo_url: &str, task: &str, project_name: &str,
     dev: &(String, String, String, Option<String>),
@@ -3726,8 +5055,13 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
     );
     let user = format!("## Mission\n{task}\n\n## Added under missions/{run_id}/\nThe team's per-role deliverable markdown files for this mission.\n\nWrite TITLE: and BODY:.");
     let (title, body) = match dmodel.as_deref() {
-        Some(m) => match app.llm_max(m, &system, &user, 400).await {
-            Ok(t) => parse_pr_text(&t, task, run_id),
+        Some(m) => match llm_step(app, run_id, dev_role, "pr", m, &system, &user, 400).await {
+            Ok(Some(t)) => parse_pr_text(&t, task, run_id),
+            Ok(None) => {
+                let n = "run stopped at the budget checkpoint — nothing was pushed".to_string();
+                step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+                return skip(n);
+            }
             Err(_) => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
         },
         None => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
@@ -3888,8 +5222,11 @@ Present concisely (≤180 words): what was verified, the concrete evidence from 
     );
     let quser = format!("## Mission\n{task}\n\n## Your QA deliverable\n{}\n\nPresent the evidence.", qa_output.chars().take(1600).collect::<String>());
     let qa_msg = match qmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &qsys, &quser, 500).await
-            .unwrap_or_else(|e| format!("(QA could not present: {})", e.1)),
+        Some(m) => match llm_step(app, run_id, "qa", "", m, &qsys, &quser, 500).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => format!("(QA could not present: {})", e.1),
+        },
         None => "(no model configured for QA)".into(),
     };
     demo_say(app, run_id, &disc_id, "qa", &qa_msg).await;
@@ -3906,8 +5243,11 @@ State what was shipped — branch, pull request — using EXACTLY the facts give
         pr.describe()
     );
     let dev_msg = match dmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &dsys, &duser, 400).await
-            .unwrap_or_else(|e| format!("(Dev could not present: {})", e.1)),
+        Some(m) => match llm_step(app, run_id, dev_role, "", m, &dsys, &duser, 400).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => format!("(Dev could not present: {})", e.1),
+        },
         None => "(no model configured for the Dev)".into(),
     };
     demo_say(app, run_id, &disc_id, dev_role, &dev_msg).await;
@@ -3931,7 +5271,11 @@ Write the checks in the same language as the mission."
         po_output.chars().take(1600).collect::<String>(), qa_msg, dev_msg, footer
     );
     let po_msg = match pmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &psys, &puser, 1600).await,
+        Some(m) => match llm_step(app, run_id, "po", "", m, &psys, &puser, 1600).await {
+            Ok(Some(t)) => Ok(t),
+            Ok(None) => return None,
+            Err(e) => Err(e),
+        },
         None => Err(err(StatusCode::BAD_REQUEST, "No model configured for the PO")),
     };
     match po_msg {
@@ -4008,8 +5352,9 @@ Write the checks in the same language as the mission."
 /// stall the relay or the demo verdict with an empty answer. A token-cap empty
 /// retries once with a doubled budget (room for visible text after the
 /// thinking); transient upstream errors back off; config errors fail fast.
-async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<String, ApiError> {
+async fn llm_retry_usage(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<(String, LlmUsage), ApiError> {
     let mut budget = max;
+    let mut usage = LlmUsage::default();
     let mut last_err: Option<ApiError> = None;
     // 5 attempts with growing backoff (~20s of waiting total) — provider blips
     // (5xx, rate limits, even transient auth flaps that surface as 401) must
@@ -4017,9 +5362,17 @@ async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -
     // fast on the first attempt below.
     for attempt in 0..5u32 {
         if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await; }
-        match app.llm_max(model, system, user, budget).await {
-            Ok(t) if !t.trim().is_empty() => return Ok(t),
-            Ok(_) => last_err = Some(err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer"))),
+        match app.llm_max_usage(model, system, user, budget).await {
+            Ok((t, u)) if !t.trim().is_empty() => {
+                usage.input_tokens += u.input_tokens;
+                usage.output_tokens += u.output_tokens;
+                return Ok((t, usage));
+            }
+            Ok((_, u)) => {
+                usage.input_tokens += u.input_tokens;
+                usage.output_tokens += u.output_tokens;
+                last_err = Some(err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer")));
+            }
             Err(e) => {
                 if attempt == 0 && budget < 8000 && e.1.contains("token cap") {
                     budget = (budget * 2).min(8000); // thinking ate the budget — leave room for the answer
@@ -4173,6 +5526,24 @@ fn prepare_project_docs(store: &Store, project_id: &str) -> (String, String) {
             None => section.push_str(&format!("- **{}**\n", doc.title)),
         }
     }
+    let open_comments: Vec<&DocComment> = store.doc_comments.iter()
+        .filter(|c| c.project_id == project_id && c.status == "open")
+        .collect();
+    if !open_comments.is_empty() {
+        section.push_str("\n#### Open review comments — address these explicitly in your deliverable\n");
+        for c in open_comments.iter().take(20) {
+            let doc_title = docs.iter().find(|d| d.id == c.doc_id).map(|d| d.title.as_str()).unwrap_or(c.doc_id.as_str());
+            let quote = if c.quote.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" (on «{}»)", c.quote.chars().take(120).collect::<String>())
+            };
+            section.push_str(&format!(
+                "- **{doc_title}**{quote} — {}: {}\n",
+                c.author, c.body.chars().take(300).collect::<String>()
+            ));
+        }
+    }
     let mut budget = DOCS_INJECT_MAX_CHARS;
     for doc in &docs {
         if doc.file.is_some() || doc.content_md.trim().is_empty() { continue; }
@@ -4194,7 +5565,36 @@ fn prepare_project_docs(store: &Store, project_id: &str) -> (String, String) {
 /// Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
 /// `files` = this teammate ships real repo artifacts (dev/UX with a repo) —
 /// their reply must end with a FILES block the orchestrator applies.
-fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, run_id: &str) -> String {
+/// Goal ancestry + org-lite line for a persona's prompt: the project's standing
+/// "why" and the manager this role reports to. Empty when neither is set.
+fn goal_ancestry_line(app: &App, run_id: &str, role: &str) -> String {
+    let store = app.store.lock().unwrap();
+    let Some(run) = store.runs.iter().find(|r| r.id == run_id) else { return String::new() };
+    let goal = if !run.goal.trim().is_empty() {
+        run.goal.clone()
+    } else {
+        store.projects.iter().find(|p| p.id == run.project_id).map(|p| p.goal.clone()).unwrap_or_default()
+    };
+    let manager = store.personas.iter().find(|p| p.role == role).map(|p| p.reports_to.clone()).unwrap_or_default();
+    let mut out = String::new();
+    if !goal.trim().is_empty() {
+        out.push_str(&format!(
+            "\n\n## Project goal — the WHY behind every task\n{goal}\nEvery deliverable must serve this goal; if the task conflicts with it, raise that in your ## ASK."
+        ));
+    }
+    if !manager.is_empty() {
+        let (mname, mtitle) = store.personas.iter().find(|p| p.role == manager)
+            .map(|p| (p.name.clone(), p.title.clone()))
+            .unwrap_or((manager.clone(), String::new()));
+        out.push_str(&format!(
+            "\nYou report to {mname} ({manager}{}) — align your output with the brief above yours and address blockers to them in your ## ASK.",
+            if mtitle.is_empty() { String::new() } else { format!(", {mtitle}") }
+        ));
+    }
+    out
+}
+
+fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, goal_line: &str, run_id: &str) -> String {
     let files_line = if files {
         format!("\nYou work on the REAL repository (already checked out in the team workspace). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
     } else {
@@ -4202,7 +5602,7 @@ fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: 
     };
     format!(
         "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line} \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line}{goal_line} \
 Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
 Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
 Answer in the same language the task is written in. Keep it under ~450 words (the ## FILES section does not count toward the limit). \
@@ -4329,7 +5729,8 @@ async fn execute_run(app: App, run_id: String) {
         // dev/UX teammates with a repo ship real files — their reply may carry a
         // FILES block, which needs a far larger completion budget than prose
         let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
-        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &run_id);
+        let goal_line = goal_ancestry_line(&app, &run_id, &role);
+        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
         let first_note = repo_note.as_deref().unwrap_or("");
         let user = if handoff.is_empty() {
             format!("## Task from the user\n{task}{first_note}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
@@ -4338,20 +5739,32 @@ async fn execute_run(app: App, run_id: String) {
         };
 
         let cap = if ships_files { 6000 } else { 1400 };
-        let result = match model.as_deref() {
-            Some(m) => llm_retry(&app, m, &system, &user, cap).await,
-            None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+        let (harness, hcmd) = persona_harness(&app, &role);
+        let external = harness != "native";
+        let result = if external {
+            harness_step(&app, &run_id, &role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+        } else {
+            match model.as_deref() {
+                Some(m) => llm_step(&app, &run_id, &role, "work", m, &system, &user, cap).await,
+                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            }
         };
         match result {
-            Ok(output) if !output.is_empty() => {
+            Ok(Some(output)) if !output.is_empty() => {
                 let mut clean = strip_ask(&output);
-                apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                if external {
+                    mark_harness_step(&app, &run_id, &role, &harness);
+                } else {
+                    // External harnesses edit the repo directly — no FILES to apply.
+                    apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                }
                 deliver_and_close(&app, &run_id, &role, &clean, None).await;
                 if let Some((to, topic)) = parse_ask(&output) {
                     raise_discussion(&role, &to, &topic, 1);
                 }
             }
-            Ok(_) => {
+            Ok(None) => return,
+            Ok(Some(_)) => {
                 let mut store = app.store.lock().unwrap();
                 if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
                     step.status = "error".into();
@@ -4480,12 +5893,13 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                     d.topic,
                 );
                 let answer = match tmodel.as_deref() {
-                    Some(m) => llm_retry(&app, m, &system, &user, 350).await,
+                    Some(m) => llm_step(&app, &run_id, target, "", m, &system, &user, 350).await,
                     None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
                 };
                 let text = match answer {
-                    Ok(t) if !t.is_empty() => t.trim().chars().take(900).collect::<String>(),
-                    Ok(_) => "(empty answer)".into(),
+                    Ok(Some(t)) if !t.is_empty() => t.trim().chars().take(900).collect::<String>(),
+                    Ok(None) => return,
+                    Ok(Some(_)) => "(empty answer)".into(),
                     Err(e) => format!("⚠️ could not answer: {}", e.1),
                 };
                 let mut store = app.store.lock().unwrap();
@@ -4520,19 +5934,30 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             }
             // a dev/UX asker may re-emit their FILES block with fixes applied
             let rev_files = repo_path.is_some() && (d.from.starts_with("dev") || d.from.starts_with("ux"));
-            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &docs_line, &run_id);
+            let goal_line = goal_ancestry_line(&app, &run_id, &d.from);
+            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
             let user = format!(
                 "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words — re-emit the full \"## FILES\" section too if your files changed). If you are still blocked you may end with another \"## ASK\" section.",
                 d.topic,
             );
-            let result = match amodel.as_deref() {
-                Some(m) => llm_retry(&app, m, &system, &user, if rev_files { 6000 } else { 1400 }).await,
-                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            let (harness, hcmd) = persona_harness(&app, &d.from);
+            let external = harness != "native";
+            let result = if external {
+                harness_step(&app, &run_id, &d.from, &harness, &hcmd, amodel.as_deref().unwrap_or(""), &system, &user).await
+            } else {
+                match amodel.as_deref() {
+                    Some(m) => llm_step(&app, &run_id, &d.from, "work", m, &system, &user, if rev_files { 6000 } else { 1400 }).await,
+                    None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+                }
             };
             match result {
-                Ok(output) if !output.is_empty() => {
+                Ok(Some(output)) if !output.is_empty() => {
                     let mut clean = strip_ask(&output);
-                    apply_files_note(&app, repo_path.as_deref(), &d.from, &mut clean).await;
+                    if external {
+                        mark_harness_step(&app, &run_id, &d.from, &harness);
+                    } else {
+                        apply_files_note(&app, repo_path.as_deref(), &d.from, &mut clean).await;
+                    }
                     deliver_and_close(&app, &run_id, &d.from, &clean, Some(meeting_round + 1)).await;
                     // The question as asked is answered either way; a still-blocked asker raises a NEW discussion.
                     match parse_ask(&output) {
@@ -4540,6 +5965,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                         None => {}
                     }
                 }
+                Ok(None) => return,
                 // Revision failed — keep the round-1 deliverable, it is still valid work
                 _ => {
                     let mut store = app.store.lock().unwrap();
@@ -4579,7 +6005,27 @@ A teammate raised a blocking question that needs your expertise. Answer directly
         let dev_role = roles.iter().find(|(r, _, _)| r.starts_with("dev")).map(|(r, _, _)| r.clone()).unwrap();
         append_tail_steps(&app, &run_id, &dev_role, "po").await;
         let dev_persona = persona_of(&app, &dev_role);
-        let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
+        // Spending checkpoint before the tail: never commit/push for a run
+        // whose budget is already exhausted.
+        if !guard_budget(&app, &run_id).await { return; }
+        // Review gate: nothing is committed or pushed until the human approves
+        // the staged diff (approve → PR, first reject → one Dev revision).
+        let reviewed = if let Some(rp) = repo_path.as_deref() {
+            match review_gate(&app, &run_id, &dev_role, &repo_url, rp, &task, &project_name).await {
+                ReviewOutcome::Proceed => None,
+                ReviewOutcome::Stopped => { finish_run(&app, &run_id, "stopped"); return; }
+                ReviewOutcome::Skip(note) => {
+                    step_transition(&app, &run_id, &dev_role, "pr", "skipped", &note).await;
+                    Some(PrOutcome { status: "skipped".into(), url: String::new(), branch: run_id.clone(), note })
+                }
+            }
+        } else {
+            None
+        };
+        let pr = match reviewed {
+            Some(outcome) => outcome,
+            None => run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await,
+        };
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
         let qa_persona = persona_of(&app, "qa");
         let po_persona = persona_of(&app, "po");
@@ -4615,11 +6061,12 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
         };
         let user = format!("## Mission\n{task}\n\n## Deliverables\n{deliverables}\n\n## Meetings\n{meetings}{tail_line}\n\nWrite the mission summary.");
         let result = match pmodel.as_deref() {
-            Some(m) => llm_retry(&app, m, &system, &user, 500).await,
+            Some(m) => llm_step(&app, &run_id, "po", "", m, &system, &user, 500).await,
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
-        if let Ok(summary) = result {
-            if !summary.is_empty() {
+        match result {
+            Ok(None) => return,
+            Ok(Some(summary)) if !summary.is_empty() => {
                 if let Some((cid, _)) = app.agent_container("po").await {
                     let _ = write_deliverable(&app, &cid, &run_id, "summary", &summary).await;
                 }
@@ -4629,6 +6076,7 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
                 }
                 save_runs(&store);
             }
+            _ => {}
         }
     }
 
@@ -4675,11 +6123,11 @@ The last iteration's acceptance verdict from the demo session is listed under 'A
 Reply with EITHER the concrete task for the next iteration (one sentence, same language as the goal, ≤60 words — build on what is already done, do not repeat it) OR exactly `DONE` when the goal is achieved and no further iteration adds value."
             );
             let user = format!("## Standing goal\n{task}\n\n## Iterations so far\n{chain}\n\n## Acceptance verdict\n{acc_text}\n\nDecide: the next iteration's task, or `DONE`.");
-            if let Ok(next) = app.llm_max(&model, &system, &user, 200).await {
+            if let Ok(Some(next)) = llm_step(&app, &run_id, "po", "", &model, &system, &user, 200).await {
                 let next = next.trim().trim_matches('`').to_string();
                 if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600 {
                     let next_task = next.lines().last().unwrap_or(&next).to_string();
-                    if let Ok(child) = spawn_run(&app, &project_id, &next_task, true, iteration + 1) {
+                    if let Ok(child) = spawn_run_with(&app, &project_id, &next_task, true, iteration + 1, "loop", None) {
                         let mut store = app.store.lock().unwrap();
                         if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
                             run.next_run_id = Some(child.id.clone());
@@ -4759,20 +6207,24 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                 save_runs(&store);
             }
             let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
-            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &run_id);
+            let goal_line = goal_ancestry_line(&app, &run_id, &role);
+            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
             let user = if handoff.is_empty() {
                 format!("## Task from the user\n{task}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
             } else {
                 format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
             };
             let cap = if ships_files { 6000 } else { 1400 };
-            let result = match model.as_deref() {
-                Some(m) => llm_retry(&app, m, &system, &user, cap).await,
-                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            let (harness, hcmd) = persona_harness(&app, &role);
+            let external = harness != "native";
+            let result = if external {
+                harness_step(&app, &run_id, &role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+            } else {
+                match model.as_deref() {
+                    Some(m) => llm_step(&app, &run_id, &role, "work", m, &system, &user, cap).await,
+                    None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+                }
             };
-            // No ASK raising on retry: no meeting engine is attached to a
-            // reopened run, so a fresh question could never be answered — the
-            // block is stripped, the deliverable itself is kept.
             let error_outcome = |msg: String| {
                 let mut store = app.store.lock().unwrap();
                 if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
@@ -4783,12 +6235,17 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                 save_runs(&store);
             };
             match result {
-                Ok(output) if !output.is_empty() => {
+                Ok(Some(output)) if !output.is_empty() => {
                     let mut clean = strip_ask(&output);
-                    apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                    if external {
+                        mark_harness_step(&app, &run_id, &role, &harness);
+                    } else {
+                        apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                    }
                     deliver_and_close(&app, &run_id, &role, &clean, None).await;
                 }
-                Ok(_) => error_outcome("Model returned an empty answer".into()),
+                Ok(None) => return,
+                Ok(Some(_)) => error_outcome("Model returned an empty answer".into()),
                 Err(e) => error_outcome(e.1),
             }
         }
@@ -4846,11 +6303,21 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
 /// engine (each loop iteration spawns the next run this way). Returns the
 /// stored run — its `.id` is what links a loop chain via `next_run_id`.
 fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32) -> Result<Run, ApiError> {
+    spawn_run_with(app, project_id, task, loop_mode, iteration, "manual", None)
+}
+
+/// Same as spawn_run, with an explicit trigger (manual / scheduled / loop) and
+/// routine provenance. Scheduled runs snapshot the project goal + budget.
+fn spawn_run_with(
+    app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32,
+    trigger: &str, routine_id: Option<&str>,
+) -> Result<Run, ApiError> {
     let run = {
         let mut store = app.store.lock().unwrap();
         let p = store.projects.iter().find(|p| p.id == project_id)
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")))?;
         let (project_name, agents) = (p.name.clone(), p.agents.clone());
+        let (goal, budget_usd) = (p.goal.clone(), p.budget_usd);
         if agents.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no team — add agents on the flow first"));
         }
@@ -4861,7 +6328,8 @@ fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration
                 kind: "work".into(),
                 status: "pending".into(), output: String::new(),
                 model: None, container: None, deliverable: None, rev: None,
-                started_at: 0, finished_at: 0,
+                started_at: 0, finished_at: 0, harness: None,
+                input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
             }))
             .collect::<Vec<_>>();
         if steps.is_empty() {
@@ -4885,6 +6353,15 @@ fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration
             iteration,
             stop_requested: false,
             next_run_id: None,
+            trigger: trigger.into(),
+            routine_id: routine_id.map(str::to_string),
+            goal,
+            budget_usd,
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_alerted: false,
+            review: None,
         };
         store.runs.push(run.clone());
         save_runs(&store);
@@ -4904,6 +6381,148 @@ async fn run_project(State(app): State<App>, headers: axum::http::HeaderMap, Pat
     }
     // Heavy lifting happens in the background; the UI polls GET /runs/{id}
     let run = spawn_run(&app, &id, &task, req.run_loop, 1)?;
+    Ok(json_ok(serde_json::to_value(run).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct RoutineCreate {
+    name: String,
+    task: String,
+    cron: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    loop_mode: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RoutineUpdate {
+    name: Option<String>,
+    task: Option<String>,
+    cron: Option<String>,
+    enabled: Option<bool>,
+    loop_mode: Option<bool>,
+}
+
+/// Next occurrence for a routine, using the same base as the scheduler.
+fn routine_next_run(r: &Routine) -> Option<u64> {
+    if !r.enabled { return None; }
+    next_run_at(&r.cron, if r.last_run_at > 0 { r.last_run_at } else { r.created_at.max(1) })
+}
+
+fn routine_json(r: &Routine) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
+    v["next_run_at"] = json!(routine_next_run(r));
+    v
+}
+
+async fn list_routines(State(app): State<App>, headers: axum::http::HeaderMap, Path(project_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    let list: Vec<Value> = store.routines.iter().filter(|r| r.project_id == project_id).map(routine_json).collect();
+    Ok(json_ok(json!(list)))
+}
+
+async fn create_routine(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(project_id): Path<String>,
+    Json(req): Json<RoutineCreate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let name = req.name.trim().to_string();
+    let task = req.task.trim().to_string();
+    let cron = req.cron.trim().to_string();
+    if name.is_empty() || task.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name and task are required"));
+    }
+    if cron_parse(&cron).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST,
+            "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    store.routine_counter += 1;
+    let routine = Routine {
+        id: format!("rt-{:03}", store.routine_counter),
+        project_id,
+        name,
+        task,
+        cron,
+        enabled: req.enabled,
+        loop_mode: req.loop_mode,
+        last_run_at: 0,
+        last_run_id: None,
+        last_result: String::new(),
+        created_at: now_secs(),
+    };
+    let out = routine_json(&routine);
+    store.routines.push(routine);
+    save_routines(&store);
+    Ok(json_ok(out))
+}
+
+async fn update_routine(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(rid): Path<String>,
+    Json(req): Json<RoutineUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let routine = store.routines.iter_mut().find(|r| r.id == rid)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")))?;
+    if let Some(cron) = req.cron.as_deref() {
+        let cron = cron.trim();
+        if cron_parse(cron).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST,
+                "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
+        }
+        routine.cron = cron.to_string();
+    }
+    if let Some(name) = req.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "name cannot be empty")); }
+        routine.name = name.to_string();
+    }
+    if let Some(task) = req.task.as_deref() {
+        let task = task.trim();
+        if task.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "task cannot be empty")); }
+        routine.task = task.to_string();
+    }
+    if let Some(v) = req.enabled { routine.enabled = v; }
+    if let Some(v) = req.loop_mode { routine.loop_mode = v; }
+    let out = routine_json(routine);
+    save_routines(&store);
+    Ok(json_ok(out))
+}
+
+async fn delete_routine(State(app): State<App>, headers: axum::http::HeaderMap, Path(rid): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let before = store.routines.len();
+    store.routines.retain(|r| r.id != rid);
+    if store.routines.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")));
+    }
+    save_routines(&store);
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+async fn run_routine(State(app): State<App>, headers: axum::http::HeaderMap, Path(rid): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let routine = {
+        let store = app.store.lock().unwrap();
+        store.routines.iter().find(|r| r.id == rid).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")))?
+    };
+    let run = fire_routine(&app, &routine)?;
     Ok(json_ok(serde_json::to_value(run).unwrap()))
 }
 
@@ -4949,7 +6568,8 @@ async fn reply_discussion(
     if disc.status == "resolved" {
         return Err(err(StatusCode::BAD_REQUEST, "This meeting is already resolved"));
     }
-    disc.messages.push(MeetingMessage { from: "human".into(), text, at: now_secs() });
+    let is_review = disc.kind == "review";
+    disc.messages.push(MeetingMessage { from: "human".into(), text: text.clone(), at: now_secs() });
     // Only the live need-human wait reacts to the message; otherwise it is kept as a record.
     if disc.status == "need_human" {
         disc.status = "answering".into();
@@ -4957,6 +6577,10 @@ async fn reply_discussion(
         if run.status == "waiting_human" {
             run.status = "running".into();
         }
+    }
+    // A chat reply on a review discussion may itself carry the decision.
+    if is_review {
+        apply_review_text(run, &text);
     }
     save_runs(&store);
     Ok(json_ok(json!({ "ok": true })))
@@ -4978,6 +6602,121 @@ async fn stop_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(r
     };
     save_runs(&store);
     Ok(json_ok(json!({ "ok": true, "status": status })))
+}
+
+#[derive(Deserialize)]
+struct ReviewDecision {
+    decision: String,
+    #[serde(default)]
+    comment: String,
+}
+
+/// Explicit approve/reject action for the pending pre-push review.
+async fn decide_review(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(run_id): Path<String>,
+    Json(req): Json<ReviewDecision>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let decision = req.decision.trim().to_lowercase();
+    if decision != "approve" && decision != "reject" {
+        return Err(err(StatusCode::BAD_REQUEST, "decision must be 'approve' or 'reject'"));
+    }
+    let mut store = app.store.lock().unwrap();
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    let review = run.review.as_mut()
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "this run has no diff review"))?;
+    if review.status != "pending" {
+        return Err(err(StatusCode::BAD_REQUEST, format!("review is already {}", review.status)));
+    }
+    let approve = decision == "approve";
+    review.status = if approve { "approved".into() } else { "rejected".into() };
+    review.comment = req.comment.trim().to_string();
+    review.decided_at = now_secs();
+    let msg = if approve {
+        "APPROVE".to_string()
+    } else {
+        format!("REJECT: {}", review.comment)
+    };
+    if let Some(disc) = run.discussions.iter_mut().rev().find(|d| d.kind == "review" && d.status == "need_human") {
+        disc.messages.push(MeetingMessage { from: "human".into(), text: msg, at: now_secs() });
+        disc.status = "answering".into();
+        disc.answering = None;
+    }
+    if run.status == "waiting_human" {
+        run.status = "running".into();
+        run.phase = "working".into();
+    }
+    save_runs(&store);
+    Ok(json_ok(json!({ "ok": true, "status": if approve { "approved" } else { "rejected" } })))
+}
+
+/// Parse `APPROVE` / `REJECT: <comment>` sent as a chat reply into the review.
+fn apply_review_text(run: &mut Run, text: &str) {
+    let t = text.trim();
+    let upper = t.to_uppercase();
+    let (status, comment) = if upper.starts_with("APPROVE") {
+        ("approved", String::new())
+    } else if upper.starts_with("REJECT") {
+        ("rejected", t.chars().skip(6).collect::<String>()
+            .trim_start_matches([':', '-', ' ', ':', '：']).trim().to_string())
+    } else {
+        return;
+    };
+    if let Some(review) = run.review.as_mut() {
+        if review.status == "pending" {
+            review.status = status.into();
+            review.comment = comment;
+            review.decided_at = now_secs();
+        }
+    }
+}
+
+/// Raise the per-run budget after a budget pause. This is the ONLY way to
+/// resume a budget-blocked run — a plain chat reply deliberately does not
+/// change the limit. Appends a human message so `wait_for_human` resumes.
+#[derive(Deserialize)]
+struct BudgetUpdate {
+    budget_usd: f64,
+}
+
+async fn set_run_budget(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(run_id): Path<String>,
+    Json(req): Json<BudgetUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    if !req.budget_usd.is_finite() || req.budget_usd <= 0.0 {
+        return Err(err(StatusCode::BAD_REQUEST, "budget_usd must be a positive number"));
+    }
+    if req.budget_usd <= run.cost_usd {
+        return Err(err(StatusCode::BAD_REQUEST, format!(
+            "budget ${:.4} must be above the ${:.4} already spent", req.budget_usd, run.cost_usd)));
+    }
+    run.budget_usd = Some(req.budget_usd);
+    run.cost_alerted = false;
+    if let Some(disc) = run.discussions.iter_mut().rev().find(|d| d.kind == "budget" && d.status != "resolved") {
+        disc.messages.push(MeetingMessage {
+            from: "human".into(),
+            text: format!("budget raised to ${:.2}", req.budget_usd),
+            at: now_secs(),
+        });
+        disc.status = "answering".into();
+        disc.answering = None;
+    }
+    if run.status == "waiting_human" {
+        run.status = "running".into();
+        run.phase = "working".into();
+    }
+    let out = run.clone();
+    save_runs(&store);
+    Ok(json_ok(json!(out)))
 }
 
 /// Per-item retry: re-run ONE failed/skipped/stopped step of a CLOSED run in place.
@@ -5263,9 +7002,14 @@ async fn main() {
     let app_state = App {
         store: {
             let mut store = Store::default();
+            load_personas(&mut store); // personas survive restarts (personas.json)
+            load_config(&mut store);   // provider config + pricing (config.json, 0600)
+            load_skills(&mut store);   // skills + test bench (skills.json)
+            load_tasks(&mut store);    // board tasks (tasks.json)
             load_projects(&mut store); // projects survive restarts (projects.json) — BEFORE load_runs, whose counter salvage scans store.projects
             load_runs(&mut store); // work history survives restarts (runs.json)
-            load_docs(&mut store); // document space survives restarts (docs.json)
+            load_docs(&mut store); // document space + comments survive restarts (docs.json)
+            load_routines(&mut store); // scheduled routines (routines.json)
             load_paused(&mut store); // paused-registry survives restarts (paused.json)
             load_agents(&mut store); // agent registry survives restarts (agents.json)
             // tmux sessions outlive this process — adopt any live ones
@@ -5283,6 +7027,8 @@ async fn main() {
 
     // Idle sweeper — auto-pause agents idle past the configured window.
     tokio::spawn(idle_sweeper(app_state.clone()));
+    // Routine scheduler — fires enabled cron schedules every 30 s.
+    tokio::spawn(routine_scheduler(app_state.clone()));
 
     let cors = tower_http::cors::CorsLayer::permissive();
 
@@ -5315,6 +7061,7 @@ async fn main() {
         .route("/containers/{ident}/connectors/figma/connect-token", post(figma_connect_token))
         .route("/containers/{ident}/connectors/figma/disconnect", post(figma_disconnect))
         .route("/agents", get(list_agents).post(create_persona))
+        .route("/agents/harnesses", get(list_harnesses))
         .route("/agents/{role}", put(update_persona).delete(delete_persona))
         .route("/agents/{role}/start", post(start_agent))
         .route("/agents/{role}/activity", get(agent_activity))
@@ -5326,15 +7073,27 @@ async fn main() {
         .route("/projects/{id}/docs/upload",
                post(upload_doc).layer(axum::extract::DefaultBodyLimit::max(DOC_UPLOAD_MAX_BYTES + 65536)))
         .route("/projects/{id}/docs/{doc_id}", get(get_doc).put(update_doc).delete(delete_doc))
+        .route("/projects/{id}/docs/{doc_id}/comments",
+               get(list_doc_comments).post(create_doc_comment))
+        .route("/projects/{id}/docs/{doc_id}/comments/{comment_id}",
+               put(update_doc_comment).delete(delete_doc_comment))
         .route("/projects/{id}/run", post(run_project))
+        .route("/projects/{id}/routines", get(list_routines).post(create_routine))
+        .route("/routines/{rid}", put(update_routine).delete(delete_routine))
+        .route("/routines/{rid}/run", post(run_routine))
         .route("/runs", get(list_runs))
         .route("/runs/{run_id}", get(get_run))
         .route("/runs/{run_id}/stop", post(stop_run))
+        .route("/runs/{run_id}/budget", post(set_run_budget))
+        .route("/runs/{run_id}/review", post(decide_review))
         .route("/runs/{run_id}/steps/{role}/{kind}/retry", post(retry_step))
         .route("/runs/{run_id}/discussions/{disc_id}/reply", post(reply_discussion))
         .route("/config", get(get_config).put(update_config))
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/{skill_id}", put(update_skill).delete(delete_skill))
+        .route("/skills/{skill_id}/tests", put(set_skill_tests))
+        .route("/skills/{skill_id}/tests/run", post(run_skill_tests))
+        .route("/skills/{skill_id}/restore/{version}", post(restore_skill))
         .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({ "detail": "Not Found" }))) })
         .layer(cors)
         .with_state(app_state);
@@ -5342,4 +7101,123 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.expect("bind :8000");
     println!("{SERVICE_NAME} listening on :8000");
     axum::serve(listener, router).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> u64 {
+        Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap().timestamp() as u64
+    }
+
+    fn test_run(status: &str) -> Run {
+        Run {
+            id: "r-test".into(),
+            project_id: "p-test".into(),
+            project_name: "Test".into(),
+            task: "task".into(),
+            status: status.into(),
+            steps: Vec::new(),
+            phase: "work".into(),
+            round: 1,
+            discussions: Vec::new(),
+            summary: None,
+            acceptance: None,
+            created_at: 1,
+            loop_mode: false,
+            iteration: 1,
+            stop_requested: false,
+            next_run_id: None,
+            trigger: "manual".into(),
+            routine_id: None,
+            goal: String::new(),
+            budget_usd: None,
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_alerted: false,
+            review: None,
+        }
+    }
+
+    #[test]
+    fn cron_field_parsing() {
+        assert_eq!(parse_cron_field("*", 0, 5), Some(vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(parse_cron_field("1,15", 0, 59), Some(vec![1, 15]));
+        assert_eq!(parse_cron_field("9-11", 0, 23), Some(vec![9, 10, 11]));
+        assert_eq!(parse_cron_field("*/20", 0, 59), Some(vec![0, 20, 40]));
+        assert_eq!(parse_cron_field("10-20/5", 0, 59), Some(vec![10, 15, 20]));
+        // out of range / malformed
+        assert_eq!(parse_cron_field("60", 0, 59), None);
+        assert_eq!(parse_cron_field("5-1", 0, 59), None);
+        assert_eq!(parse_cron_field("*/0", 0, 59), None);
+        assert_eq!(parse_cron_field("x", 0, 59), None);
+    }
+
+    #[test]
+    fn cron_expression_needs_five_fields() {
+        assert!(cron_parse("0 9 * * 1-5").is_some());
+        assert!(cron_parse("0 9 * *").is_none());
+        assert!(cron_parse("0 9 * * *  *").is_none());
+        // dow 7 is normalized to Sunday = 0
+        let spec = cron_parse("0 0 * * 7").unwrap();
+        assert_eq!(spec.dows, vec![0]);
+    }
+
+    #[test]
+    fn next_run_is_strictly_after_now() {
+        // Monday 2026-01-05 08:30 local → weekdays 09:00 is the same day.
+        let after = at(2026, 1, 5, 8, 30);
+        assert_eq!(next_run_at("0 9 * * 1-5", after), Some(at(2026, 1, 5, 9, 0)));
+        // Exactly on the occurrence → the NEXT one, not now.
+        let nine = at(2026, 1, 5, 9, 0);
+        assert_eq!(next_run_at("0 9 * * *", nine), Some(at(2026, 1, 6, 9, 0)));
+        // Saturday → Monday for a weekdays-only routine.
+        let sat = at(2026, 1, 10, 12, 0);
+        assert_eq!(next_run_at("0 9 * * 1-5", sat), Some(at(2026, 1, 12, 9, 0)));
+    }
+
+    #[test]
+    fn usage_cost_prices_per_million_tokens() {
+        let usage = LlmUsage { input_tokens: 1_000_000, output_tokens: 500_000 };
+        assert!((usage_cost(usage, 3.0, 15.0) - 10.5).abs() < 1e-9);
+        assert_eq!(usage_cost(LlmUsage { input_tokens: 0, output_tokens: 0 }, 3.0, 15.0), 0.0);
+    }
+
+    #[test]
+    fn harness_templates_and_binary_validation() {
+        let claude = harness_template("claude", "").unwrap();
+        assert!(claude.contains("{prompt_file}"));
+        assert_eq!(harness_binary(&claude), "claude");
+        // a custom template always wins
+        let custom = harness_template("custom", "aider --file {prompt_file}").unwrap();
+        assert_eq!(harness_binary(&custom), "aider");
+        assert!(harness_template("nope", "").is_none());
+        assert!(valid_binary_name("claude"));
+        assert!(!valid_binary_name("claude; rm -rf /"));
+        assert!(!valid_binary_name(""));
+    }
+
+    #[test]
+    fn review_text_approve_and_reject() {
+        let mut run = test_run("waiting_human");
+        run.review = Some(RunReview {
+            status: "pending".into(), diff: String::new(), files: Vec::new(),
+            comment: String::new(), requested_at: 1, decided_at: 0,
+        });
+        apply_review_text(&mut run, "APPROVE");
+        assert_eq!(run.review.as_ref().unwrap().status, "approved");
+
+        run.review.as_mut().unwrap().status = "pending".into();
+        apply_review_text(&mut run, "REJECT: missing empty state");
+        let rv = run.review.as_ref().unwrap();
+        assert_eq!(rv.status, "rejected");
+        assert_eq!(rv.comment, "missing empty state");
+
+        // a normal chat line is not a decision
+        run.review.as_mut().unwrap().status = "pending".into();
+        apply_review_text(&mut run, "looks fine to me");
+        assert_eq!(run.review.as_ref().unwrap().status, "pending");
+    }
 }

@@ -9,7 +9,7 @@ import { authFetch } from '@/lib/auth'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Eye, Code2, Plus, Upload, Download, Pencil, Trash2, FileText, File as FileIcon,
-  Search, Loader2, AlertCircle, FolderOpen, Clock, Sparkles,
+  Search, Loader2, AlertCircle, FolderOpen, Clock, Sparkles, MessageSquarePlus, CheckCircle2, RotateCcw, Quote, X,
 } from 'lucide-react'
 import { marked } from 'marked'
 import { Badge } from '@/components/ui/badge'
@@ -34,7 +34,7 @@ function FileTypeIcon({ file, className }) {
   return <FileIcon className={className} />
 }
 
-export function ProjectDocs({ projectId }) {
+export function ProjectDocs({ projectId, onCommentsChanged }) {
   const [docs, setDocs] = useState(null) // null = loading
   const [folder, setFolder] = useState('All')
   const [search, setSearch] = useState('')
@@ -47,6 +47,12 @@ export function ProjectDocs({ projectId }) {
   const [uploading, setUploading] = useState(false)
   const [formError, setFormError] = useState('')
   const [error, setError] = useState('')
+  // Threaded review comments anchored to quoted passages of the open document.
+  // Open comments are injected into the team's docs section on the next run.
+  const [comments, setComments] = useState(null)
+  const [commentBody, setCommentBody] = useState('')
+  const [quote, setQuote] = useState('')
+  const [commentBusy, setCommentBusy] = useState(false)
   const uploadRef = useRef(null)
 
   const load = useCallback(() => {
@@ -55,7 +61,20 @@ export function ProjectDocs({ projectId }) {
     }).catch(() => setDocs([]))
   }, [projectId])
 
+  const loadComments = useCallback((docId) => {
+    if (!docId) { setComments([]); return }
+    authFetch(`${API}/projects/${projectId}/docs/${docId}/comments`).then(r => r.json())
+      .then(c => setComments(Array.isArray(c) ? c : []))
+      .catch(() => setComments([]))
+  }, [projectId])
+
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    setCommentBody('')
+    setQuote('')
+    loadComments(selected?.id)
+  }, [selected?.id, loadComments])
 
   const folders = ['All', ...Array.from(new Set((docs || []).map(d => d.folder))).sort()]
   const counts = useMemo(() => {
@@ -152,6 +171,64 @@ export function ProjectDocs({ projectId }) {
     }
     if (selected?.id === doc.id) setSelected(null)
     load()
+  }
+
+  // Selecting text in the doc viewer pre-fills the quote the comment is anchored to.
+  function captureSelection() {
+    const text = window.getSelection?.()?.toString().trim() || ''
+    if (text) setQuote(text.slice(0, 400))
+  }
+
+  async function addComment(e) {
+    e.preventDefault()
+    if (!selected || !commentBody.trim()) return
+    setCommentBusy(true)
+    setError('')
+    try {
+      const res = await authFetch(`${API}/projects/${projectId}/docs/${selected.id}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: commentBody.trim(), quote }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setCommentBody('')
+      setQuote('')
+      loadComments(selected.id)
+      load()
+      onCommentsChanged?.()
+    } catch (err) {
+      setError(err.message)
+    }
+    setCommentBusy(false)
+  }
+
+  async function setCommentStatus(comment, status) {
+    setError('')
+    const res = await authFetch(`${API}/projects/${projectId}/docs/${comment.doc_id}/comments/${comment.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      return setError(data.detail || `HTTP ${res.status}`)
+    }
+    loadComments(comment.doc_id)
+    load()
+    onCommentsChanged?.()
+  }
+
+  async function removeComment(comment) {
+    setError('')
+    const res = await authFetch(`${API}/projects/${projectId}/docs/${comment.doc_id}/comments/${comment.id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      return setError(data.detail || `HTTP ${res.status}`)
+    }
+    loadComments(comment.doc_id)
+    load()
+    onCommentsChanged?.()
   }
 
   return (
@@ -287,6 +364,11 @@ export function ProjectDocs({ projectId }) {
                           <span>{doc.folder}</span>
                           <span className="text-muted-foreground/25">·</span>
                           <span>{fmtDate(doc.updated_at)}</span>
+                          {doc.open_comments > 0 && (
+                            <Badge variant="yellow" className="ml-auto gap-0.5 px-1.5 py-0 text-[9px]" title={`${doc.open_comments} comment ที่ยังเปิดอยู่`} data-testid="doc-open-comments">
+                              <MessageSquarePlus className="h-2.5 w-2.5" /> {doc.open_comments}
+                            </Badge>
+                          )}
                         </span>
                       </span>
                     </button>
@@ -307,7 +389,7 @@ export function ProjectDocs({ projectId }) {
       </div>
 
       {/* ---- right: document viewer ---- */}
-      <div className="min-h-[420px] overflow-hidden rounded-2xl border border-white/[0.06] bg-card/80 shadow-card">
+      <div className="min-h-[420px] overflow-hidden rounded-2xl border border-white/[0.06] bg-card/80 shadow-card" onMouseUp={captureSelection}>
         {selected ? (
           <>
             <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/[0.05] px-5 py-4">
@@ -357,6 +439,81 @@ export function ProjectDocs({ projectId }) {
                 />
               </div>
             )}
+
+            {/* Review comments — open ones are injected into the team's docs
+                section, so the next mission explicitly addresses them. */}
+            <div className="border-t border-white/[0.05] px-6 py-4" data-testid="doc-comments">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-white">
+                  <MessageSquarePlus className="h-3.5 w-3.5 text-primary" /> Review comments
+                </span>
+                {comments?.length > 0 && <Badge variant="gray" className="text-[9.5px]">{comments.filter(c => c.status === 'open').length} open / {comments.length}</Badge>}
+                <span className="text-[10.5px] text-muted-foreground/50">เลือกข้อความในเอกสารเพื่อ quote — ทีม AI จะเห็นคอมเมนต์ที่ยังเปิดอยู่ตอนรัน mission</span>
+              </div>
+
+              {comments === null ? (
+                <div className="mt-3 flex items-center gap-2 text-[11.5px] text-muted-foreground/60"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังโหลดคอมเมนต์…</div>
+              ) : comments.length === 0 ? (
+                <div className="mt-3 text-[11.5px] text-muted-foreground/50" data-testid="comments-empty">ยังไม่มีคอมเมนต์ในเอกสารนี้</div>
+              ) : (
+                <div className="mt-3 flex flex-col gap-2">
+                  {comments.map(c => (
+                    <div
+                      key={c.id}
+                      className={cn('rounded-lg border p-2.5', c.status === 'open' ? 'border-amber-500/25 bg-amber-500/[0.04]' : 'border-white/[0.05] bg-white/[0.02] opacity-70')}
+                      data-testid="doc-comment"
+                      data-status={c.status}
+                    >
+                      {c.quote && (
+                        <div className="mb-1 border-l-2 border-amber-400/50 pl-2 text-[11px] italic leading-relaxed text-amber-200/70">“{c.quote}”</div>
+                      )}
+                      <div className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/85">{c.body}</div>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/50">
+                        <span>{c.author} · {fmtDate(c.created_at)}</span>
+                        <button
+                          type="button"
+                          onClick={() => setCommentStatus(c, c.status === 'open' ? 'resolved' : 'open')}
+                          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-semibold text-emerald-300/80 hover:bg-emerald-500/10 hover:text-emerald-300"
+                          data-testid="comment-toggle"
+                        >
+                          {c.status === 'open' ? <><CheckCircle2 className="h-3 w-3" /> Resolve</> : <><RotateCcw className="h-3 w-3" /> Reopen</>}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeComment(c)}
+                          className="rounded px-1.5 py-0.5 text-muted-foreground/40 hover:bg-red-500/10 hover:text-red-400"
+                          data-testid="comment-delete"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <form onSubmit={addComment} className="mt-3 flex flex-col gap-2" data-testid="comment-form">
+                {quote && (
+                  <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.05] px-2.5 py-1.5">
+                    <Quote className="mt-0.5 h-3 w-3 shrink-0 text-amber-400/70" />
+                    <span className="line-clamp-2 flex-1 text-[11px] italic leading-relaxed text-amber-200/80">{quote}</span>
+                    <button type="button" onClick={() => setQuote('')} className="shrink-0 text-amber-300/50 hover:text-amber-200" aria-label="Clear quoted passage"><X className="h-3 w-3" /></button>
+                  </div>
+                )}
+                <div className="flex items-start gap-2">
+                  <Textarea
+                    className="min-h-[54px] flex-1 text-[12px]"
+                    placeholder="คอมเมนต์ถึงทีม เช่น “ตรงนี้ต้องมี empty state ตอนไม่มีข้อมูล”…"
+                    value={commentBody}
+                    onChange={e => setCommentBody(e.target.value)}
+                    data-testid="comment-body"
+                  />
+                  <Button type="submit" size="sm" disabled={commentBusy || !commentBody.trim()} className="h-fit" data-testid="comment-submit">
+                    {commentBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MessageSquarePlus className="h-3.5 w-3.5" />} Comment
+                  </Button>
+                </div>
+              </form>
+            </div>
           </>
         ) : (
           <div className="flex h-full min-h-[420px] flex-col items-center justify-center gap-3 px-6 text-center" data-testid="doc-view-empty">

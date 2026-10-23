@@ -1,8 +1,8 @@
 'use client'
 
 import { authFetch } from '@/lib/auth'
-import { useEffect, useState } from 'react'
-import { Save, Check, Sparkles } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
+import { Save, Check, Sparkles, DollarSign, Plus, Trash2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -19,6 +19,7 @@ export default function AIConfigPage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  const [newModel, setNewModel] = useState('')
 
   useEffect(() => {
     authFetch(`${API}/providers`).then(r => r.json()).then(setProviders).catch(() => setProviders([]))
@@ -34,6 +35,37 @@ export default function AIConfigPage() {
     setSaved(false)
   }
 
+  function setPrice(model, field, value) {
+    setConfig(c => ({
+      ...c,
+      pricing: {
+        ...(c.pricing || {}),
+        [model]: { ...(c.pricing?.[model] || {}), [field]: Math.max(0, Number(value) || 0) },
+      },
+    }))
+    setSaved(false)
+  }
+
+  function addModel() {
+    const model = newModel.trim()
+    if (!model) return
+    setConfig(c => ({
+      ...c,
+      pricing: { ...(c.pricing || {}), [model]: c.pricing?.[model] || { input_per_mtok: 0, output_per_mtok: 0 } },
+    }))
+    setNewModel('')
+    setSaved(false)
+  }
+
+  function removeModel(model) {
+    setConfig(c => {
+      const pricing = { ...(c.pricing || {}) }
+      delete pricing[model]
+      return { ...c, pricing }
+    })
+    setSaved(false)
+  }
+
   async function save(e) {
     e.preventDefault()
     setSaving(true)
@@ -43,6 +75,9 @@ export default function AIConfigPage() {
       const body = {
         ai_provider: config.ai_provider,
         ai_base_url: config.ai_base_url,
+        pricing: config.pricing || {},
+        default_input_per_mtok: Number(config.default_input_per_mtok) || 0,
+        default_output_per_mtok: Number(config.default_output_per_mtok) || 0,
       }
       if (apiKey) body.ai_api_key = apiKey
       const res = await authFetch(`${API}/config`, {
@@ -126,6 +161,83 @@ export default function AIConfigPage() {
             </div>
           </form>
         </Card>
+
+        <Card className="mt-4 max-w-2xl p-5" data-testid="pricing-card">
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold text-white">
+            <DollarSign className="h-4 w-4 text-emerald-400" /> Token pricing
+            <span className="text-[11px] font-normal text-muted-foreground/55">USD ต่อ 1M tokens</span>
+          </div>
+          <div className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground/60">
+            ใช้ประเมินค่าใช้จ่ายต่อ run — ราคาที่ seed มาเป็นค่าประมาณ แก้ให้ตรงกับผู้ให้บริการได้; กด Save Provider Config ด้านบนเพื่อบันทึก
+          </div>
+
+          <div className="mt-3 grid grid-cols-[minmax(0,1fr)_92px_92px_28px] items-center gap-x-2 gap-y-1.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Model</span>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Input</span>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Output</span>
+            <span />
+            {Object.entries(config.pricing || {}).sort(([a], [b]) => a.localeCompare(b)).map(([model, p]) => (
+              <Fragment key={model}>
+                <code className="truncate rounded bg-black/20 px-2 py-1 font-mono text-[11px] text-foreground/80" title={model}>{model}</code>
+                <Input
+                  type="number" min="0" step="0.01"
+                  className="h-8 text-[11.5px] tabular-nums"
+                  value={p?.input_per_mtok ?? 0}
+                  onChange={e => setPrice(model, 'input_per_mtok', e.target.value)}
+                  aria-label={`${model} input price`}
+                />
+                <Input
+                  type="number" min="0" step="0.01"
+                  className="h-8 text-[11.5px] tabular-nums"
+                  value={p?.output_per_mtok ?? 0}
+                  onChange={e => setPrice(model, 'output_per_mtok', e.target.value)}
+                  aria-label={`${model} output price`}
+                />
+                <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground/40 hover:bg-red-500/10 hover:text-red-400" onClick={() => removeModel(model)} aria-label={`Remove ${model}`}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </Fragment>
+            ))}
+          </div>
+
+          <div className="mt-2 flex items-center gap-1.5">
+            <Input
+              className="h-8 max-w-[260px] font-mono text-[11.5px]"
+              placeholder="เพิ่มโมเดล เช่น glm-5.3"
+              value={newModel}
+              onChange={e => setNewModel(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModel() } }}
+              data-testid="pricing-new-model"
+            />
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-[11.5px]" onClick={addModel} disabled={!newModel.trim()} data-testid="pricing-add-model">
+              <Plus className="h-3.5 w-3.5" /> Add
+            </Button>
+          </div>
+
+          <div className="mt-3 border-t border-white/[0.06] pt-3">
+            <div className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground/50">Default price for unknown models</div>
+            <div className="mt-1.5 grid grid-cols-[minmax(0,1fr)_92px_92px_28px] items-center gap-2">
+              <span className="text-[11.5px] text-muted-foreground/70">fallback (USD / 1M tokens)</span>
+              <Input
+                type="number" min="0" step="0.01"
+                className="h-8 text-[11.5px] tabular-nums"
+                value={config.default_input_per_mtok ?? 0}
+                onChange={e => { setConfig({ ...config, default_input_per_mtok: Math.max(0, Number(e.target.value) || 0) }); setSaved(false) }}
+                aria-label="default input price"
+              />
+              <Input
+                type="number" min="0" step="0.01"
+                className="h-8 text-[11.5px] tabular-nums"
+                value={config.default_output_per_mtok ?? 0}
+                onChange={e => { setConfig({ ...config, default_output_per_mtok: Math.max(0, Number(e.target.value) || 0) }); setSaved(false) }}
+                aria-label="default output price"
+              />
+              <span />
+            </div>
+            <div className="mt-1 text-[10.5px] text-muted-foreground/45">ถ้าเป็น 0 และโมเดลไม่อยู่ในตาราง → step จะแสดง “estimate unavailable”</div>
+          </div>
+        </Card>
+
         <div className="mt-3 text-[12px] text-muted-foreground/70" data-testid="per-agent-model-hint">
           เลือกโมเดลทำที่ระดับ agent — ตั้ง per-persona model ได้ที่หน้า <a className="text-primary underline" href="/team">AI Team</a>
         </div>

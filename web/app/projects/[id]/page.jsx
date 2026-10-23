@@ -8,11 +8,14 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { marked } from 'marked'
-import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, MonitorPlay, RotateCcw } from 'lucide-react'
+import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, MonitorPlay, RotateCcw, Wallet, AlertTriangle, CalendarClock, Play, Pencil, Trash2, ShieldCheck, X, Target } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Textarea } from '@/components/ui/textarea'
+import { Input } from '@/components/ui/input'
+import { Progress } from '@/components/ui/progress'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { AgentDetail } from '@/components/agent-detail'
@@ -289,6 +292,301 @@ function StepKindBadge({ kind }) {
   )
 }
 
+function fmtUsd(v) {
+  const n = Number(v || 0)
+  if (!n) return '$0.00'
+  return n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`
+}
+
+function fmtTok(n) {
+  const v = Number(n || 0)
+  return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)
+}
+
+// Pre-push diff review: the human sees exactly what will be pushed and can send
+// it back to Dev once with a comment (a second reject skips the PR entirely).
+function ReviewCard({ run, onDecide, deciding }) {
+  const [comment, setComment] = useState('')
+  const rv = run.review
+  if (!rv) return null
+  const pending = rv.status === 'pending'
+  const tone = rv.status === 'approved' ? 'border-emerald-500/40 bg-emerald-500/5'
+    : pending ? 'border-sky-500/40 bg-sky-500/5'
+    : 'border-rose-500/40 bg-rose-500/5'
+  return (
+    <div className={`mb-3 rounded-xl border p-3.5 ${tone}`} data-testid="review-card" data-status={rv.status}>
+      <div className="flex flex-wrap items-center gap-2">
+        <ShieldCheck className="h-4 w-4 text-sky-300" />
+        <span className="text-[12.5px] font-bold text-sky-200">Diff review — ก่อน push/PR</span>
+        <Badge variant={pending ? 'created' : rv.status === 'approved' ? 'running' : 'dead'} className="text-[9.5px]">
+          {pending ? 'รอคุณอนุมัติ' : rv.status === 'approved' ? 'approved' : rv.status === 'timed_out' ? 'timed out — ข้าม PR' : 'rejected'}
+        </Badge>
+        {rv.files?.length > 0 && <span className="text-[11px] text-muted-foreground/60">{rv.files.length} ไฟล์</span>}
+      </div>
+      {rv.files?.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {rv.files.map(f => <code key={f} className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10.5px] text-sky-200/80">{f}</code>)}
+        </div>
+      )}
+      {rv.diff && (
+        <div className="mt-2 max-h-[260px] overflow-auto rounded-lg border border-white/[0.06] bg-black/40 p-2.5">
+          <pre className="whitespace-pre font-mono text-[10.5px] leading-relaxed text-foreground/75">{rv.diff}</pre>
+        </div>
+      )}
+      {pending && (
+        <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            className="h-8 flex-1 text-[12px]"
+            placeholder="เหตุผลที่ตีกลับ (ถ้าจะให้ Dev แก้)…"
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            data-testid="review-comment"
+          />
+          <div className="flex items-center gap-1.5">
+            <Button size="sm" onClick={() => onDecide('approve', comment.trim())} disabled={deciding} data-testid="review-approve" className="h-8">
+              {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Approve
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => onDecide('reject', comment.trim())} disabled={deciding || !comment.trim()} data-testid="review-reject" className="h-8 border-rose-400/40 text-rose-300 hover:bg-rose-500/10 hover:text-rose-200">
+              <X className="h-3.5 w-3.5" /> Reject
+            </Button>
+          </div>
+        </div>
+      )}
+      {!pending && rv.comment && <div className="mt-2 text-[11.5px] text-muted-foreground/70">คอมเมนต์: {rv.comment}</div>}
+    </div>
+  )
+}
+
+// Budget overrun is a pause, not a kill: the run waits for an explicit new
+// ceiling. A normal chat reply deliberately cannot raise it.
+function BudgetCard({ d, run, onRaise, onStop, busy }) {
+  const [amount, setAmount] = useState('')
+  const open = d.status === 'need_human'
+  const cost = run.cost_usd || 0
+  return (
+    <div className={`rounded-xl border p-3.5 ${open ? 'border-amber-400/60 bg-amber-500/[0.06]' : 'border-white/[0.08] bg-white/[0.02]'}`} data-testid="budget-card" data-status={d.status}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Wallet className="h-4 w-4 text-amber-300" />
+        <span className="text-[12.5px] font-bold text-amber-200">Budget guardrail</span>
+        <Badge variant={open ? 'yellow' : 'running'} className="text-[9.5px]">{open ? '⏸ ใช้งบครบ — รออนุมัติ' : d.status}</Badge>
+      </div>
+      <div className="mt-1.5 text-[12px] text-muted-foreground/80">
+        ใช้ไป <strong className="text-foreground">{fmtUsd(cost)}</strong> จากเพดาน <strong className="text-foreground">{fmtUsd(run.budget_usd)}</strong>
+        {' · '}{fmtTok((run.input_tokens || 0) + (run.output_tokens || 0))} tokens
+      </div>
+      {open && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <Input type="number" min="0" step="0.5" className="h-8 w-36 text-[12px]" placeholder="เพดานใหม่ (USD)" value={amount} onChange={e => setAmount(e.target.value)} data-testid="budget-amount" />
+          <Button size="sm" className="h-8" disabled={busy || !(Number(amount) > cost)} onClick={() => onRaise(Number(amount))} data-testid="budget-raise">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />} เพิ่มงบ
+          </Button>
+          <Button size="sm" variant="outline" className="h-8 border-red-500/40 text-rose-300 hover:bg-red-500/10 hover:text-rose-200" disabled={busy} onClick={onStop}>
+            <Square className="h-3.5 w-3.5 fill-current" /> หยุด run
+          </Button>
+          <span className="text-[10.5px] text-muted-foreground/50">ตอบแชทปกติไม่เพิ่มงบ — ต้องกดปุ่มนี้เท่านั้น</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const EMPTY_ROUTINE = { name: '', task: '', cron: '0 9 * * 1-5', loop_mode: false, enabled: true }
+
+function fmtWhen(secs) {
+  if (!secs) return '—'
+  return new Date(secs * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+// Scheduled missions for this project (5-field cron, local time).
+function RoutinesTab({ projectId }) {
+  const [routines, setRoutines] = useState(null)
+  const [error, setError] = useState('')
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [form, setForm] = useState(EMPTY_ROUTINE)
+  const [saving, setSaving] = useState(false)
+  const [runningId, setRunningId] = useState(null)
+
+  const load = useCallback(() => {
+    authFetch(`${API}/projects/${projectId}/routines`).then(r => r.json())
+      .then(d => setRoutines(Array.isArray(d) ? d : []))
+      .catch(() => setRoutines([]))
+  }, [projectId])
+  useEffect(() => { load() }, [load])
+
+  function openCreate() {
+    setEditing(null)
+    setForm(EMPTY_ROUTINE)
+    setError('')
+    setDialogOpen(true)
+  }
+
+  function openEdit(r) {
+    setEditing(r)
+    setForm({ name: r.name, task: r.task, cron: r.cron, loop_mode: !!r.loop_mode, enabled: !!r.enabled })
+    setError('')
+    setDialogOpen(true)
+  }
+
+  async function save(e) {
+    e.preventDefault()
+    if (!form.name.trim() || !form.task.trim() || !form.cron.trim()) return setError('กรอกชื่อ งาน และ cron ให้ครบ')
+    setSaving(true)
+    setError('')
+    try {
+      const res = await authFetch(editing ? `${API}/routines/${editing.id}` : `${API}/projects/${projectId}/routines`, {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setDialogOpen(false)
+      load()
+    } catch (err) {
+      setError(err.message)
+    }
+    setSaving(false)
+  }
+
+  async function toggle(r) {
+    setError('')
+    const res = await authFetch(`${API}/routines/${r.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !r.enabled }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `HTTP ${res.status}`)
+    }
+    load()
+  }
+
+  async function runNow(r) {
+    setRunningId(r.id)
+    setError('')
+    try {
+      const res = await authFetch(`${API}/routines/${r.id}/run`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      load()
+    } catch (err) {
+      setError(err.message)
+    }
+    setRunningId(null)
+  }
+
+  async function remove(r) {
+    setError('')
+    const res = await authFetch(`${API}/routines/${r.id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `HTTP ${res.status}`)
+    }
+    load()
+  }
+
+  return (
+    <div data-testid="project-routines" className="flex flex-col gap-4">
+      <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+        <div>
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold text-white">
+            <CalendarClock className="h-4 w-4 text-primary" /> Scheduled routines
+          </div>
+          <div className="mt-1 text-[11.5px] text-muted-foreground/60">
+            สั่งงานทีมซ้ำตามเวลา (cron 5 ช่อง, เวลาท้องถิ่น) — ถ้าโปรเจกต์กำลังมี run อยู่ รอบนั้นจะถูก skip
+          </div>
+        </div>
+        <Button size="sm" onClick={openCreate} data-testid="routine-new"><Plus className="h-3.5 w-3.5" /> New routine</Button>
+      </Card>
+
+      {error && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12px] text-red-300">{error}</div>}
+
+      {routines === null ? (
+        <div className="text-[12px] text-muted-foreground/60">Loading routines…</div>
+      ) : routines.length === 0 ? (
+        <Card className="px-5 py-10 text-center text-[12.5px] text-muted-foreground/60" data-testid="routines-empty">
+          ยังไม่มี routine — สร้างเพื่อให้ทีมทำงานซ้ำอัตโนมัติ เช่น สรุปงานทุกเช้าวันจันทร์
+        </Card>
+      ) : (
+        <div className="flex flex-col gap-2.5">
+          {routines.map(r => (
+            <Card key={r.id} className="p-4" data-testid="routine-row" data-enabled={r.enabled ? '1' : '0'}>
+              <div className="flex flex-wrap items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[13px] font-semibold text-white">{r.name}</span>
+                    <code className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10.5px] text-amber-200/80">{r.cron}</code>
+                    {r.loop_mode && <Badge variant="purple" className="text-[9.5px]"><Repeat className="h-2.5 w-2.5" /> loop</Badge>}
+                    <Badge variant={r.enabled ? 'running' : 'gray'} className="text-[9.5px]">{r.enabled ? 'enabled' : 'paused'}</Badge>
+                  </div>
+                  <div className="mt-1 truncate text-[12px] text-muted-foreground/75">{r.task}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground/50">
+                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> next: {r.enabled ? fmtWhen(r.next_run_at) : '—'}</span>
+                    <span>last: {r.last_run_at ? fmtWhen(r.last_run_at) : 'never'}{r.last_result ? ` · ${r.last_result}` : ''}</span>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button size="sm" variant="outline" className="h-7 gap-1.5 text-[11.5px]" onClick={() => runNow(r)} disabled={runningId === r.id} data-testid="routine-run">
+                    {runningId === r.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />} Run now
+                  </Button>
+                  <Button size="sm" variant="outline" className="h-7 text-[11.5px]" onClick={() => toggle(r)} data-testid="routine-toggle">
+                    {r.enabled ? 'Pause' : 'Enable'}
+                  </Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground/50 hover:text-foreground" onClick={() => openEdit(r)} aria-label="Edit routine"><Pencil className="h-3.5 w-3.5" /></Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground/40 hover:bg-red-500/10 hover:text-red-400" onClick={() => remove(r)} aria-label="Delete routine"><Trash2 className="h-3.5 w-3.5" /></Button>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{editing ? `Edit — ${editing.name}` : 'Routine ใหม่'}</DialogTitle>
+            <DialogDescription>5-field cron: นาที ชั่วโมง วัน-ใน-เดือน เดือน วัน-ใน-สัปดาห์ · รองรับ * , - และ */n</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={save} className="grid gap-3.5">
+            <div className="grid gap-1.5">
+              <label className="field-label">ชื่อ routine</label>
+              <Input value={form.name} placeholder="เช่น Morning triage" onChange={e => setForm({ ...form, name: e.target.value })} data-testid="routine-name" />
+            </div>
+            <div className="grid gap-1.5">
+              <label className="field-label">งานที่สั่งทีม</label>
+              <Textarea className="min-h-[90px] text-[12.5px]" value={form.task} placeholder="เช่น ตรวจ issue ใหม่, สรุปความคืบหน้า และอัปเดต CHANGELOG" onChange={e => setForm({ ...form, task: e.target.value })} data-testid="routine-task" />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+              <div className="grid gap-1.5">
+                <label className="field-label">Cron</label>
+                <Input className="font-mono text-[12.5px]" value={form.cron} onChange={e => setForm({ ...form, cron: e.target.value })} data-testid="routine-cron" />
+                <span className="text-[10.5px] text-muted-foreground/50">ตัวอย่าง: <code className="font-mono">0 9 * * 1-5</code> = 09:00 ทุกวันจันทร์–ศุกร์</span>
+              </div>
+              <div className="flex flex-col justify-end gap-2 pb-1">
+                <label className="flex cursor-pointer items-center gap-2 text-[12px] text-muted-foreground">
+                  <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} />
+                  Enabled
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-[12px] text-muted-foreground">
+                  <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={form.loop_mode} onChange={e => setForm({ ...form, loop_mode: e.target.checked })} />
+                  Loop mode
+                </label>
+              </div>
+            </div>
+            {error && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12px] text-red-300" data-testid="routine-error">{error}</div>}
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+              <Button type="submit" disabled={saving} data-testid="routine-save">{saving ? 'Saving…' : 'Save routine'}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
 export default function ProjectFlow() {
   const params = useParams()
   const router = useRouter()
@@ -302,6 +600,9 @@ export default function ProjectFlow() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
+  const [goal, setGoal] = useState('')
+  const [budgetUsd, setBudgetUsd] = useState('')
+  const [alertPct, setAlertPct] = useState('80')
 
   // Team run state
   const [task, setTask] = useState('')
@@ -314,6 +615,9 @@ export default function ProjectFlow() {
   const [retrying, setRetrying] = useState(false)
   const [retryingStep, setRetryingStep] = useState(null)
   const [replySending, setReplySending] = useState(false)
+  const [reviewDeciding, setReviewDeciding] = useState(false)
+  const [budgetBusy, setBudgetBusy] = useState(false)
+  const [openComments, setOpenComments] = useState(0)
   const outputRef = useRef(null)
 
   // Click a node in the chart → live activity + work history of that agent
@@ -324,11 +628,23 @@ export default function ProjectFlow() {
     authFetch(`${API}/agents`).then(r => r.json()).then(setPersonas).catch(() => {})
   }
 
+  // Open doc comments across the project — badge on the Docs tab.
+  const refreshOpenComments = useCallback(() => {
+    authFetch(`${API}/projects/${id}/docs`).then(r => r.json()).then(list => {
+      if (Array.isArray(list)) setOpenComments(list.reduce((n, d) => n + (d.open_comments || 0), 0))
+    }).catch(() => {})
+  }, [id])
+
+  useEffect(() => { refreshOpenComments() }, [refreshOpenComments])
+
   useEffect(() => {
     authFetch(`${API}/projects/${id}`).then(r => r.json()).then(p => {
       if (p.detail) { setError(p.detail); return }
       setProject(p)
       setRepoUrl(p.repo_url || '')
+      setGoal(p.goal || '')
+      setBudgetUsd(p.budget_usd ? String(p.budget_usd) : '')
+      setAlertPct(String(p.budget_alert_pct ?? 80))
       const initial = (p.agents || []).map((role, i) => ({
         id: role,
         type: 'persona',
@@ -456,6 +772,9 @@ export default function ProjectFlow() {
     try {
       const body = {
         repo_url: repoUrl,
+        goal: goal.trim(),
+        budget_usd: budgetUsd === '' ? null : Number(budgetUsd),
+        budget_alert_pct: Math.min(100, Math.max(1, Number(alertPct) || 80)),
         agents: nodes.map(n => n.id),
         links: edges.map(e => ({ from: e.source, to: e.target })),
         positions: Object.fromEntries(nodes.map(n => [n.id, { x: n.position.x, y: n.position.y }])),
@@ -538,6 +857,46 @@ export default function ProjectFlow() {
     setRetryingStep(null)
   }
 
+  async function decideReview(decision, comment) {
+    if (!run || reviewDeciding) return
+    setReviewDeciding(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, comment }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setReviewDeciding(false)
+  }
+
+  // Raising the ceiling is deliberately an explicit action — a plain chat reply
+  // never resumes a budget-paused run.
+  async function raiseBudget(amount) {
+    if (!run || budgetBusy) return
+    setBudgetBusy(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/budget`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ budget_usd: amount }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setBudgetBusy(false)
+  }
+
   if (error && !project) {
     return <div className="px-7 pt-5 text-red-400">{error}</div>
   }
@@ -553,11 +912,13 @@ export default function ProjectFlow() {
   // Role → that agent's WORK step only, so chat names/canvas rings never get
   // shadowed by the same agent's tail steps (pr/demo).
   const stepByRole = Object.fromEntries((run?.steps || []).filter(s => (s.kind || 'work') === 'work').map(s => [s.role, s]))
-  const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved')
+  const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved' && d.kind !== 'review' && d.kind !== 'budget')
+  // review/budget gates get their own cards above the timeline, not chat threads
+  const meetingDiscs = (run?.discussions || []).filter(d => d.kind !== 'review' && d.kind !== 'budget')
   // Agents paused on a need-human meeting
   const waitingHuman = run?.status === 'waiting_human'
   const waitingHumanRoles = new Set(
-    (run?.discussions || []).filter(d => d.status === 'need_human').flatMap(d => [d.from, ...d.to])
+    (run?.discussions || []).filter(d => d.status === 'need_human' && d.kind !== 'review' && d.kind !== 'budget').flatMap(d => [d.from, ...d.to])
   )
   // Who each agent is talking to in a live meeting: role → display names of the others
   const meetingPartners = {}
@@ -661,7 +1022,7 @@ export default function ProjectFlow() {
           </Button>
         }
         title={project.name}
-        subtitle={project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
+        subtitle={project.goal || project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
         actions={
           <>
             {error && <span className="text-[12px] text-red-400">{error}</span>}
@@ -676,7 +1037,7 @@ export default function ProjectFlow() {
       <div className="page-body">
         <Tabs defaultValue="mission" className="w-full">
           <TabsList className="mb-6 h-auto w-full justify-start gap-1 rounded-none border-b border-white/[0.06] bg-transparent p-0">
-            {[['mission', 'Mission Control'], ['docs', 'Docs']].map(([v, label]) => (
+            {[['mission', 'Mission Control'], ['routines', 'Routines'], ['docs', 'Docs']].map(([v, label]) => (
               <TabsTrigger
                 key={v}
                 value={v}
@@ -684,6 +1045,9 @@ export default function ProjectFlow() {
                 className="rounded-none border-b-2 border-transparent px-3.5 pb-3 pt-1 text-[12.5px] font-semibold text-muted-foreground/70 hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-white data-[state=active]:shadow-none"
               >
                 {label}
+                {v === 'docs' && openComments > 0 && (
+                  <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-300" data-testid="docs-comment-badge">{openComments}</span>
+                )}
               </TabsTrigger>
             ))}
           </TabsList>
@@ -718,6 +1082,43 @@ export default function ProjectFlow() {
               {!saved && repoUrl !== (project?.repo_url || '') && (
                 <span className="shrink-0 text-[11px] text-amber-400">กด Save Team เพื่อบันทึก repo</span>
               )}
+            </div>
+            <div className="flex items-center gap-2.5">
+              <Target className="h-4 w-4 shrink-0 text-muted-foreground/50" />
+              <input
+                data-testid="project-goal"
+                className="h-9 w-full max-w-xl rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                placeholder="Goal ของโปรเจกต์ — ทีมจะยึดเป็นเป้าหมายหลัก ทุก deliverable"
+                value={goal}
+                onChange={e => { setGoal(e.target.value); setSaved(false) }}
+                title="Goal ancestry: ถูกใส่ใน prompt ของทุกขั้นตอน"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Wallet className="h-4 w-4 shrink-0 text-muted-foreground/50" />
+              <input
+                data-testid="project-budget"
+                type="number"
+                min="0"
+                step="0.5"
+                className="h-9 w-40 rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                placeholder="Budget / run (USD)"
+                value={budgetUsd}
+                onChange={e => { setBudgetUsd(e.target.value); setSaved(false) }}
+                title="เพดานต่อ run — ถึงเพดานแล้ว run จะ pause รออนุมัติ ไม่ตัดจบเอง"
+              />
+              <span className="text-[11.5px] text-muted-foreground/60">alert ที่</span>
+              <input
+                data-testid="project-budget-alert"
+                type="number"
+                min="1"
+                max="100"
+                className="h-9 w-20 rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                value={alertPct}
+                onChange={e => { setAlertPct(e.target.value); setSaved(false) }}
+                title="แจ้งเตือนเมื่อใช้ถึง % ของ budget (ไม่หยุดงาน)"
+              />
+              <span className="text-[11.5px] text-muted-foreground/50">% — ถึงเพดานแล้ว run pause รอคุณอนุมัติเพิ่มงบ</span>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row">
               <Textarea
@@ -767,11 +1168,33 @@ export default function ProjectFlow() {
                     <Repeat className="h-3 w-3" /> Loop{run.iteration > 1 ? ` รอบที่ ${run.iteration}` : ''}{run.status === 'done' && !run.next_run_id ? ' · กำลังประเมินรอบถัดไป…' : ''}
                   </Badge>
                 )}
+                {run.trigger === 'scheduled' && (
+                  <Badge variant="cyan" className="gap-1" data-testid="scheduled-badge" title={run.routine_id ? `routine ${run.routine_id}` : 'scheduled run'}>
+                    <CalendarClock className="h-3 w-3" /> scheduled
+                  </Badge>
+                )}
+                {(run.cost_usd > 0 || run.budget_usd) && (
+                  <span
+                    className="flex items-center gap-1.5 text-[12px] tabular-nums text-muted-foreground/80"
+                    data-testid="run-cost"
+                    title={`${fmtTok(run.input_tokens)} input + ${fmtTok(run.output_tokens)} output tokens`}
+                  >
+                    <Wallet className="h-3.5 w-3.5 shrink-0 text-emerald-400/80" />
+                    <strong className="font-semibold text-foreground/90">{fmtUsd(run.cost_usd)}</strong>
+                    {run.budget_usd ? <span>/ {fmtUsd(run.budget_usd)}</span> : null}
+                    <span className="text-muted-foreground/50">· {fmtTok((run.input_tokens || 0) + (run.output_tokens || 0))} tok</span>
+                  </span>
+                )}
+                {run.cost_alerted && (
+                  <Badge variant="yellow" className="gap-1" data-testid="cost-alert">
+                    <AlertTriangle className="h-3 w-3" /> ใช้งบ ≥ {project.budget_alert_pct ?? 80}%
+                  </Badge>
+                )}
                 <span className="text-[12.5px] font-medium">{doneCount}/{run.steps.length} ส่งงานแล้ว</span>
-                {(run.discussions || []).length > 0 && (
+                {meetingDiscs.length > 0 && (
                   <span className="flex items-center gap-1.5 text-[12px] text-amber-300/90">
                     <MessagesSquare className="h-3.5 w-3.5 shrink-0" />
-                    {run.discussions.length} meeting{run.discussions.some(d => d.status !== 'resolved') ? ` · คำถามค้าง ${run.discussions.filter(d => d.status !== 'resolved').length}` : ' — ตัดสินใจครบแล้ว'}
+                    {meetingDiscs.length} meeting{meetingDiscs.some(d => d.status !== 'resolved') ? ` · คำถามค้าง ${meetingDiscs.filter(d => d.status !== 'resolved').length}` : ' — ตัดสินใจครบแล้ว'}
                   </span>
                 )}
                 {revertTotal > 0 && (
@@ -807,6 +1230,34 @@ export default function ProjectFlow() {
                   </Button>
                 )}
               </div>
+
+              {run.steps.length > 0 && (
+                <div className="mb-3 flex items-center gap-3">
+                  <Progress
+                    value={(doneCount / Math.max(1, run.steps.length)) * 100}
+                    indicatorClassName={run.status === 'error' ? 'bg-gradient-to-r from-rose-500 to-red-400' : undefined}
+                  />
+                  <span className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground/50">
+                    {Math.round((doneCount / Math.max(1, run.steps.length)) * 100)}%
+                  </span>
+                </div>
+              )}
+
+              <ReviewCard run={run} onDecide={decideReview} deciding={reviewDeciding} />
+              {(run.discussions || []).filter(d => d.kind === 'budget').length > 0 && (
+                <div className="mb-3 flex flex-col gap-2.5">
+                  {run.discussions.filter(d => d.kind === 'budget').map(d => (
+                    <BudgetCard
+                      key={d.id}
+                      d={d}
+                      run={run}
+                      onRaise={raiseBudget}
+                      onStop={stopTeam}
+                      busy={budgetBusy || stopping}
+                    />
+                  ))}
+                </div>
+              )}
 
               {run.acceptance && (
                 <div
@@ -860,8 +1311,21 @@ export default function ProjectFlow() {
                               <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
                               {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
                               {kind !== 'work' && <StepKindBadge kind={kind} />}
+                              {step.harness && <span className="ml-1.5 rounded bg-violet-500/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-violet-300" title="external CLI harness — unmetered">{step.harness}</span>}
                             </div>
                           </div>
+                          {(step.input_tokens > 0 || step.output_tokens > 0 || step.cost_usd > 0 || step.metered === false) && (
+                            <span
+                              className={`hidden shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-medium tabular-nums sm:flex ${step.metered === false ? 'bg-violet-500/10 text-violet-300' : 'bg-emerald-500/10 text-emerald-400'}`}
+                              data-testid={`step-cost-${step.role}${kind !== 'work' ? `-${kind}` : ''}`}
+                              title={step.metered === false ? 'external harness — ไม่คิดค่า token ผ่าน platform' : `input ${step.input_tokens.toLocaleString()} · output ${step.output_tokens.toLocaleString()} tokens${step.priced === false ? ' · ไม่มีราคาในตาราง (ประมาณการ)' : ''}`}
+                            >
+                              <Wallet className="h-3 w-3" />
+                              {step.metered === false
+                                ? 'unmetered'
+                                : <>{fmtTok((step.input_tokens || 0) + (step.output_tokens || 0))} tok · {fmtUsd(step.cost_usd)}{step.priced === false ? ' est.' : ''}</>}
+                            </span>
+                          )}
                           {step.container && (
                             <span className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-medium text-emerald-400 sm:flex" title={`deliverable: ${step.deliverable || '-'}`}>
                               <Container className="h-3 w-3" /> {step.container}
@@ -915,12 +1379,12 @@ export default function ProjectFlow() {
                 })}
               </div>
 
-              {(run.discussions || []).length > 0 && (
+              {meetingDiscs.length > 0 && (
                 <div className="mt-4 flex flex-col gap-2.5" data-testid="run-meetings">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-400/80">
-                    Meetings — คุยกันแบบแชทเรียลไทม์ {run.discussions.some(d => d.status === 'need_human') && <span className="ml-1 normal-case text-rose-300">· มีคำถามที่รอคุณตอบ</span>}
+                    Meetings — คุยกันแบบแชทเรียลไทม์ {meetingDiscs.some(d => d.status === 'need_human') && <span className="ml-1 normal-case text-rose-300">· มีคำถามที่รอคุณตอบ</span>}
                   </div>
-                  {run.discussions.map(d => (
+                  {meetingDiscs.map(d => (
                     <MeetingChat
                       key={d.id}
                       d={d}
@@ -983,8 +1447,12 @@ export default function ProjectFlow() {
         </div>
           </TabsContent>
 
+          <TabsContent value="routines" className="mt-0">
+            <RoutinesTab projectId={id} />
+          </TabsContent>
+
           <TabsContent value="docs" className="mt-0">
-            <ProjectDocs projectId={id} />
+            <ProjectDocs projectId={id} onCommentsChanged={refreshOpenComments} />
           </TabsContent>
         </Tabs>
       </div>

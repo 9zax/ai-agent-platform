@@ -2,7 +2,7 @@
 
 import { authFetch } from '@/lib/auth'
 import { useEffect, useState } from 'react'
-import { Play, MessageSquare, Trash2, Users, Plus, Pencil, Network } from 'lucide-react'
+import { Play, MessageSquare, Trash2, Users, Plus, Pencil, Network, LayoutGrid, GitBranch, Terminal } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -26,6 +26,72 @@ function statusOf(container) {
   return { label: s, variant: 'gray', line: 'via-white/15' }
 }
 
+// Lightweight org chart: manager → direct reports, click anyone to edit their
+// persona (including who they report to). No canvas — just a nested list.
+function OrgNode({ agent, agents, depth = 0, seen = new Set(), onEdit }) {
+  const kids = agents.filter(a => (a.reports_to || '') === agent.role && a.role !== agent.role && !seen.has(a.role))
+  const next = new Set(seen).add(agent.role)
+  return (
+    <div className={depth ? 'relative border-l border-white/[0.08] pl-4' : ''} data-testid="org-node" data-role={agent.role}>
+      <button
+        onClick={() => onEdit(agent)}
+        className="group flex w-full items-center gap-2.5 rounded-lg border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left transition-colors hover:border-white/[0.12] hover:bg-white/[0.04]"
+      >
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500/90 to-indigo-600 text-[10px] font-semibold text-white">
+          {initials(agent.name)}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5">
+            <span className="truncate text-[12.5px] font-semibold text-white">{agent.name}</span>
+            <code className="shrink-0 rounded bg-white/[0.04] px-1 font-mono text-[9px] uppercase text-muted-foreground/60">{agent.role}</code>
+            {agent.harness && agent.harness !== 'native' && (
+              <Badge variant="purple" className="shrink-0 gap-0.5 text-[9px]"><Terminal className="h-2.5 w-2.5" />{agent.harness}</Badge>
+            )}
+          </span>
+          <span className="block truncate text-[11px] text-muted-foreground/65">{agent.title}{kids.length ? ` · ${kids.length} คนในทีม` : ''}</span>
+        </span>
+        <Pencil className="h-3 w-3 shrink-0 text-muted-foreground/30 group-hover:text-primary" />
+      </button>
+      {kids.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1.5">
+          {kids.map(k => <OrgNode key={k.role} agent={k} agents={agents} depth={depth + 1} seen={next} onEdit={onEdit} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function OrgView({ agents, onEdit }) {
+  const roles = new Set(agents.map(a => a.role))
+  const roots = agents.filter(a => !a.reports_to || a.reports_to === a.role || !roles.has(a.reports_to))
+  // cycle members are not reachable from a root — surface them instead of hiding them
+  const reachable = new Set()
+  const walk = (a) => {
+    if (reachable.has(a.role)) return
+    reachable.add(a.role)
+    agents.filter(x => (x.reports_to || '') === a.role).forEach(walk)
+  }
+  roots.forEach(walk)
+  const orphans = agents.filter(a => !reachable.has(a.role))
+  return (
+    <Card className="p-5" data-testid="org-view">
+      <div className="flex items-center gap-2 text-[13.5px] font-semibold text-white">
+        <GitBranch className="h-4 w-4 text-primary" /> Org chart
+        <span className="text-[11px] font-normal text-muted-foreground/55">— กดที่ชื่อเพื่อแก้ persona / สายบังคับบัญชา</span>
+      </div>
+      <div className="mt-4 flex max-w-3xl flex-col gap-2">
+        {roots.map(a => <OrgNode key={a.role} agent={a} agents={agents} onEdit={onEdit} />)}
+        {orphans.length > 0 && (
+          <div className="mt-2 border-t border-white/[0.06] pt-3">
+            <div className="mb-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-amber-400/70">ไม่มีเส้นสายที่ลงตัว (cycle / manager หาย)</div>
+            {orphans.map(a => <OrgNode key={a.role} agent={a} agents={agents} onEdit={onEdit} />)}
+          </div>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 export default function TeamPage() {
   const [agents, setAgents] = useState(null)
   const [busy, setBusy] = useState('')
@@ -35,6 +101,7 @@ export default function TeamPage() {
   const [connectorRows, setConnectorRows] = useState(null) // /connectors/status rows — null = loading
   const [flow, setFlow] = useState(null) // { container, ctype } — opens the shared connect dialog
   const [connRefresh, setConnRefresh] = useState(0) // bumped after a dialog change → repoll now
+  const [view, setView] = useState('grid')
 
   async function load() {
     try {
@@ -126,6 +193,14 @@ export default function TeamPage() {
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />
               {onlineCount} online
             </div>
+            <div className="flex items-center gap-0.5 rounded-lg border border-white/[0.06] bg-white/[0.02] p-0.5" data-testid="team-view-toggle">
+              <Button variant={view === 'grid' ? 'secondary' : 'ghost'} size="sm" className="h-7 gap-1.5 px-2.5 text-[11.5px]" onClick={() => setView('grid')} data-testid="view-grid">
+                <LayoutGrid className="h-3.5 w-3.5" /> Cards
+              </Button>
+              <Button variant={view === 'org' ? 'secondary' : 'ghost'} size="sm" className="h-7 gap-1.5 px-2.5 text-[11.5px]" onClick={() => setView('org')} data-testid="view-org">
+                <GitBranch className="h-3.5 w-3.5" /> Org
+              </Button>
+            </div>
             <Button variant="outline" onClick={() => window.location.href = '/projects'}>
               <Network className="h-4 w-4" /> Build Team (Projects)
             </Button>
@@ -135,6 +210,9 @@ export default function TeamPage() {
       />
 
       <div className="page-body">
+        {view === 'org' && agents ? (
+          <OrgView agents={agents} onEdit={openEditor} />
+        ) : (
         <div className="grid gap-3.5 [grid-template-columns:repeat(auto-fit,minmax(310px,1fr))]">
           {agents === null && [0, 1, 2, 3, 4, 5].map(i => (
             <Card key={i} className="h-[230px] p-5">
@@ -190,7 +268,7 @@ export default function TeamPage() {
                   </div>
                 </div>
 
-                <div className="mt-3.5">
+                <div className="mt-3.5 flex flex-wrap items-center gap-1.5">
                   <Badge
                     variant={overridden ? 'blue' : 'gray'}
                     className="max-w-full truncate font-mono text-[9.5px]"
@@ -199,6 +277,11 @@ export default function TeamPage() {
                   >
                     {a.model || 'ไม่ได้ตั้งโมเดล'}
                   </Badge>
+                  {a.harness && a.harness !== 'native' && (
+                    <Badge variant="purple" className="gap-1 text-[9.5px]" title="external CLI harness — unmetered" data-testid={`agent-harness-${a.role}`}>
+                      <Terminal className="h-2.5 w-2.5" /> {a.harness}
+                    </Badge>
+                  )}
                 </div>
 
                 <div className="mt-3 line-clamp-3 min-h-[54px] text-[12px] leading-relaxed text-muted-foreground/75">{a.expertise}</div>
@@ -255,6 +338,7 @@ export default function TeamPage() {
             )
           })}
         </div>
+        )}
       </div>
 
       <PersonaEditor agent={editingAgent} open={editorOpen} onOpenChange={setEditorOpen} onSaved={load} />

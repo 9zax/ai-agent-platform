@@ -6,7 +6,7 @@
 
 import { authFetch } from '@/lib/auth'
 import { useEffect, useState } from 'react'
-import { Eye, Code2 } from 'lucide-react'
+import { Eye, Code2, Terminal, Users, AlertCircle } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -17,7 +17,14 @@ import { marked } from 'marked'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-const EMPTY_PERSONA = { role: '', name: '', title: '', years: '14', expertise: '', rules_md: '', model: '' }
+const EMPTY_PERSONA = { role: '', name: '', title: '', years: '14', expertise: '', rules_md: '', model: '', reports_to: '', harness: 'native', harness_command: '' }
+
+const HARNESS_FALLBACK = [
+  { id: 'native', label: 'Built-in provider loop', command: '', installed: true },
+  { id: 'claude', label: 'Claude Code CLI', command: 'claude -p "$(cat {prompt_file})"', installed: null },
+  { id: 'codex', label: 'Codex CLI', command: 'codex exec "$(cat {prompt_file})"', installed: null },
+  { id: 'custom', label: 'Custom command', command: '', installed: true },
+]
 
 // The form body shared by the PersonaEditor dialog and the agent detail panel's
 // "แก้ไข persona" tab. `active` gates the load effect (a tab that mounts hidden
@@ -29,6 +36,8 @@ export function PersonaForm({ agent, active = true, onSaved, onDone }) {
   const [saving, setSaving] = useState(false)
   const [agentStatus, setAgentStatus] = useState(null) // {model, provider, provider_id}
   const [modelsInfo, setModelsInfo] = useState(null)   // {models, source, provider}
+  const [harnesses, setHarnesses] = useState(HARNESS_FALLBACK)
+  const [teammates, setTeammates] = useState([])
 
   const editing = !!agent
 
@@ -42,12 +51,22 @@ export function PersonaForm({ agent, active = true, onSaved, onDone }) {
     Promise.all([
       authFetch(`${API}/agent/status`).then(r => r.json()).catch(() => null),
       authFetch(`${API}/models`).then(r => r.json()).catch(() => null),
-    ]).then(([status, models]) => {
+      authFetch(`${API}/agents/harnesses`).then(r => r.json()).catch(() => null),
+      authFetch(`${API}/agents`).then(r => r.json()).catch(() => null),
+    ]).then(([status, models, foundHarnesses, team]) => {
       if (!alive) return
       setAgentStatus(status)
       setModelsInfo(models)
+      if (Array.isArray(foundHarnesses) && foundHarnesses.length) setHarnesses(foundHarnesses)
+      if (Array.isArray(team)) setTeammates(team)
       const base = agent
-        ? { role: agent.role, name: agent.name, title: agent.title, years: agent.years, expertise: agent.expertise, rules_md: agent.rules_md || '' }
+        ? {
+            role: agent.role, name: agent.name, title: agent.title, years: agent.years,
+            expertise: agent.expertise, rules_md: agent.rules_md || '',
+            reports_to: agent.reports_to || '',
+            harness: agent.harness || 'native',
+            harness_command: agent.harness_command || '',
+          }
         : { ...EMPTY_PERSONA }
       setForm({ ...base, model: agent?.model_overrides?.[status?.provider_id] || '' })
     })
@@ -109,6 +128,24 @@ export function PersonaForm({ agent, active = true, onSaved, onDone }) {
             <Input value={form.expertise} placeholder="CI/CD, Docker, Kubernetes..." onChange={e => setForm({ ...form, expertise: e.target.value })} />
           </div>
           <div className="grid gap-1.5">
+            <label className="flex items-center gap-1.5 text-[13px] font-medium"><Users className="h-3.5 w-3.5 text-muted-foreground/60" /> Reports to (manager)</label>
+            <Select
+              value={form.reports_to || 'none'}
+              onValueChange={v => setForm({ ...form, reports_to: v === 'none' ? '' : v })}
+            >
+              <SelectTrigger data-testid="manager-select"><SelectValue placeholder="ไม่มี (top of org)" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">ไม่มี — top of the org</SelectItem>
+                {teammates.filter(t => t.role !== form.role).map(t => (
+                  <SelectItem key={t.role} value={t.role} data-testid="manager-option">{t.name} — {t.title}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <div className="text-[11px] text-muted-foreground/60">
+              สายบังคับบัญชาถูกใส่ใน prompt ของ agent นี้ (goal ancestry) — และใช้แสดง org chart ในหน้า Team
+            </div>
+          </div>
+          <div className="grid gap-1.5">
             <div className="flex items-center justify-between">
               <label className="text-[13px] font-medium">โมเดลประจำตัว (per-persona)</label>
               <span className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground/60" data-testid="model-provider-label">
@@ -143,6 +180,46 @@ export function PersonaForm({ agent, active = true, onSaved, onDone }) {
             </Select>
             <div className="text-[11px] text-muted-foreground/60">
               ตั้งค่าต่อ provider — สลับ provider แล้ว persona นี้จะจำโมเดลของแต่ละ provider แยกกัน
+            </div>
+          </div>
+          <div className="grid gap-1.5">
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-1.5 text-[13px] font-medium"><Terminal className="h-3.5 w-3.5 text-muted-foreground/60" /> Harness (วิธีคิดของ agent)</label>
+              {(() => {
+                const h = harnesses.find(x => x.id === form.harness)
+                if (!h || h.id === 'native' || h.id === 'custom') return null
+                return h.installed
+                  ? <Badge variant="green" className="text-[9px]">installed</Badge>
+                  : <Badge variant="dead" className="text-[9px]"><AlertCircle className="h-2.5 w-2.5" /> not found</Badge>
+              })()}
+            </div>
+            <Select value={form.harness} onValueChange={v => setForm({ ...form, harness: v })}>
+              <SelectTrigger data-testid="harness-select"><SelectValue placeholder="เลือก harness" /></SelectTrigger>
+              <SelectContent>
+                {harnesses.map(h => (
+                  <SelectItem key={h.id} value={h.id} data-testid={`harness-option-${h.id}`}>
+                    {h.label}{h.id !== 'native' && h.id !== 'custom' && h.installed === false ? ' — ยังไม่ติดตั้ง' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {form.harness === 'custom' && (
+              <Input
+                className="font-mono text-[12px]"
+                data-testid="harness-command"
+                value={form.harness_command}
+                placeholder={'my-agent --prompt-file {prompt_file} --role {role} --model {model}'}
+                onChange={e => setForm({ ...form, harness_command: e.target.value })}
+              />
+            )}
+            {form.harness !== 'native' && form.harness !== 'custom' && (() => {
+              const h = harnesses.find(x => x.id === form.harness)
+              return h?.command ? (
+                <div className="text-[11px] text-muted-foreground/60">คำสั่ง preset: <code className="rounded bg-secondary px-1 font-mono text-[10.5px]">{h.command}</code></div>
+              ) : null
+            })()}
+            <div className="text-[11px] leading-relaxed text-muted-foreground/60">
+              external harness ทำงานใน repo โดยตรงและ<b>ไม่คิดค่า token</b>ผ่าน platform — ต้องติดตั้ง CLI บนเครื่องก่อน ถ้าไม่พบคำสั่ง step จะ error (ไม่ fallback เงียบ ๆ)
             </div>
           </div>
           <div className="grid gap-1.5">
