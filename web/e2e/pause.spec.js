@@ -1,15 +1,15 @@
 const { test, expect } = require('@playwright/test')
 
-// Pause / resume — platform pause = docker stop + registry entry, resume revives.
-// Runs against real Docker via the orchestrator (:8000), same as features.spec.js.
+// Pause / resume — platform pause = kill the tmux session + registry entry; resume revives.
+// Runs against real host agents via the orchestrator (:8000), same as features.spec.js.
 test.describe('Pause / resume containers', () => {
   let containerName
 
   async function createContainer(page, name) {
     await page.goto('/')
-    await page.getByRole('button', { name: /New Container/ }).click()
+    await page.getByRole('button', { name: /New Agent/ }).click()
     await page.getByLabel('Name').fill(name)
-    await page.getByRole('button', { name: 'Create Container' }).click()
+    await page.getByRole('button', { name: 'Create Agent' }).click()
     await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 30000 })
     await expect(page.getByTestId('container-row').filter({ hasText: name })).toBeVisible({ timeout: 30000 })
     await page.getByTestId('container-row').filter({ hasText: name }).click()
@@ -23,8 +23,26 @@ test.describe('Pause / resume containers', () => {
     await expect(page.getByTestId('container-row').filter({ hasText: name })).toHaveCount(0, { timeout: 20000 })
   }
 
-  async function putConfig(page, request, body) {
-    const token = await page.evaluate(() => localStorage.getItem('aap_token') || '')
+  // Config changes go straight to the API (login like global-setup does) so
+  // they work from any page state — including the finally cleanup.
+  async function configToken(request) {
+    if (!process.env.ADMIN_PASSWORD) return ''
+    const res = await request.post('http://localhost:8000/auth/login', {
+      headers: { 'Content-Type': 'application/json' },
+      data: { username: process.env.ADMIN_USER || 'admin', password: process.env.ADMIN_PASSWORD },
+    })
+    return res.ok() ? (await res.json()).token : ''
+  }
+
+  async function getConfig(request) {
+    const token = await configToken(request)
+    return request.get('http://localhost:8000/config', {
+      headers: token ? { 'x-session-token': token } : {},
+    })
+  }
+
+  async function putConfig(request, body) {
+    const token = await configToken(request)
     return request.put('http://localhost:8000/config', {
       headers: { 'Content-Type': 'application/json', ...(token ? { 'x-session-token': token } : {}) },
       data: body,
@@ -58,9 +76,9 @@ test.describe('Pause / resume containers', () => {
     await page.getByRole('button', { name: 'Pause', exact: true }).click()
     await expect(page.getByTestId('status-badge')).toHaveText('Paused', { timeout: 20000 })
 
-    // Opening the shell auto-resumes the container (terminal_ws revives it)
+    // Opening the shell auto-resumes the agent (terminal_ws revives it)
     await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    const term = page.getByTestId('terminal')
+    const term = page.getByTestId('terminal').nth(1)
     await expect(term).toBeVisible({ timeout: 20000 })
     await term.click()
     await page.keyboard.type('echo back')
@@ -77,10 +95,10 @@ test.describe('Pause / resume containers', () => {
     containerName = `e2e-pause-auto-${Date.now()}`
 
     // Shorten the idle window for this test only; always restore afterwards
-    const before = await (await request.get('http://localhost:8000/config')).json()
+    const before = await (await getConfig(request)).json()
     const originalIdle = before.idle_timeout_secs || 900
     try {
-      await putConfig(page, request, { idle_timeout_secs: 60 })
+      await putConfig(request, { idle_timeout_secs: 60 })
       await createContainer(page, containerName)
 
       // No run involves role 'agent' → after ≤ ~2 idle windows + ticks the
@@ -91,7 +109,7 @@ test.describe('Pause / resume containers', () => {
       await page.getByRole('button', { name: 'Resume', exact: true }).click()
       await expect(page.getByTestId('status-badge')).toHaveText('Running', { timeout: 20000 })
     } finally {
-      await putConfig(page, request, { idle_timeout_secs: originalIdle })
+      await putConfig(request, { idle_timeout_secs: originalIdle })
       await deleteContainer(page, containerName)
     }
   })

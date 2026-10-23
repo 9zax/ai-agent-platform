@@ -28,6 +28,31 @@ module.exports = {
         sm: 'calc(var(--radius) - 4px)',
       },
       fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+      boxShadow: {
+        card: 'inset 0 1px 0 rgba(255,255,255,0.04), 0 24px 48px -32px rgba(0,0,0,0.9)',
+        lift: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 28px 56px -28px rgba(0,0,0,0.95)',
+        pop: '0 32px 80px -24px rgba(0,0,0,0.92), 0 0 0 1px rgba(255,255,255,0.04)',
+        glow: '0 0 0 1px rgba(139,92,246,0.35), 0 12px 40px -12px rgba(139,92,246,0.55)',
+      },
+      keyframes: {
+        'fade-up': {
+          from: { opacity: '0', transform: 'translateY(8px)' },
+          to: { opacity: '1', transform: 'translateY(0)' },
+        },
+        shimmer: {
+          '0%': { backgroundPosition: '200% 0' },
+          '100%': { backgroundPosition: '-200% 0' },
+        },
+        'pulse-soft': {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.45' },
+        },
+      },
+      animation: {
+        'fade-up': 'fade-up .35s cubic-bezier(.2,.7,.3,1) both',
+        shimmer: 'shimmer 1.6s linear infinite',
+        'pulse-soft': 'pulse-soft 2.4s ease-in-out infinite',
+      },
     },
   },
   plugins: [require('tailwindcss-animate')],

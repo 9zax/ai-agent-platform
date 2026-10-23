@@ -24,14 +24,17 @@ test.describe('Container detail', () => {
     await page.getByPlaceholder(/บอก AI ว่าต้องการอะไร/).fill('run tests')
     await expect(page.getByText('9 characters')).toBeVisible()
 
-    // Shell mode swaps it for a real interactive terminal (xterm.js over WebSocket)
+    // Shell mode swaps the Command Center box for a real interactive terminal
+    // (xterm.js over WebSocket); the Console tab also hosts one — scope to the
+    // Command Center's terminal (the taller Console-tab panel stays mounted)
     await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    await expect(page.getByTestId('terminal')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByTestId('terminal').nth(1)).toBeVisible({ timeout: 10000 })
     await expect(page.getByPlaceholder(/บอก AI ว่าต้องการอะไร/)).toHaveCount(0)
   })
 
   test('shows resource metrics', async ({ page }) => {
-    for (const metric of ['CPU', 'Memory', 'Disk', 'Network ↓', 'Network ↑']) {
+    // host mode: CPU/Memory have no cgroup numbers (render as "—"), Disk is real
+    for (const metric of ['CPU', 'Memory', 'Disk']) {
       await expect(page.getByTestId('metric').filter({ hasText: metric })).toBeVisible()
     }
   })

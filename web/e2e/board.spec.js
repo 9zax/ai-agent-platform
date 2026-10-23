@@ -1,4 +1,5 @@
 const { test, expect } = require('@playwright/test')
+const { authHeaders } = require('./lib/auth')
 
 const API = 'http://localhost:8000'
 const SEED_NAME = 'E2E Board Project'
@@ -10,18 +11,19 @@ test.describe('Board', () => {
 
   test.beforeEach(async ({ request }) => {
     // Clean leftovers from a previous aborted run, then seed a fresh no-run project
-    const res = await request.get(`${API}/projects`)
+    const res = await request.get(`${API}/projects`, { headers: authHeaders() })
     for (const p of await res.json()) {
-      if (p.name === SEED_NAME) await request.delete(`${API}/projects/${p.id}`)
+      if (p.name === SEED_NAME) await request.delete(`${API}/projects/${p.id}`, { headers: authHeaders() })
     }
     const created = await request.post(`${API}/projects`, {
+      headers: authHeaders(),
       data: { name: SEED_NAME, description: 'orchestrator board test' },
     })
     projectId = (await created.json()).id
   })
 
   test.afterEach(async ({ request }) => {
-    if (projectId) await request.delete(`${API}/projects/${projectId}`)
+    if (projectId) await request.delete(`${API}/projects/${projectId}`, { headers: authHeaders() })
   })
 
   test.beforeEach(async ({ page }) => {
@@ -41,7 +43,9 @@ test.describe('Board', () => {
   test('card count tracks the API even while other serial tests mutate projects', async ({ page }) => {
     await expect(async () => {
       const apiProjects = await page.evaluate(async () => {
-        const res = await fetch('http://localhost:8000/projects')
+        const res = await fetch('http://localhost:8000/projects', {
+          headers: { 'x-session-token': localStorage.getItem('aap_token') || '' },
+        })
         return res.json()
       })
       const domCards = await page.getByTestId('board-project-card').count()
@@ -52,8 +56,8 @@ test.describe('Board', () => {
   test('renders latest run with per-agent chips when the project has runs', async ({ page, request }) => {
     // Only assert against runs that already exist — creating one here is too heavy
     const [runs, projects] = await Promise.all([
-      request.get(`${API}/runs`).then(r => r.json()),
-      request.get(`${API}/projects`).then(r => r.json()),
+      request.get(`${API}/runs`, { headers: authHeaders() }).then(r => r.json()),
+      request.get(`${API}/projects`, { headers: authHeaders() }).then(r => r.json()),
     ])
     const withRuns = new Map(runs.map(r => [r.project_id, r]))
     const target = projects.find(p => withRuns.has(p.id))
@@ -63,12 +67,17 @@ test.describe('Board', () => {
     await expect(card.getByTestId('board-latest-run')).toBeVisible()
     await expect(card.getByTestId('board-run-status')).toBeVisible()
 
-    // Chip count tracks the latest run's steps (retry — runs mutate while polling)
+    // Chip count tracks the latest run's steps. Re-read the API on every try:
+    // a live mission keeps appending steps (and may spawn the next run), so a
+    // snapshot taken once would go stale while the card correctly moves on.
     await expect(async () => {
-      const latest = withRuns.get(target.id)
+      const current = await request.get(`${API}/runs`, { headers: authHeaders() }).then(r => r.json())
+      const latest = current
+        .filter(r => r.project_id === target.id)
+        .sort((a, b) => b.created_at - a.created_at)[0]
       const chips = await card.getByTestId('board-agent-chip').count()
       if (chips !== latest.steps.length) throw new Error(`chips: DOM ${chips} != API ${latest.steps.length}`)
-    }).toPass({ timeout: 15000 })
+    }).toPass({ timeout: 20000 })
   })
 
   test('search filters project cards', async ({ page }) => {

@@ -9,7 +9,7 @@ module.exports = defineConfig({
   globalSetup: './global-setup.js',
   timeout: 30_000,
   retries: 0,
-  // Tests share real Docker/task state (create/delete containers, tasks) —
+  // Tests share real agent/task state (create/delete sessions, tasks) —
   // run serially to avoid cross-file races on the shared backend
   workers: 1,
   reporter: [['list']],

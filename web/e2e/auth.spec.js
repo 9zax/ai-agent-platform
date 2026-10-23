@@ -13,18 +13,31 @@ test.describe('Auth gate', () => {
     expect(await res.json()).toMatchObject({ detail: 'Login required' })
   })
 
-  test('unauthenticated UI redirects container actions to /login', async ({ page, request }) => {
-    test.skip(!(await (await request.get(`${API}/config`)).json()).auth_required, 'auth disabled')
+  test('backend rejects data reads without a session (protected mode)', async ({ request }) => {
+    for (const path of ['/containers', '/runs', '/runs/run-001', '/projects', '/projects/p-001', '/agents', '/skills', '/tasks', '/connectors']) {
+      const res = await request.get(`${API}${path}`)
+      expect(res.status(), `GET ${path} without a session`).toBe(401)
+    }
+  })
+
+  test('unauthenticated UI shows only the locked screen', async ({ page, request }) => {
+    const authRequired = (await (await request.get(`${API}/auth/me`)).json()).auth_required
+    test.skip(!authRequired, 'auth disabled')
 
     await page.goto('/containers/agent-dev-be')
-    await expect(page.getByTestId('status-badge')).toBeVisible()
-    await page.getByRole('button', { name: 'Stop', exact: true }).click()
+    const locked = page.getByTestId('auth-locked')
+    await expect(locked).toBeVisible({ timeout: 15000 })
+    // nothing beyond the gate: no sidebar nav, no page content
+    await expect(page.getByRole('link', { name: 'Dashboard' })).toHaveCount(0)
+    await expect(page.getByTestId('status-badge')).toHaveCount(0)
+    await locked.getByTestId('auth-locked-signin').click()
     await expect(page).toHaveURL(/\/login/, { timeout: 10000 })
     await expect(page.getByTestId('login-form')).toBeVisible()
   })
 
   test('login with valid credentials restores access', async ({ page, request }) => {
-    test.skip(!(await (await request.get(`${API}/config`)).json()).auth_required, 'auth disabled')
+    const authRequired = (await (await request.get(`${API}/auth/me`)).json()).auth_required
+    test.skip(!authRequired, 'auth disabled')
 
     await page.goto('/login')
     await page.getByLabel('Username').fill(process.env.ADMIN_USER || 'admin')

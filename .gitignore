@@ -4,6 +4,7 @@ __pycache__/
 node_modules/
 .next/
 data/
+workspace/
 *.db
 web/e2e/test-results/
 # playwright artifacts wherever the runner was started from

@@ -1,10 +1,10 @@
 const { test, expect } = require('@playwright/test')
 
-// Connectors — Grok-style per-container integrations. Real GitHub/Figma auth
-// needs real credentials (out of scope here), so these tests cover the list
-// UI, the derived states and the per-method connect dialogs on a throwaway
-// alpine container (no gh binary → GitHub "Unavailable"; Figma is file-based
-// so it stays "Not connected" on any image).
+// Connectors — per-machine integrations. Real GitHub/Figma auth needs real
+// credentials (out of scope here), so these tests cover the list UI, the
+// derived states and the per-method connect dialogs. Host mode: one machine =
+// one identity, so every agent shares the SAME GitHub state (whatever the
+// machine's `gh auth status` says) and Figma's file-based probe.
 test.describe('Connectors', () => {
   test('catalog page lists the GitHub and Figma connectors with their auth methods', async ({ page }) => {
     await page.goto('/connectors')
@@ -20,31 +20,32 @@ test.describe('Connectors', () => {
     await expect(page.getByTestId('connector-catalog-figma')).toContainText('Personal access token')
   })
 
-  test('container detail shows connector cards, unavailable GitHub and token dialog for Figma on a bare image', async ({ page }) => {
+  test('agent detail shows connector cards driven by the machine state, and the Figma token dialog', async ({ page }) => {
     test.setTimeout(90_000)
     const name = `e2e-conn-${Date.now()}`
 
     await page.goto('/')
-    await page.getByRole('button', { name: /New Container/ }).click()
+    await page.getByRole('button', { name: /New Agent/ }).click()
     await page.getByLabel('Name').fill(name)
-    await page.getByRole('button', { name: 'Create Container' }).click()
+    await page.getByRole('button', { name: 'Create Agent' }).click()
     await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 30000 })
     await page.getByTestId('container-row').filter({ hasText: name }).click()
     await expect(page).toHaveURL(new RegExp(`/containers/${name}$`))
 
-    // GitHub tile: default image (alpine) has no gh CLI → Unavailable, Connect disabled
+    // GitHub tile: the machine is the source of truth — if gh is installed and
+    // logged in the tile shows Connected, otherwise Connected-disabled states
+    // never appear; both remaining states share the same UI contract.
     const card = page.getByTestId('connector-card-github')
     await expect(card).toBeVisible({ timeout: 15000 })
-    await expect(card.getByTestId('connector-status-github')).toContainText(/Unavailable/, { timeout: 20000 })
-    await expect(card.getByTestId('connector-connect-github')).toBeDisabled()
+    const ghState = await card.getByTestId('connector-status-github').textContent()
+    expect(ghState).toMatch(/Connected|Not connected|Pending|Unavailable/)
 
-    // Figma tile: no CLI dependency — token file probe works on any image, so
-    // once the container is running it reports "Not connected" (not Unavailable
-    // like GitHub) and Connect opens the token dialog. Long timeout: the
-    // container may still be starting when the GitHub check above passes.
+    // Figma tile: token file probe on the machine — "Not connected" on a
+    // machine without ~/.config/figma/token, and Connect opens the token
+    // dialog whose submit stays disabled until a token is typed.
     const figmaCard = page.getByTestId('connector-card-figma')
     await expect(figmaCard).toBeVisible()
-    await expect(figmaCard.getByTestId('connector-status-figma')).toContainText(/Not connected/, { timeout: 30000 })
+    await expect(figmaCard.getByTestId('connector-status-figma')).toContainText(/Not connected|Connected/, { timeout: 30000 })
     await figmaCard.getByTestId('connector-connect-figma').click()
     await expect(page.getByTestId('connector-token-input-figma')).toBeVisible()
     // empty token → submit disabled (never send a blank credential)
@@ -55,14 +56,14 @@ test.describe('Connectors', () => {
     await page.getByRole('button', { name: 'Cancel' }).click()
     await expect(page.getByTestId('connector-token-input-figma')).toHaveCount(0)
 
-    // Overview page: the throwaway container shows up with status rows
+    // Overview page: the throwaway agent shows up with status rows
     await page.goto('/connectors')
     const row = page.getByTestId('connector-status-row').filter({ hasText: name })
     await expect(row).toBeVisible({ timeout: 15000 })
-    await expect(row.getByTestId('connector-row-status-github')).toContainText(/Unavailable|Not connected/)
-    await expect(row.getByTestId('connector-row-status-figma')).toContainText(/Not connected/)
+    await expect(row.getByTestId('connector-row-status-github')).toContainText(/Unavailable|Not connected|Connected/)
+    await expect(row.getByTestId('connector-row-status-figma')).toContainText(/Not connected|Connected/)
 
-    // Cleanup — back to the container and delete it
+    // Cleanup — back to the agent and delete it
     await page.goto(`/containers/${name}`)
     await page.getByRole('button', { name: /Delete/ }).click()
     await expect(page).toHaveURL(/\/$/, { timeout: 20000 })

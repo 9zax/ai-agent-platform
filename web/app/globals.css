@@ -4,36 +4,329 @@
 
 @layer base {
   :root {
-    --background: 216 33% 6%;
-    --foreground: 214 32% 91%;
-    --card: 219 38% 11%;
-    --card-foreground: 214 32% 91%;
-    --popover: 219 38% 9%;
-    --popover-foreground: 214 32% 91%;
-    --primary: 252 96% 67%;
+    --background: 222 47% 4.5%;
+    --foreground: 213 31% 93%;
+    --card: 222 36% 8%;
+    --card-foreground: 213 31% 93%;
+    --popover: 222 38% 9%;
+    --popover-foreground: 213 31% 93%;
+    --primary: 255 92% 69%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 218 26% 15%;
-    --secondary-foreground: 214 32% 91%;
-    --muted: 217 22% 16%;
-    --muted-foreground: 214 15% 60%;
-    --accent: 252 96% 67%;
+    --secondary: 220 25% 13%;
+    --secondary-foreground: 213 31% 93%;
+    --muted: 220 23% 14%;
+    --muted-foreground: 217 14% 64%;
+    --accent: 255 92% 69%;
     --accent-foreground: 0 0% 100%;
-    --destructive: 0 84% 60%;
+    --destructive: 0 72% 58%;
     --destructive-foreground: 0 0% 100%;
-    --border: 217 27% 17%;
-    --input: 217 27% 17%;
-    --ring: 252 96% 67%;
-    --radius: 0.75rem;
+    --border: 220 24% 15.5%;
+    --input: 220 24% 17%;
+    --ring: 255 92% 69%;
+    --radius: 0.875rem;
   }
 
   * {
     @apply border-border;
   }
 
+  html {
+    -webkit-text-size-adjust: 100%;
+    color-scheme: dark;
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    letter-spacing: -0.011em;
+    background-image:
+      radial-gradient(920px 520px at 8% -12%, rgba(139, 92, 246, 0.13), transparent 62%),
+      radial-gradient(780px 460px at 102% -6%, rgba(56, 189, 248, 0.06), transparent 62%);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: rgba(139, 92, 246, 0.32);
+    color: #fff;
+  }
+
+  :focus-visible {
+    outline: none;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background: hsl(var(--border));
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: hsl(220 18% 30%);
+    background-clip: content-box;
+  }
+
+  h1, h2, h3, h4 {
+    letter-spacing: -0.022em;
+  }
+
+  /* Dark native controls (select popups, date pickers) */
+  input, textarea, select {
+    color-scheme: dark;
   }
 }
+
+@layer components {
+  /* Shared page chrome — keeps headers and content rhythm identical page to page */
+  .page-header {
+    @apply flex flex-wrap items-start justify-between gap-4 px-8 pb-6 pt-8;
+  }
+
+  .page-body {
+    @apply px-8 pb-10;
+  }
+
+  .page-title {
+    @apply text-[22px] font-semibold leading-tight tracking-[-0.025em] text-white;
+  }
+
+  .page-subtitle {
+    @apply mt-1 max-w-2xl text-[12.5px] leading-relaxed text-muted-foreground;
+  }
+
+  .icon-tile {
+    @apply flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/[0.08] bg-white/[0.035] text-primary;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 20px -14px rgba(0, 0, 0, 0.9);
+  }
+
+  .section-label {
+    @apply px-3 pb-2 pt-5 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground/45;
+  }
+
+  .panel {
+    @apply rounded-2xl border border-white/[0.06] bg-card/80 shadow-card;
+  }
+
+  .stat-card {
+    @apply relative overflow-hidden rounded-2xl border border-white/[0.06] bg-card/80 p-5 shadow-card transition-all duration-200;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(260px 130px at 100% 0%, rgba(139, 92, 246, 0.10), transparent 70%);
+  }
+
+  .stat-card:hover {
+    @apply -translate-y-0.5 border-white/[0.1] shadow-lift;
+  }
+
+  .field-label {
+    @apply text-[12.5px] font-medium text-foreground/80;
+  }
+
+  .field-hint {
+    @apply text-[11.5px] leading-relaxed text-muted-foreground/60;
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.04) 25%, rgba(255, 255, 255, 0.09) 37%, rgba(255, 255, 255, 0.04) 63%);
+    background-size: 400% 100%;
+    animation: shimmer 1.6s linear infinite;
+    @apply rounded-lg;
+  }
+
+  .hairline {
+    @apply h-px w-full bg-gradient-to-r from-transparent via-white/[0.09] to-transparent;
+  }
+}
+
+/* ---------- Markdown documents (project docs viewer + preview) ---------- */
+.doc-prose {
+  color: hsl(var(--foreground) / 0.9);
+  font-size: 13.5px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.doc-prose > :first-child {
+  margin-top: 0;
+}
+
+.doc-prose h1 {
+  margin: 1.4em 0 0.6em;
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.25;
+  color: #fff;
+  letter-spacing: -0.025em;
+}
+
+.doc-prose h2 {
+  margin: 1.6em 0 0.55em;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid hsl(var(--border) / 0.65);
+  font-size: 16px;
+  font-weight: 650;
+  color: #fff;
+  letter-spacing: -0.018em;
+}
+
+.doc-prose h3 {
+  margin: 1.3em 0 0.45em;
+  font-size: 14px;
+  font-weight: 650;
+  color: hsl(var(--foreground) / 0.95);
+}
+
+.doc-prose h4 {
+  margin: 1.2em 0 0.4em;
+  font-size: 13px;
+  font-weight: 650;
+  color: hsl(var(--foreground) / 0.9);
+}
+
+.doc-prose p {
+  margin: 0.7em 0;
+}
+
+.doc-prose a {
+  color: hsl(var(--primary));
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: hsl(var(--primary) / 0.35);
+  text-underline-offset: 3px;
+}
+
+.doc-prose a:hover {
+  text-decoration-color: hsl(var(--primary));
+}
+
+.doc-prose strong {
+  color: #fff;
+  font-weight: 650;
+}
+
+.doc-prose ul,
+.doc-prose ol {
+  margin: 0.65em 0;
+  padding-left: 1.35em;
+}
+
+.doc-prose ul {
+  list-style: disc;
+}
+
+.doc-prose ol {
+  list-style: decimal;
+}
+
+.doc-prose li {
+  margin: 0.28em 0;
+  padding-left: 0.15em;
+}
+
+.doc-prose li::marker {
+  color: hsl(var(--primary) / 0.8);
+}
+
+.doc-prose ol li::marker {
+  color: hsl(var(--muted-foreground));
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-prose blockquote {
+  margin: 1em 0;
+  padding: 0.2em 0 0.2em 1em;
+  border-left: 2px solid hsl(var(--primary) / 0.5);
+  color: hsl(var(--muted-foreground));
+}
+
+.doc-prose code {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.045);
+  padding: 0.12em 0.38em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  color: #c4b5fd;
+}
+
+.doc-prose pre {
+  margin: 1em 0;
+  overflow-x: auto;
+  border: 1px solid hsl(var(--border));
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.32);
+  padding: 14px 16px;
+  line-height: 1.6;
+}
+
+.doc-prose pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: hsl(var(--foreground) / 0.85);
+  font-size: 12px;
+}
+
+.doc-prose table {
+  margin: 1em 0;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 12.5px;
+}
+
+.doc-prose th {
+  background: rgba(255, 255, 255, 0.035);
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  color: hsl(var(--foreground) / 0.8);
+}
+
+.doc-prose td {
+  border-top: 1px solid hsl(var(--border) / 0.7);
+  padding: 8px 12px;
+}
+
+.doc-prose tr:hover td {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.doc-prose hr {
+  margin: 1.6em 0;
+  border: 0;
+  border-top: 1px solid hsl(var(--border));
+}
+
+.doc-prose img {
+  max-width: 100%;
+  border-radius: 10px;
+  border: 1px solid hsl(var(--border));
+}
+
+/* ---------- Animations ---------- */
 
 /* A step bounced back from a meeting — soft rose pulse while the deliverable
    is being redone (paired with the dashed rose revert edge on the flow canvas). */
@@ -63,3 +356,9 @@
   to { opacity: 1; transform: translateX(0); }
 }
 .toast-in { animation: toast-in .3s ease-out both; }
+
+@keyframes ping-soft {
+  0% { transform: scale(1); opacity: .55; }
+  70%, 100% { transform: scale(2.1); opacity: 0; }
+}
+.ping-soft { animation: ping-soft 2s cubic-bezier(0, 0, 0.2, 1) infinite; }

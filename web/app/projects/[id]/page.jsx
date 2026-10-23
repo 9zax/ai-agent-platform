@@ -8,21 +8,27 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { marked } from 'marked'
-import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, Rocket, MonitorPlay } from 'lucide-react'
+import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, MonitorPlay, RotateCcw, Wallet, AlertTriangle, CalendarClock, Play, Pencil, Trash2, ShieldCheck, X, Target } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Textarea } from '@/components/ui/textarea'
+import { Input } from '@/components/ui/input'
+import { Progress } from '@/components/ui/progress'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { AgentDetail } from '@/components/agent-detail'
+import { ProjectDocs } from '@/components/project-docs'
+import PageHeader from '@/components/page-header'
 import { fmtClock, stepKey } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 // Tail-stage steps (after QA verifies): icon + label chip shown next to the title.
+// (deploy/staging removed with docker — the tail is now PR → demo)
 const STEP_KIND_META = {
   pr: { icon: GitPullRequest, label: 'Pull Request', cls: 'bg-sky-500/10 text-sky-300' },
-  deploy: { icon: Rocket, label: 'Deploy staging', cls: 'bg-orange-500/10 text-orange-300' },
   demo: { icon: MonitorPlay, label: 'Acceptance demo', cls: 'bg-violet-500/10 text-violet-300' },
 }
 
@@ -130,6 +136,7 @@ function StepStatusIcon({ status }) {
   if (status === 'done') return <CheckCircle2 className="h-4 w-4 text-emerald-400" />
   if (status === 'error') return <XCircle className="h-4 w-4 text-red-400" />
   if (status === 'skipped') return <PauseCircle className="h-4 w-4 text-muted-foreground/60" />
+  if (status === 'stopped') return <Square className="h-3.5 w-3.5 text-muted-foreground/60" />
   return <Clock className="h-4 w-4 text-muted-foreground/50" />
 }
 
@@ -205,9 +212,23 @@ function TypingRow({ label, tone = 'amber', revert = false }) {
 function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending }) {
   const scrollRef = useRef(null)
   const [reply, setReply] = useState('')
+  // Local lock: replySending is shared across threads and only flips after the
+  // parent re-renders — Enter spam before that used to fire the same reply twice.
+  const sendingRef = useRef(false)
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [d.messages.length, d.answering, d.status])
+
+  async function submitReply(e) {
+    e.preventDefault()
+    const text = reply.trim()
+    if (!text || sendingRef.current) return
+    sendingRef.current = true
+    const ok = await onReply(d.id, text)
+    // Keep the draft when the send failed — losing a long answer to a blip hurts.
+    if (ok) setReply('')
+    sendingRef.current = false
+  }
 
   const isDemo = d.kind === 'demo'
   const asker = stepByRole[d.from]?.name || d.from
@@ -233,7 +254,7 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
           ? <MonitorPlay className="h-3.5 w-3.5 shrink-0 text-violet-300" />
           : <MessageCircle className={`h-3.5 w-3.5 shrink-0 ${d.status === 'need_human' ? 'text-rose-400' : 'text-amber-400'}`} />}
         <span className={`text-[12.5px] font-semibold ${isDemo ? 'text-violet-200' : 'text-amber-200'}`}>
-          {isDemo ? 'Acceptance Demo — QA แสดงหลักฐาน · Dev ส่งมอบ PR/Deploy · PO ตรวจรับ' : `${asker} ถาม → ${addressees}`}
+          {isDemo ? 'Acceptance Demo — QA แสดงหลักฐาน · Dev ส่งมอบ PR · PO ตรวจรับ' : `${asker} ถาม → ${addressees}`}
         </span>
         <Badge variant={d.status === 'resolved' ? 'running' : d.status === 'need_human' ? 'dead' : 'purple'} className="text-[9.5px]">
           {d.status === 'resolved' ? (isDemo ? 'ตรวจรับเสร็จ' : 'resolved') : d.status === 'need_human' ? '⏸ รอคุณตอบ' : d.status === 'answering' ? (isDemo ? 'กำลัง demo' : 'กำลังคุยกัน') : 'รอเปิดประชุม'}
@@ -251,14 +272,14 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
         <form
           className="flex gap-2 border-t border-rose-400/25 px-3.5 py-2.5"
           data-testid="human-reply"
-          onSubmit={e => { e.preventDefault(); if (!reply.trim()) return; onReply(d.id, reply.trim()) ; setReply('') }}
+          onSubmit={submitReply}
         >
           <Textarea
             className="min-h-[38px] flex-1 text-[12px]"
             placeholder="พิมพ์คำตอบถึงทีม…"
             value={reply}
             onChange={e => setReply(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form?.requestSubmit() } }}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sendingRef.current) e.target.form?.requestSubmit() } }}
           />
           <Button type="submit" size="sm" disabled={replySending || !reply.trim()} className="h-fit">
             {replySending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />} ตอบ
@@ -273,7 +294,7 @@ function initials(name) {
   return (name || '?').split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase()
 }
 
-// Chip for a tail-stage step kind (pr/deploy/demo) next to the step title.
+// Chip for a tail-stage step kind (pr/demo) next to the step title.
 function StepKindBadge({ kind }) {
   const meta = STEP_KIND_META[kind]
   if (!meta) return null
@@ -282,6 +303,308 @@ function StepKindBadge({ kind }) {
     <span className={`ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9.5px] font-semibold ${meta.cls}`}>
       <Icon className="h-3 w-3" /> {meta.label}
     </span>
+  )
+}
+
+function fmtUsd(v) {
+  const n = Number(v || 0)
+  if (!n) return '$0.00'
+  return n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`
+}
+
+function fmtTok(n) {
+  const v = Number(n || 0)
+  return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)
+}
+
+// Pre-push diff review: the human sees exactly what will be pushed and can send
+// it back to Dev once with a comment (a second reject skips the PR entirely).
+function ReviewCard({ run, onDecide, deciding }) {
+  const [comment, setComment] = useState('')
+  const rv = run.review
+  if (!rv) return null
+  const pending = rv.status === 'pending'
+  const tone = rv.status === 'approved' ? 'border-emerald-500/40 bg-emerald-500/5'
+    : pending ? 'border-sky-500/40 bg-sky-500/5'
+    : 'border-rose-500/40 bg-rose-500/5'
+  return (
+    <div className={`mb-3 rounded-xl border p-3.5 ${tone}`} data-testid="review-card" data-status={rv.status}>
+      <div className="flex flex-wrap items-center gap-2">
+        <ShieldCheck className="h-4 w-4 text-sky-300" />
+        <span className="text-[12.5px] font-bold text-sky-200">Diff review — ก่อน push/PR</span>
+        <Badge variant={pending ? 'created' : rv.status === 'approved' ? 'running' : 'dead'} className="text-[9.5px]">
+          {pending ? 'รอคุณอนุมัติ' : rv.status === 'approved' ? 'approved' : rv.status === 'timed_out' ? 'timed out — ข้าม PR' : 'rejected'}
+        </Badge>
+        {rv.files?.length > 0 && <span className="text-[11px] text-muted-foreground/60">{rv.files.length} ไฟล์</span>}
+      </div>
+      {rv.files?.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {rv.files.map(f => <code key={f} className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10.5px] text-sky-200/80">{f}</code>)}
+        </div>
+      )}
+      {rv.diff && (
+        <div className="mt-2 max-h-[260px] overflow-auto rounded-lg border border-white/[0.06] bg-black/40 p-2.5">
+          <pre className="whitespace-pre font-mono text-[10.5px] leading-relaxed text-foreground/75">{rv.diff}</pre>
+        </div>
+      )}
+      {pending && (
+        <div className="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+          <Input
+            className="h-8 flex-1 text-[12px]"
+            placeholder="เหตุผลที่ตีกลับ (ถ้าจะให้ Dev แก้)…"
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            data-testid="review-comment"
+          />
+          <div className="flex items-center gap-1.5">
+            <Button size="sm" onClick={() => onDecide('approve', comment.trim())} disabled={deciding} data-testid="review-approve" className="h-8">
+              {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Approve
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => onDecide('reject', comment.trim())} disabled={deciding || !comment.trim()} data-testid="review-reject" className="h-8 border-rose-400/40 text-rose-300 hover:bg-rose-500/10 hover:text-rose-200">
+              <X className="h-3.5 w-3.5" /> Reject
+            </Button>
+          </div>
+        </div>
+      )}
+      {!pending && rv.comment && <div className="mt-2 text-[11.5px] text-muted-foreground/70">คอมเมนต์: {rv.comment}</div>}
+    </div>
+  )
+}
+
+// Budget overrun is a pause, not a kill: the run waits for an explicit new
+// ceiling. A normal chat reply deliberately cannot raise it.
+function BudgetCard({ d, run, onRaise, onStop, busy }) {
+  const [amount, setAmount] = useState('')
+  const open = d.status === 'need_human'
+  const cost = run.cost_usd || 0
+  return (
+    <div className={`rounded-xl border p-3.5 ${open ? 'border-amber-400/60 bg-amber-500/[0.06]' : 'border-white/[0.08] bg-white/[0.02]'}`} data-testid="budget-card" data-status={d.status}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Wallet className="h-4 w-4 text-amber-300" />
+        <span className="text-[12.5px] font-bold text-amber-200">Budget guardrail</span>
+        <Badge variant={open ? 'yellow' : 'running'} className="text-[9.5px]">{open ? '⏸ ใช้งบครบ — รออนุมัติ' : d.status}</Badge>
+      </div>
+      <div className="mt-1.5 text-[12px] text-muted-foreground/80">
+        ใช้ไป <strong className="text-foreground">{fmtUsd(cost)}</strong> จากเพดาน <strong className="text-foreground">{fmtUsd(run.budget_usd)}</strong>
+        {' · '}{fmtTok((run.input_tokens || 0) + (run.output_tokens || 0))} tokens
+      </div>
+      {open && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <Input type="number" min="0" step="0.5" className="h-8 w-36 text-[12px]" placeholder="เพดานใหม่ (USD)" value={amount} onChange={e => setAmount(e.target.value)} data-testid="budget-amount" />
+          <Button size="sm" className="h-8" disabled={busy || !(Number(amount) > cost)} onClick={() => onRaise(Number(amount))} data-testid="budget-raise">
+            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />} เพิ่มงบ
+          </Button>
+          <Button size="sm" variant="outline" className="h-8 border-red-500/40 text-rose-300 hover:bg-red-500/10 hover:text-rose-200" disabled={busy} onClick={onStop}>
+            <Square className="h-3.5 w-3.5 fill-current" /> หยุด run
+          </Button>
+          <span className="text-[10.5px] text-muted-foreground/50">ตอบแชทปกติไม่เพิ่มงบ — ต้องกดปุ่มนี้เท่านั้น</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const EMPTY_ROUTINE = { name: '', task: '', cron: '0 9 * * 1-5', loop_mode: false, enabled: true }
+
+function fmtWhen(secs) {
+  if (!secs) return '—'
+  return new Date(secs * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+// Scheduled missions for this project (5-field cron, local time).
+function RoutinesTab({ projectId, onRunStarted }) {
+  const [routines, setRoutines] = useState(null)
+  const [error, setError] = useState('')
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [form, setForm] = useState(EMPTY_ROUTINE)
+  const [saving, setSaving] = useState(false)
+  const [runningId, setRunningId] = useState(null)
+
+  const load = useCallback(() => {
+    authFetch(`${API}/projects/${projectId}/routines`).then(async r => {
+      const d = await r.json()
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`)
+      return d
+    })
+      .then(d => setRoutines(Array.isArray(d) ? d : []))
+      .catch(err => { setRoutines([]); setError(err.message) })
+  }, [projectId])
+  useEffect(() => { load() }, [load])
+
+  function openCreate() {
+    setEditing(null)
+    setForm(EMPTY_ROUTINE)
+    setError('')
+    setDialogOpen(true)
+  }
+
+  function openEdit(r) {
+    setEditing(r)
+    setForm({ name: r.name, task: r.task, cron: r.cron, loop_mode: !!r.loop_mode, enabled: !!r.enabled })
+    setError('')
+    setDialogOpen(true)
+  }
+
+  async function save(e) {
+    e.preventDefault()
+    if (!form.name.trim() || !form.task.trim() || !form.cron.trim()) return setError('กรอกชื่อ งาน และ cron ให้ครบ')
+    setSaving(true)
+    setError('')
+    try {
+      const res = await authFetch(editing ? `${API}/routines/${editing.id}` : `${API}/projects/${projectId}/routines`, {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setDialogOpen(false)
+      load()
+    } catch (err) {
+      setError(err.message)
+    }
+    setSaving(false)
+  }
+
+  async function toggle(r) {
+    setError('')
+    const res = await authFetch(`${API}/routines/${r.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !r.enabled }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `HTTP ${res.status}`)
+    }
+    load()
+  }
+
+  async function runNow(r) {
+    setRunningId(r.id)
+    setError('')
+    try {
+      const res = await authFetch(`${API}/routines/${r.id}/run`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      // Adopt the spawned run so Mission Control shows it immediately —
+      // otherwise "Run now" silently starts work the user cannot see.
+      if (data && data.id) onRunStarted?.(data)
+      load()
+    } catch (err) {
+      setError(err.message)
+    }
+    setRunningId(null)
+  }
+
+  async function remove(r) {
+    setError('')
+    const res = await authFetch(`${API}/routines/${r.id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      setError(data.detail || `HTTP ${res.status}`)
+    }
+    load()
+  }
+
+  return (
+    <div data-testid="project-routines" className="flex flex-col gap-4">
+      <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+        <div>
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold text-white">
+            <CalendarClock className="h-4 w-4 text-primary" /> Scheduled routines
+          </div>
+          <div className="mt-1 text-[11.5px] text-muted-foreground/60">
+            สั่งงานทีมซ้ำตามเวลา (cron 5 ช่อง, เวลาท้องถิ่น) — ถ้าโปรเจกต์กำลังมี run อยู่ รอบนั้นจะถูก skip
+          </div>
+        </div>
+        <Button size="sm" onClick={openCreate} data-testid="routine-new"><Plus className="h-3.5 w-3.5" /> New routine</Button>
+      </Card>
+
+      {error && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12px] text-red-300">{error}</div>}
+
+      {routines === null ? (
+        <div className="text-[12px] text-muted-foreground/60">Loading routines…</div>
+      ) : routines.length === 0 ? (
+        <Card className="px-5 py-10 text-center text-[12.5px] text-muted-foreground/60" data-testid="routines-empty">
+          ยังไม่มี routine — สร้างเพื่อให้ทีมทำงานซ้ำอัตโนมัติ เช่น สรุปงานทุกเช้าวันจันทร์
+        </Card>
+      ) : (
+        <div className="flex flex-col gap-2.5">
+          {routines.map(r => (
+            <Card key={r.id} className="p-4" data-testid="routine-row" data-enabled={r.enabled ? '1' : '0'}>
+              <div className="flex flex-wrap items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[13px] font-semibold text-white">{r.name}</span>
+                    <code className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10.5px] text-amber-200/80">{r.cron}</code>
+                    {r.loop_mode && <Badge variant="purple" className="text-[9.5px]"><Repeat className="h-2.5 w-2.5" /> loop</Badge>}
+                    <Badge variant={r.enabled ? 'running' : 'gray'} className="text-[9.5px]">{r.enabled ? 'enabled' : 'paused'}</Badge>
+                  </div>
+                  <div className="mt-1 truncate text-[12px] text-muted-foreground/75">{r.task}</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground/50">
+                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> next: {r.enabled ? fmtWhen(r.next_run_at) : '—'}</span>
+                    <span>last: {r.last_run_at ? fmtWhen(r.last_run_at) : 'never'}{r.last_result ? ` · ${r.last_result}` : ''}</span>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button size="sm" variant="outline" className="h-7 gap-1.5 text-[11.5px]" onClick={() => runNow(r)} disabled={runningId === r.id} data-testid="routine-run">
+                    {runningId === r.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />} Run now
+                  </Button>
+                  <Button size="sm" variant="outline" className="h-7 text-[11.5px]" onClick={() => toggle(r)} data-testid="routine-toggle">
+                    {r.enabled ? 'Pause' : 'Enable'}
+                  </Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground/50 hover:text-foreground" onClick={() => openEdit(r)} aria-label="Edit routine"><Pencil className="h-3.5 w-3.5" /></Button>
+                  <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground/40 hover:bg-red-500/10 hover:text-red-400" onClick={() => remove(r)} aria-label="Delete routine"><Trash2 className="h-3.5 w-3.5" /></Button>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>{editing ? `Edit — ${editing.name}` : 'Routine ใหม่'}</DialogTitle>
+            <DialogDescription>5-field cron: นาที ชั่วโมง วัน-ใน-เดือน เดือน วัน-ใน-สัปดาห์ · รองรับ * , - และ */n</DialogDescription>
+          </DialogHeader>
+          <form onSubmit={save} className="grid gap-3.5">
+            <div className="grid gap-1.5">
+              <label className="field-label">ชื่อ routine</label>
+              <Input value={form.name} placeholder="เช่น Morning triage" onChange={e => setForm({ ...form, name: e.target.value })} data-testid="routine-name" />
+            </div>
+            <div className="grid gap-1.5">
+              <label className="field-label">งานที่สั่งทีม</label>
+              <Textarea className="min-h-[90px] text-[12.5px]" value={form.task} placeholder="เช่น ตรวจ issue ใหม่, สรุปความคืบหน้า และอัปเดต CHANGELOG" onChange={e => setForm({ ...form, task: e.target.value })} data-testid="routine-task" />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+              <div className="grid gap-1.5">
+                <label className="field-label">Cron</label>
+                <Input className="font-mono text-[12.5px]" value={form.cron} onChange={e => setForm({ ...form, cron: e.target.value })} data-testid="routine-cron" />
+                <span className="text-[10.5px] text-muted-foreground/50">ตัวอย่าง: <code className="font-mono">0 9 * * 1-5</code> = 09:00 ทุกวันจันทร์–ศุกร์</span>
+              </div>
+              <div className="flex flex-col justify-end gap-2 pb-1">
+                <label className="flex cursor-pointer items-center gap-2 text-[12px] text-muted-foreground">
+                  <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} />
+                  Enabled
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 text-[12px] text-muted-foreground">
+                  <input type="checkbox" className="h-3.5 w-3.5 accent-primary" checked={form.loop_mode} onChange={e => setForm({ ...form, loop_mode: e.target.checked })} />
+                  Loop mode
+                </label>
+              </div>
+            </div>
+            {error && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12px] text-red-300" data-testid="routine-error">{error}</div>}
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+              <Button type="submit" disabled={saving} data-testid="routine-save">{saving ? 'Saving…' : 'Save routine'}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </div>
   )
 }
 
@@ -298,6 +621,9 @@ export default function ProjectFlow() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
+  const [goal, setGoal] = useState('')
+  const [budgetUsd, setBudgetUsd] = useState('')
+  const [alertPct, setAlertPct] = useState('80')
 
   // Team run state
   const [task, setTask] = useState('')
@@ -307,7 +633,13 @@ export default function ProjectFlow() {
   const [collapsed, setCollapsed] = useState({})
   const [loopMode, setLoopMode] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [retrying, setRetrying] = useState(false)
+  const [retryingStep, setRetryingStep] = useState(null)
   const [replySending, setReplySending] = useState(false)
+  const [reviewDeciding, setReviewDeciding] = useState(false)
+  const [budgetBusy, setBudgetBusy] = useState(false)
+  const [openComments, setOpenComments] = useState(0)
+  const [tab, setTab] = useState('mission')
   const outputRef = useRef(null)
 
   // Click a node in the chart → live activity + work history of that agent
@@ -318,11 +650,23 @@ export default function ProjectFlow() {
     authFetch(`${API}/agents`).then(r => r.json()).then(setPersonas).catch(() => {})
   }
 
+  // Open doc comments across the project — badge on the Docs tab.
+  const refreshOpenComments = useCallback(() => {
+    authFetch(`${API}/projects/${id}/docs`).then(r => r.json()).then(list => {
+      if (Array.isArray(list)) setOpenComments(list.reduce((n, d) => n + (d.open_comments || 0), 0))
+    }).catch(() => {})
+  }, [id])
+
+  useEffect(() => { refreshOpenComments() }, [refreshOpenComments])
+
   useEffect(() => {
     authFetch(`${API}/projects/${id}`).then(r => r.json()).then(p => {
       if (p.detail) { setError(p.detail); return }
       setProject(p)
       setRepoUrl(p.repo_url || '')
+      setGoal(p.goal || '')
+      setBudgetUsd(p.budget_usd ? String(p.budget_usd) : '')
+      setAlertPct(String(p.budget_alert_pct ?? 80))
       const initial = (p.agents || []).map((role, i) => ({
         id: role,
         type: 'persona',
@@ -389,7 +733,7 @@ export default function ProjectFlow() {
 
   // The human's answer to a need-human meeting — POST then refresh the run
   async function replyHuman(discId, text) {
-    if (!run) return
+    if (!run) return false
     setReplySending(true)
     try {
       const res = await authFetch(`${API}/runs/${run.id}/discussions/${discId}/reply`, {
@@ -401,10 +745,13 @@ export default function ProjectFlow() {
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       const fresh = await authFetch(`${API}/runs/${run.id}`).then(r => r.json()).catch(() => null)
       if (fresh && !fresh.detail) setRun(fresh)
+      return true
     } catch (e) {
       setRunError(e.message)
+      return false
+    } finally {
+      setReplySending(false)
     }
-    setReplySending(false)
   }
 
   async function stopTeam() {
@@ -447,9 +794,28 @@ export default function ProjectFlow() {
     setSaving(true)
     setSaved(false)
     setError('')
+    // Validate before sending: Number('') is 0 and Number('abc') is NaN — both
+    // would silently persist a nonsense ceiling (or JSON.stringify to null).
+    if (budgetUsd !== '') {
+      const b = Number(budgetUsd)
+      if (!Number.isFinite(b) || b <= 0) {
+        setError('Budget ต้องเป็นตัวเลขมากกว่า 0 (หรือเว้นว่าง = ไม่จำกัด)')
+        setSaving(false)
+        return
+      }
+    }
+    const pct = Number(alertPct)
+    if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
+      setError('Alert % ต้องอยู่ระหว่าง 1–100')
+      setSaving(false)
+      return
+    }
     try {
       const body = {
         repo_url: repoUrl,
+        goal: goal.trim(),
+        budget_usd: budgetUsd === '' ? null : Number(budgetUsd),
+        budget_alert_pct: pct,
         agents: nodes.map(n => n.id),
         links: edges.map(e => ({ from: e.source, to: e.target })),
         positions: Object.fromEntries(nodes.map(n => [n.id, { x: n.position.x, y: n.position.y }])),
@@ -491,6 +857,87 @@ export default function ProjectFlow() {
     setDispatching(false)
   }
 
+  // Re-dispatch the SAME task as a fresh run — the recovery path for a mission
+  // whose steps died on a transient failure (e.g. provider 401 blip): nothing
+  // mid-run is resumed, the team just takes the mission from the top.
+  async function retryRun() {
+    if (!run?.task || retrying) return
+    setRetrying(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/projects/${id}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: run.task, loop: false }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+      setCollapsed({})
+      requestAnimationFrame(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setRetrying(false)
+  }
+
+  // Per-step retry — failures are per-step, so recovery is per-step too: only
+  // THIS step is redone in place, everyone else's finished work is kept.
+  async function retryOneStep(role, kind) {
+    if (!run || retryingStep) return
+    setRetryingStep(`${role}-${kind}`)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/steps/${role}/${kind}/retry`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setRetryingStep(null)
+  }
+
+  async function decideReview(decision, comment) {
+    if (!run || reviewDeciding) return
+    setReviewDeciding(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, comment }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setReviewDeciding(false)
+  }
+
+  // Raising the ceiling is deliberately an explicit action — a plain chat reply
+  // never resumes a budget-paused run.
+  async function raiseBudget(amount) {
+    if (!run || budgetBusy) return
+    setBudgetBusy(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/budget`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ budget_usd: amount }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setBudgetBusy(false)
+  }
+
   if (error && !project) {
     return <div className="px-7 pt-5 text-red-400">{error}</div>
   }
@@ -504,13 +951,15 @@ export default function ProjectFlow() {
   // the early returns above, so no hooks here) ----
   const live = run?.status === 'running' || run?.status === 'waiting_human'
   // Role → that agent's WORK step only, so chat names/canvas rings never get
-  // shadowed by the same agent's tail steps (pr/deploy/demo).
+  // shadowed by the same agent's tail steps (pr/demo).
   const stepByRole = Object.fromEntries((run?.steps || []).filter(s => (s.kind || 'work') === 'work').map(s => [s.role, s]))
-  const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved')
+  const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved' && d.kind !== 'review' && d.kind !== 'budget')
+  // review/budget gates get their own cards above the timeline, not chat threads
+  const meetingDiscs = (run?.discussions || []).filter(d => d.kind !== 'review' && d.kind !== 'budget')
   // Agents paused on a need-human meeting
   const waitingHuman = run?.status === 'waiting_human'
   const waitingHumanRoles = new Set(
-    (run?.discussions || []).filter(d => d.status === 'need_human').flatMap(d => [d.from, ...d.to])
+    (run?.discussions || []).filter(d => d.status === 'need_human' && d.kind !== 'review' && d.kind !== 'budget').flatMap(d => [d.from, ...d.to])
   )
   // Who each agent is talking to in a live meeting: role → display names of the others
   const meetingPartners = {}
@@ -601,49 +1050,122 @@ export default function ProjectFlow() {
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-3 px-7 pb-1 pt-5">
-        <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" onClick={() => router.push('/projects')}><ArrowLeft /></Button>
-          <div>
-            <h1 className="text-[21px] font-bold tracking-tight">{project.name}</h1>
-            <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-              {project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
-            </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2.5">
-          {error && <span className="text-[12px] text-red-400">{error}</span>}
-          {saved && <span className="flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="flow-saved">Saved <Check className="h-3.5 w-3.5" /></span>}
-          <Button onClick={save} disabled={saving} data-testid="flow-save">
-            <Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save Team'}
+      <PageHeader
+        leading={
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-9 w-9 shrink-0 text-muted-foreground hover:text-white"
+            onClick={() => router.push('/projects')}
+            aria-label="Back to projects"
+          >
+            <ArrowLeft className="h-4 w-4" />
           </Button>
-        </div>
-      </div>
+        }
+        title={project.name}
+        subtitle={project.goal || project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
+        actions={
+          <>
+            {error && <span className="text-[12px] text-red-400">{error}</span>}
+            {saved && <span className="flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="flow-saved">Saved <Check className="h-3.5 w-3.5" /></span>}
+            <Button onClick={save} disabled={saving} data-testid="flow-save">
+              <Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save Team'}
+            </Button>
+          </>
+        }
+      />
 
-      <div className="px-7 py-5">
+      <div className="page-body">
+        <Tabs value={tab} onValueChange={setTab} className="w-full">
+          <TabsList className="mb-6 h-auto w-full justify-start gap-1 rounded-none border-b border-white/[0.06] bg-transparent p-0">
+            {[['mission', 'Mission Control'], ['routines', 'Routines'], ['docs', 'Docs']].map(([v, label]) => (
+              <TabsTrigger
+                key={v}
+                value={v}
+                data-testid={`tab-${v}`}
+                className="rounded-none border-b-2 border-transparent px-3.5 pb-3 pt-1 text-[12.5px] font-semibold text-muted-foreground/70 hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-white data-[state=active]:shadow-none"
+              >
+                {label}
+                {v === 'docs' && openComments > 0 && (
+                  <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-300" data-testid="docs-comment-badge">{openComments}</span>
+                )}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+
+          <TabsContent value="mission" className="mt-0">
         {/* Mission control — dispatch one task through the whole team */}
-        <Card className="mb-5 p-4" data-testid="mission-control">
-          <form onSubmit={dispatch} className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <div className="text-[14.5px] font-bold">สั่งงานทีม AI</div>
-              <div className="text-[11.5px] text-muted-foreground/70">
-                {nodes.length} agents รับงานตามลำดับและเขียนงานลง container ของตัวเอง — ถ้าใครติดขัด/มีคำถาม จะเปิด meeting ถามกลับแล้วแก้งานต่อ
+        <Card className="mb-5 p-5" data-testid="mission-control">
+          <form onSubmit={dispatch} className="flex flex-col gap-3.5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/[0.09] text-primary ring-1 ring-inset ring-primary/15">
+                  <Send className="h-4 w-4" />
+                </span>
+                <div>
+                  <div className="text-[13.5px] font-semibold text-white">สั่งงานทีม AI</div>
+                  <div className="text-[11.5px] text-muted-foreground/60">{nodes.length} agents รับงานตามลำดับและเขียนงานลง container ของตัวเอง</div>
+                </div>
+              </div>
+              <div className="max-w-md text-[11.5px] leading-relaxed text-muted-foreground/60">
+                ถ้าใครติดขัด/มีคำถาม จะเปิด meeting ถามกลับแล้วแก้งานต่อ
               </div>
             </div>
             <div className="flex items-center gap-2.5">
-              <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground/60" />
+              <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground/50" />
               <input
                 data-testid="project-repo"
-                className="h-8 w-full max-w-xl rounded-md border bg-background px-2.5 text-[12.5px] outline-none focus:ring-1 focus:ring-ring"
+                className="h-9 w-full max-w-xl rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
                 placeholder="Git repo (https://github.com/owner/repo) — ทีมจะ clone ลง /workspace ของ container ก่อนทำงานทุกครั้ง"
                 value={repoUrl}
                 onChange={e => { setRepoUrl(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
               />
               {!saved && repoUrl !== (project?.repo_url || '') && (
                 <span className="shrink-0 text-[11px] text-amber-400">กด Save Team เพื่อบันทึก repo</span>
               )}
             </div>
-            <div className="flex gap-3">
+            <div className="flex items-center gap-2.5">
+              <Target className="h-4 w-4 shrink-0 text-muted-foreground/50" />
+              <input
+                data-testid="project-goal"
+                className="h-9 w-full max-w-xl rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                placeholder="Goal ของโปรเจกต์ — ทีมจะยึดเป็นเป้าหมายหลัก ทุก deliverable"
+                value={goal}
+                onChange={e => { setGoal(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
+                title="Goal ancestry: ถูกใส่ใน prompt ของทุกขั้นตอน"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Wallet className="h-4 w-4 shrink-0 text-muted-foreground/50" />
+              <input
+                data-testid="project-budget"
+                type="number"
+                min="0"
+                step="0.5"
+                className="h-9 w-40 rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                placeholder="Budget / run (USD)"
+                value={budgetUsd}
+                onChange={e => { setBudgetUsd(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
+                title="เพดานต่อ run — ถึงเพดานแล้ว run จะ pause รออนุมัติ ไม่ตัดจบเอง"
+              />
+              <span className="text-[11.5px] text-muted-foreground/60">alert ที่</span>
+              <input
+                data-testid="project-budget-alert"
+                type="number"
+                min="1"
+                max="100"
+                className="h-9 w-20 rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
+                value={alertPct}
+                onChange={e => { setAlertPct(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
+                title="แจ้งเตือนเมื่อใช้ถึง % ของ budget (ไม่หยุดงาน)"
+              />
+              <span className="text-[11.5px] text-muted-foreground/50">% — ถึงเพดานแล้ว run pause รอคุณอนุมัติเพิ่มงบ</span>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row">
               <Textarea
                 data-testid="task-input"
                 placeholder="เช่น: Redesign หน้า Dashboard ใหม่ ทำ UX/UI เป็น design tokens + layout ใหม่..."
@@ -669,7 +1191,7 @@ export default function ProjectFlow() {
                 </label>
               </div>
             </div>
-            {runError && <div className="rounded-md bg-red-500/15 px-3 py-2 text-[12.5px] text-red-400">{runError}</div>}
+            {runError && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-300">{runError}</div>}
           </form>
 
           {run && (
@@ -683,7 +1205,11 @@ export default function ProjectFlow() {
                           ? <><MonitorPlay className="h-3 w-3" /> demo & acceptance — PO ตรวจรับ</>
                           : 'team working')
                     : run.status === 'waiting_human'
-                      ? <><User className="h-3 w-3" /> รอคุณตอบในแชท</>
+                      ? run.phase === 'budget'
+                        ? <><Wallet className="h-3 w-3" /> รอคุณอนุมัติเพิ่มงบ</>
+                        : run.phase === 'review'
+                          ? <><ShieldCheck className="h-3 w-3" /> รอคุณ review diff</>
+                          : <><User className="h-3 w-3" /> รอคุณตอบในแชท</>
                       : run.status}
                 </Badge>
                 {run.loop_mode && (
@@ -691,11 +1217,33 @@ export default function ProjectFlow() {
                     <Repeat className="h-3 w-3" /> Loop{run.iteration > 1 ? ` รอบที่ ${run.iteration}` : ''}{run.status === 'done' && !run.next_run_id ? ' · กำลังประเมินรอบถัดไป…' : ''}
                   </Badge>
                 )}
+                {run.trigger === 'scheduled' && (
+                  <Badge variant="cyan" className="gap-1" data-testid="scheduled-badge" title={run.routine_id ? `routine ${run.routine_id}` : 'scheduled run'}>
+                    <CalendarClock className="h-3 w-3" /> scheduled
+                  </Badge>
+                )}
+                {(run.cost_usd > 0 || run.budget_usd) && (
+                  <span
+                    className="flex items-center gap-1.5 text-[12px] tabular-nums text-muted-foreground/80"
+                    data-testid="run-cost"
+                    title={`${fmtTok(run.input_tokens)} input + ${fmtTok(run.output_tokens)} output tokens`}
+                  >
+                    <Wallet className="h-3.5 w-3.5 shrink-0 text-emerald-400/80" />
+                    <strong className="font-semibold text-foreground/90">{fmtUsd(run.cost_usd)}</strong>
+                    {run.budget_usd ? <span>/ {fmtUsd(run.budget_usd)}</span> : null}
+                    <span className="text-muted-foreground/50">· {fmtTok((run.input_tokens || 0) + (run.output_tokens || 0))} tok</span>
+                  </span>
+                )}
+                {run.cost_alerted && (
+                  <Badge variant="yellow" className="gap-1" data-testid="cost-alert">
+                    <AlertTriangle className="h-3 w-3" /> ใช้งบ ≥ {project.budget_alert_pct ?? 80}%
+                  </Badge>
+                )}
                 <span className="text-[12.5px] font-medium">{doneCount}/{run.steps.length} ส่งงานแล้ว</span>
-                {(run.discussions || []).length > 0 && (
+                {meetingDiscs.length > 0 && (
                   <span className="flex items-center gap-1.5 text-[12px] text-amber-300/90">
                     <MessagesSquare className="h-3.5 w-3.5 shrink-0" />
-                    {run.discussions.length} meeting{run.discussions.some(d => d.status !== 'resolved') ? ` · คำถามค้าง ${run.discussions.filter(d => d.status !== 'resolved').length}` : ' — ตัดสินใจครบแล้ว'}
+                    {meetingDiscs.length} meeting{meetingDiscs.some(d => d.status !== 'resolved') ? ` · คำถามค้าง ${meetingDiscs.filter(d => d.status !== 'resolved').length}` : ' — ตัดสินใจครบแล้ว'}
                   </span>
                 )}
                 {revertTotal > 0 && (
@@ -717,7 +1265,59 @@ export default function ProjectFlow() {
                     {stopping ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />} หยุดทีม
                   </Button>
                 )}
+                {!live && run.steps.some(s => s.status === 'error') && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={retryRun}
+                    disabled={retrying}
+                    data-testid="retry-mission"
+                    className="h-7 gap-1.5 border-amber-500/40 text-[11.5px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+                    title="สั่งงานเดิมซ้ำเป็น run ใหม่ — ทีมทำ mission นี้ตั้งแต่ต้นอีกรอบ (ถ้า failed แค่บาง step ให้กดปุ่ม ลองซ้ำ ที่ step นั้นแทน)"
+                  >
+                    {retrying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />} เริ่ม mission ใหม่
+                  </Button>
+                )}
               </div>
+
+              {run.steps.length > 0 && (
+                <div className="mb-3 flex items-center gap-3">
+                  <Progress
+                    value={(doneCount / Math.max(1, run.steps.length)) * 100}
+                    indicatorClassName={run.status === 'error' ? 'bg-gradient-to-r from-rose-500 to-red-400' : undefined}
+                  />
+                  <span className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground/50">
+                    {Math.round((doneCount / Math.max(1, run.steps.length)) * 100)}%
+                  </span>
+                </div>
+              )}
+
+              {run.watchdog_note && (
+                <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-200" data-testid="watchdog-note">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{run.watchdog_note}</span>
+                </div>
+              )}
+              {runError && (
+                <div className="mb-3 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-300" data-testid="run-error">
+                  {runError}
+                </div>
+              )}
+              <ReviewCard run={run} onDecide={decideReview} deciding={reviewDeciding} />
+              {(run.discussions || []).filter(d => d.kind === 'budget').length > 0 && (
+                <div className="mb-3 flex flex-col gap-2.5">
+                  {run.discussions.filter(d => d.kind === 'budget').map(d => (
+                    <BudgetCard
+                      key={d.id}
+                      d={d}
+                      run={run}
+                      onRaise={raiseBudget}
+                      onStop={stopTeam}
+                      busy={budgetBusy || stopping}
+                    />
+                  ))}
+                </div>
+              )}
 
               {run.acceptance && (
                 <div
@@ -756,29 +1356,57 @@ export default function ProjectFlow() {
                   const reverting = live && kind === 'work' && revisingRoles.has(step.role) && step.status === 'working'
                   return (
                     <div key={sKey} className={`rounded-xl border bg-[#0d1420] ${reverting ? 'revert-flash border-rose-400/60' : ''}`} data-testid={`run-step-${step.role}${kind !== 'work' ? `-${kind}` : ''}`} data-status={step.status} data-revert={reverting ? '1' : undefined}>
-                      <button
-                        className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left"
-                        onClick={() => setCollapsed(c => ({ ...c, [sKey]: open }))}
-                      >
-                        <StepStatusIcon status={reverting ? 'revising' : step.status} />
-                        <Avatar className="h-6 w-6">
-                          <AvatarFallback className="text-[10px]">{initials(step.name)}</AvatarFallback>
-                        </Avatar>
-                        <div className="min-w-0 flex-1">
-                          <div className="text-[13px] font-semibold">
-                            <span className="text-muted-foreground/50">{i + 1}. </span>{step.name}
-                            <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
-                            {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
-                            {kind !== 'work' && <StepKindBadge kind={kind} />}
+                      <div className="flex w-full items-center gap-3 px-3.5 py-2.5">
+                        <button
+                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                          onClick={() => setCollapsed(c => ({ ...c, [sKey]: open }))}
+                        >
+                          <StepStatusIcon status={reverting ? 'revising' : step.status} />
+                          <Avatar className="h-6 w-6">
+                            <AvatarFallback className="text-[10px]">{initials(step.name)}</AvatarFallback>
+                          </Avatar>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[13px] font-semibold">
+                              <span className="text-muted-foreground/50">{i + 1}. </span>{step.name}
+                              <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
+                              {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
+                              {kind !== 'work' && <StepKindBadge kind={kind} />}
+                              {step.harness && <span className="ml-1.5 rounded bg-violet-500/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-violet-300" title="external CLI harness — unmetered">{step.harness}</span>}
+                            </div>
                           </div>
-                        </div>
-                        {step.container && (
-                          <span className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-medium text-emerald-400 sm:flex" title={`deliverable: ${step.deliverable || '-'}`}>
-                            <Container className="h-3 w-3" /> {step.container}
-                          </span>
+                          {(step.input_tokens > 0 || step.output_tokens > 0 || step.cost_usd > 0 || step.metered === false) && (
+                            <span
+                              className={`hidden shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-medium tabular-nums sm:flex ${step.metered === false ? 'bg-violet-500/10 text-violet-300' : 'bg-emerald-500/10 text-emerald-400'}`}
+                              data-testid={`step-cost-${step.role}${kind !== 'work' ? `-${kind}` : ''}`}
+                              title={step.metered === false ? 'external harness — ไม่คิดค่า token ผ่าน platform' : `input ${step.input_tokens.toLocaleString()} · output ${step.output_tokens.toLocaleString()} tokens${step.priced === false ? ' · ไม่มีราคาในตาราง (ประมาณการ)' : ''}`}
+                            >
+                              <Wallet className="h-3 w-3" />
+                              {step.metered === false
+                                ? 'unmetered'
+                                : <>{fmtTok((step.input_tokens || 0) + (step.output_tokens || 0))} tok · {fmtUsd(step.cost_usd)}{step.priced === false ? ' est.' : ''}</>}
+                            </span>
+                          )}
+                          {step.container && (
+                            <span className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-medium text-emerald-400 sm:flex" title={`deliverable: ${step.deliverable || '-'}`}>
+                              <Container className="h-3 w-3" /> {step.container}
+                            </span>
+                          )}
+                          <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground/50 transition-transform ${open ? '' : '-rotate-90'}`} />
+                        </button>
+                        {!live && (step.status === 'error' || step.status === 'skipped' || step.status === 'stopped') && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => retryOneStep(step.role, kind)}
+                            disabled={retryingStep !== null}
+                            data-testid={`retry-step-${step.role}${kind !== 'work' ? `-${kind}` : ''}`}
+                            className="h-7 shrink-0 gap-1.5 border-amber-500/40 text-[11px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+                            title={`สั่งเฉพาะ step นี้ซ้ำ — งานที่เสร็จแล้วของคนอื่นถูกเก็บไว้ทั้งหมด (สถานะเดิม: ${step.status})`}
+                          >
+                            {retryingStep === sKey ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />} ลองซ้ำ
+                          </Button>
                         )}
-                        <ChevronDown className={`h-4 w-4 text-muted-foreground/50 transition-transform ${open ? '' : '-rotate-90'}`} />
-                      </button>
+                      </div>
                       {open && (
                         <div className="border-t px-3.5 py-3">
                           {step.status === 'pending' && <div className="text-[12px] text-muted-foreground/60">รอรับงาน…</div>}
@@ -787,7 +1415,8 @@ export default function ProjectFlow() {
                               <Loader2 className="h-3.5 w-3.5 animate-spin" /> ↩ ถูกตีกลับแก้จาก meeting — กำลังแก้งานใหม่เป็น rev {run.round}…
                             </div>
                           )}
-                          {step.status === 'working' && !reverting && <div className="flex items-center gap-2 text-[12px] text-blue-400"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังทำงาน…</div>}
+                          {step.status === 'working' && !reverting && live && <div className="flex items-center gap-2 text-[12px] text-blue-400"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังทำงาน…</div>}
+                          {step.status === 'stopped' && <div className="text-[12px] text-muted-foreground/70">หยุดกลางคัน — run จบตอน step นี้กำลังทำงาน</div>}
                           {step.status === 'error' && <div className="text-[12.5px] text-red-400">{step.output}</div>}
                           {step.status === 'skipped' && <div className="text-[12px] text-muted-foreground/70">ข้าม — {step.output || 'ไม่มีเหตุผลระบุ'}</div>}
                           {step.status === 'done' && (
@@ -810,12 +1439,12 @@ export default function ProjectFlow() {
                 })}
               </div>
 
-              {(run.discussions || []).length > 0 && (
+              {meetingDiscs.length > 0 && (
                 <div className="mt-4 flex flex-col gap-2.5" data-testid="run-meetings">
                   <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-400/80">
-                    Meetings — คุยกันแบบแชทเรียลไทม์ {run.discussions.some(d => d.status === 'need_human') && <span className="ml-1 normal-case text-rose-300">· มีคำถามที่รอคุณตอบ</span>}
+                    Meetings — คุยกันแบบแชทเรียลไทม์ {meetingDiscs.some(d => d.status === 'need_human') && <span className="ml-1 normal-case text-rose-300">· มีคำถามที่รอคุณตอบ</span>}
                   </div>
-                  {run.discussions.map(d => (
+                  {meetingDiscs.map(d => (
                     <MeetingChat
                       key={d.id}
                       d={d}
@@ -876,6 +1505,24 @@ export default function ProjectFlow() {
         <div className="mt-2 text-[11.5px] text-muted-foreground/60" data-testid="flow-edit-hint">
           กดที่การ์ด agent เพื่อดูว่ากำลังทำอะไรอยู่ + ประวัติการทำงานทั้งหมด และแก้ไข persona/โมเดลประจำตัวได้ (เส้นเชื่อม = ใครคุยกับใคร)
         </div>
+          </TabsContent>
+
+          <TabsContent value="routines" className="mt-0">
+            <RoutinesTab
+              projectId={id}
+              onRunStarted={r => {
+                setRun(r)
+                setCollapsed({})
+                setTab('mission')
+                requestAnimationFrame(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+              }}
+            />
+          </TabsContent>
+
+          <TabsContent value="docs" className="mt-0">
+            <ProjectDocs projectId={id} onCommentsChanged={refreshOpenComments} />
+          </TabsContent>
+        </Tabs>
       </div>
 
       <AgentDetail agent={detailAgent} open={detailOpen} onOpenChange={setDetailOpen} onSaved={refreshPersonas} />

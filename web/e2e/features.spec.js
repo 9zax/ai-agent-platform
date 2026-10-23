@@ -1,17 +1,17 @@
 const { test, expect } = require('@playwright/test')
 
-// Interactive features — full lifecycle against real Docker via the orchestrator API
+// Interactive features — full lifecycle against real host agents via the orchestrator API
 test.describe('Container lifecycle', () => {
   let containerName
 
   test('create → exec → stop → start → restart → delete', async ({ page }) => {
     containerName = `e2e-agent-${Date.now()}`
 
-    // 1. Create via the New Container dialog
+    // 1. Create via the New Agent dialog
     await page.goto('/')
-    await page.getByRole('button', { name: /New Container/ }).click()
+    await page.getByRole('button', { name: /New Agent/ }).click()
     await page.getByLabel('Name').fill(containerName)
-    await page.getByRole('button', { name: 'Create Container' }).click()
+    await page.getByRole('button', { name: 'Create Agent' }).click()
     await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 30000 })
     await expect(page.getByTestId('container-row').filter({ hasText: containerName })).toBeVisible({ timeout: 30000 })
 
@@ -19,7 +19,7 @@ test.describe('Container lifecycle', () => {
     await page.getByTestId('container-row').filter({ hasText: containerName }).click()
     await expect(page).toHaveURL(new RegExp(`/containers/${containerName}$`))
     await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    const term = page.getByTestId('terminal')
+    const term = page.getByTestId('terminal').nth(1)
     await expect(term).toBeVisible({ timeout: 20000 })
     await term.click()
     await page.keyboard.type('echo hello')

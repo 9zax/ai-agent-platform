@@ -1,12 +1,13 @@
 'use client'
 
 import { authFetch } from '@/lib/auth'
-import { useEffect, useState } from 'react'
-import { Save, Check } from 'lucide-react'
+import { Fragment, useEffect, useState } from 'react'
+import { Save, Check, Sparkles, DollarSign, Plus, Trash2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import PageHeader from '@/components/page-header'
 import { cn } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
@@ -18,10 +19,15 @@ export default function AIConfigPage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
+  const [newModel, setNewModel] = useState('')
 
   useEffect(() => {
     authFetch(`${API}/providers`).then(r => r.json()).then(setProviders).catch(() => setProviders([]))
-    authFetch(`${API}/config`).then(r => r.json()).then(setConfig).catch(() => setConfig(null))
+    authFetch(`${API}/config`)
+      .then(r => r.json().then(d => { if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`); return d }))
+      .then(setConfig)
+      .catch(e => setLoadError(e.message))
   }, [])
 
   function pickProvider(p) {
@@ -29,6 +35,41 @@ export default function AIConfigPage() {
       ...config,
       ai_provider: p.id,
       ai_base_url: p.base_url,
+    })
+    setSaved(false)
+  }
+
+  function setPrice(model, field, value) {
+    // Keep the RAW input string while editing: parsing on every keystroke turns
+    // "0." and "" into 0, so the field snaps back and decimals cannot be typed.
+    setConfig(c => ({
+      ...c,
+      pricing: {
+        ...(c.pricing || {}),
+        [model]: { ...(c.pricing?.[model] || {}), [field]: value },
+      },
+    }))
+    setSaved(false)
+  }
+
+  const num = v => Math.max(0, Number(v) || 0)
+
+  function addModel() {
+    const model = newModel.trim()
+    if (!model) return
+    setConfig(c => ({
+      ...c,
+      pricing: { ...(c.pricing || {}), [model]: c.pricing?.[model] || { input_per_mtok: 0, output_per_mtok: 0 } },
+    }))
+    setNewModel('')
+    setSaved(false)
+  }
+
+  function removeModel(model) {
+    setConfig(c => {
+      const pricing = { ...(c.pricing || {}) }
+      delete pricing[model]
+      return { ...c, pricing }
     })
     setSaved(false)
   }
@@ -42,6 +83,12 @@ export default function AIConfigPage() {
       const body = {
         ai_provider: config.ai_provider,
         ai_base_url: config.ai_base_url,
+        pricing: Object.fromEntries(Object.entries(config.pricing || {}).map(([m, p]) => [m, {
+          input_per_mtok: num(p?.input_per_mtok),
+          output_per_mtok: num(p?.output_per_mtok),
+        }])),
+        default_input_per_mtok: num(config.default_input_per_mtok),
+        default_output_per_mtok: num(config.default_output_per_mtok),
       }
       if (apiKey) body.ai_api_key = apiKey
       const res = await authFetch(`${API}/config`, {
@@ -61,43 +108,56 @@ export default function AIConfigPage() {
   }
 
   if (!config) {
-    return <div className="px-7 pt-5 text-muted-foreground/70">Loading configuration…</div>
+    return (
+      <div className="px-7 pt-5 text-[13px] text-muted-foreground/70" data-testid="config-loading">
+        {loadError ? `โหลด config ไม่ได้: ${loadError}` : 'Loading configuration…'}
+      </div>
+    )
   }
 
   return (
     <>
-      <div className="px-7 pb-1 pt-5">
-        <h1 className="text-[21px] font-bold tracking-tight">AI Config</h1>
-        <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">เลือก provider template แล้วกรอก key — สลับได้เลยไม่ต้อง restart</div>
-      </div>
+      <PageHeader
+        icon={Sparkles}
+        title="AI Config"
+        subtitle="เลือก provider template แล้วกรอก key — สลับได้เลยไม่ต้อง restart"
+      />
 
-      <div className="px-7 py-5">
-        <div className="mb-4 grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(210px,1fr))]">
-          {providers.map(p => (
-            <button
-              key={p.id}
-              type="button"
-              data-testid={`provider-${p.id}`}
-              onClick={() => pickProvider(p)}
-              className={cn(
-                'rounded-xl border p-3.5 text-left transition-colors',
-                config.ai_provider === p.id ? 'border-primary bg-primary/10' : 'bg-card hover:border-muted-foreground/40'
-              )}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[13.5px] font-bold">{p.label}</span>
-                {config.ai_provider === p.id && <Check className="h-4 w-4 text-primary" />}
-              </div>
-              <div className="mt-1 text-[11px] text-muted-foreground/70">{p.note}</div>
-              <div className="mt-2 flex gap-1.5">
-                <Badge variant={p.local ? 'green' : 'gray'} className="text-[10px]">{p.local ? 'no key' : p.protocol}</Badge>
-                {p.model && <Badge variant="blue" className="font-mono text-[10px]" title="default ของ provider — ปรับต่อ agent ได้ที่หน้า AI Team">{p.model}</Badge>}
-              </div>
-            </button>
-          ))}
+      <div className="page-body">
+        <div className="mb-5 grid gap-2.5 [grid-template-columns:repeat(auto-fit,minmax(220px,1fr))]">
+          {providers.map(p => {
+            const active = config.ai_provider === p.id
+            return (
+              <button
+                key={p.id}
+                type="button"
+                data-testid={`provider-${p.id}`}
+                onClick={() => pickProvider(p)}
+                className={cn(
+                  'group relative overflow-hidden rounded-xl border p-4 text-left transition-all duration-150',
+                  active
+                    ? 'border-primary/50 bg-primary/[0.08] shadow-[0_0_0_1px_rgba(139,92,246,0.12),0_14px_30px_-20px_rgba(139,92,246,0.7)]'
+                    : 'border-white/[0.06] bg-card/60 hover:-translate-y-0.5 hover:border-white/[0.12] hover:bg-white/[0.03]'
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[13.5px] font-semibold text-white">{p.label}</span>
+                  <span className={cn('flex h-5 w-5 items-center justify-center rounded-full ring-1 ring-inset transition-colors',
+                    active ? 'bg-primary text-white ring-primary' : 'text-transparent ring-white/[0.1] group-hover:ring-white/20')}>
+                    <Check className="h-3 w-3" />
+                  </span>
+                </div>
+                <div className="mt-1 line-clamp-2 min-h-[30px] text-[11px] leading-relaxed text-muted-foreground/60">{p.note}</div>
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  <Badge variant={p.local ? 'green' : 'gray'}>{p.local ? 'no key' : p.protocol}</Badge>
+                  {p.model && <Badge variant="blue" className="font-mono" title="default ของ provider — ปรับต่อ agent ได้ที่หน้า AI Team">{p.model}</Badge>}
+                </div>
+              </button>
+            )
+          })}
         </div>
 
-        <Card className="max-w-xl p-5">
+        <Card className="max-w-2xl p-5">
           <form onSubmit={save} className="grid gap-4">
             <div className="grid gap-1.5">
               <label htmlFor="ai-base" className="text-[13px] font-medium">Base URL</label>
@@ -116,6 +176,83 @@ export default function AIConfigPage() {
             </div>
           </form>
         </Card>
+
+        <Card className="mt-4 max-w-2xl p-5" data-testid="pricing-card">
+          <div className="flex items-center gap-2 text-[13.5px] font-semibold text-white">
+            <DollarSign className="h-4 w-4 text-emerald-400" /> Token pricing
+            <span className="text-[11px] font-normal text-muted-foreground/55">USD ต่อ 1M tokens</span>
+          </div>
+          <div className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground/60">
+            ใช้ประเมินค่าใช้จ่ายต่อ run — ราคาที่ seed มาเป็นค่าประมาณ แก้ให้ตรงกับผู้ให้บริการได้; กด Save Provider Config ด้านบนเพื่อบันทึก
+          </div>
+
+          <div className="mt-3 grid grid-cols-[minmax(0,1fr)_92px_92px_28px] items-center gap-x-2 gap-y-1.5">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Model</span>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Input</span>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">Output</span>
+            <span />
+            {Object.entries(config.pricing || {}).sort(([a], [b]) => a.localeCompare(b)).map(([model, p]) => (
+              <Fragment key={model}>
+                <code className="truncate rounded bg-black/20 px-2 py-1 font-mono text-[11px] text-foreground/80" title={model}>{model}</code>
+                <Input
+                  type="number" min="0" step="0.01"
+                  className="h-8 text-[11.5px] tabular-nums"
+                  value={p?.input_per_mtok ?? 0}
+                  onChange={e => setPrice(model, 'input_per_mtok', e.target.value)}
+                  aria-label={`${model} input price`}
+                />
+                <Input
+                  type="number" min="0" step="0.01"
+                  className="h-8 text-[11.5px] tabular-nums"
+                  value={p?.output_per_mtok ?? 0}
+                  onChange={e => setPrice(model, 'output_per_mtok', e.target.value)}
+                  aria-label={`${model} output price`}
+                />
+                <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground/40 hover:bg-red-500/10 hover:text-red-400" onClick={() => removeModel(model)} aria-label={`Remove ${model}`}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </Fragment>
+            ))}
+          </div>
+
+          <div className="mt-2 flex items-center gap-1.5">
+            <Input
+              className="h-8 max-w-[260px] font-mono text-[11.5px]"
+              placeholder="เพิ่มโมเดล เช่น glm-5.3"
+              value={newModel}
+              onChange={e => setNewModel(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModel() } }}
+              data-testid="pricing-new-model"
+            />
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-[11.5px]" onClick={addModel} disabled={!newModel.trim()} data-testid="pricing-add-model">
+              <Plus className="h-3.5 w-3.5" /> Add
+            </Button>
+          </div>
+
+          <div className="mt-3 border-t border-white/[0.06] pt-3">
+            <div className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground/50">Default price for unknown models</div>
+            <div className="mt-1.5 grid grid-cols-[minmax(0,1fr)_92px_92px_28px] items-center gap-2">
+              <span className="text-[11.5px] text-muted-foreground/70">fallback (USD / 1M tokens)</span>
+              <Input
+                type="number" min="0" step="0.01"
+                className="h-8 text-[11.5px] tabular-nums"
+                value={config.default_input_per_mtok ?? 0}
+                onChange={e => { setConfig({ ...config, default_input_per_mtok: e.target.value }); setSaved(false) }}
+                aria-label="default input price"
+              />
+              <Input
+                type="number" min="0" step="0.01"
+                className="h-8 text-[11.5px] tabular-nums"
+                value={config.default_output_per_mtok ?? 0}
+                onChange={e => { setConfig({ ...config, default_output_per_mtok: e.target.value }); setSaved(false) }}
+                aria-label="default output price"
+              />
+              <span />
+            </div>
+            <div className="mt-1 text-[10.5px] text-muted-foreground/45">ถ้าเป็น 0 และโมเดลไม่อยู่ในตาราง → step จะแสดง “estimate unavailable”</div>
+          </div>
+        </Card>
+
         <div className="mt-3 text-[12px] text-muted-foreground/70" data-testid="per-agent-model-hint">
           เลือกโมเดลทำที่ระดับ agent — ตั้ง per-persona model ได้ที่หน้า <a className="text-primary underline" href="/team">AI Team</a>
         </div>

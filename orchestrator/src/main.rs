@@ -1,37 +1,22 @@
-use std::collections::{BTreeMap, HashMap};
+mod hostexec;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Multipart, Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions,
-};
-use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
-use bollard::query_parameters::{
-    InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    RestartContainerOptions, StartContainerOptions, StatsOptionsBuilder, StopContainerOptions,
-};
-use bollard::Docker;
+use chrono::{Datelike, Local, TimeZone, Timelike};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 const SERVICE_NAME: &str = "AI Agent Platform Orchestrator";
-const MANAGED_LABEL: &str = "managed-by";
-const MANAGED_VALUE: &str = "ai-agent-platform";
-const AGENT_NETWORK: &str = "ai-agent-platform_agent-net";
-/// Shared workspace volume mounted at /workspace in every agent container the
-/// platform creates — one cloned repo working tree shared by the whole team,
-/// like a single Linux box the agents all work on. Named to match the compose
-/// volume so `agent-example` sees the same tree.
-const WORKSPACE_VOLUME: &str = "ai-agent-platform-workspace";
 /// GitHub connector device flow runs against GitHub CLI's public OAuth app —
 /// per-container login via browser, tokens never stored by the platform.
 const GH_DEVICE_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
@@ -41,6 +26,12 @@ const GH_DEVICE_SCOPE: &str = "repo read:org gist workflow";
 const CONNECTOR_CACHE_TTL: u64 = 10;
 /// How often the idle sweeper evaluates auto-pause candidates.
 const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
+/// Per-doc and total char budgets when project documents are injected into
+/// relay prompts (same truncation style as the 1400-char handoff).
+const DOC_INJECT_MAX_CHARS: usize = 4000;
+const DOCS_INJECT_MAX_CHARS: usize = 16000;
+/// Hard cap for one uploaded document file (enforced by the route's body limit too).
+const DOC_UPLOAD_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Default tool belt — every agent's Linux box gets these, and every prompt
@@ -48,10 +39,10 @@ const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
 // never guesses capabilities the box doesn't have.
 // ---------------------------------------------------------------------------
 
-/// (probe command, hint for the model) — probed in the container and rendered
-/// into the system prompt. Heavy runtimes (node, python, browser) are
-/// probed-only: only agent-base ships them; ad-hoc installs would be too slow
-/// and unreliable to attempt mid-command.
+/// (probe command, hint for the model) — probed on the HOST and rendered into
+/// the system prompt. The platform never installs anything on the user's
+/// machine; the manifest simply reports what is really there so the model
+/// never invents capabilities the machine doesn't have.
 const PROBED_TOOLS: &[(&str, &str)] = &[
     ("git", "clone/commit/diff"),
     ("gh", "GitHub CLI — issues, PRs, releases (e.g. gh issue create --title ... --body ...)"),
@@ -62,25 +53,12 @@ const PROBED_TOOLS: &[(&str, &str)] = &[
     ("pip3", "install Python packages"),
     ("node", "Node.js runtime"),
     ("npm", "JS packages / npx one-off tools"),
-    ("chromium", "real browser — headless screenshot: chromium --headless --no-sandbox --screenshot=/workspace/shot.png --window-size=1280,800 <url>"),
+    ("open", "macOS launcher — open <url> opens the user's real browser window (visible on their screen); open <file> reveals files in Finder"),
     ("rg", "ripgrep — fast code search"),
     ("zip", "create zip archives"),
     ("unzip", "extract zip archives"),
     ("rsync", "file sync / bulk copy"),
     ("ssh", "SSH client — git over ssh, remote commands"),
-    ("docker", "docker CLI — talks to the HOST daemon via the mounted /var/run/docker.sock (docker compose …)"),
-];
-
-/// Core tools installed on demand when a bare/foreign image lacks them
-/// (apt package, apk package). Small and fast so the first AI command on a
-/// fresh box bootstraps itself. Best-effort: failures stay silent and the
-/// probe simply reports what the box really has.
-const INSTALLABLE_TOOLS: &[(&str, &str)] = &[
-    ("git", "git"),
-    ("gh", "github-cli"),
-    ("curl", "curl"),
-    ("jq", "jq"),
-    ("ca-certificates", "ca-certificates"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -133,7 +111,18 @@ struct Persona {
     /// model override per provider id (absent/empty = use the provider's default model)
     #[serde(rename = "model_overrides", default)]
     model_overrides: BTreeMap<String, String>,
+    /// role id of this persona's manager ("" = top of the org)
+    #[serde(default)]
+    reports_to: String,
+    /// native = built-in provider loop; claude/codex/custom = external CLI harness
+    #[serde(default = "default_harness")]
+    harness: String,
+    /// command template for a custom harness ({prompt_file}, {model}, {role} placeholders)
+    #[serde(default)]
+    harness_command: String,
 }
+
+fn default_harness() -> String { "native".into() }
 
 fn seed_personas() -> Vec<Persona> {
     // Per-role model overrides, one per provider family the seeds cover:
@@ -154,11 +143,14 @@ fn seed_personas() -> Vec<Persona> {
             (PROVIDERS[0].id.to_string(), glm.to_string()),
             ("gemini".to_string(), gemini.to_string()),
         ]),
+        reports_to: String::new(),
+        harness: default_harness(),
+        harness_command: String::new(),
     };
     // Order = collaboration flow: the PO opens the mission, BA analyzes the
     // business side, SA turns it into the system spec and briefs every
     // specialist (UX/UI, Dev, QA) who then work together on the same run.
-    vec![
+    let mut team = vec![
         mk("po", "Mickey", "Product Owner", "16",
            "Product strategy, user stories, backlog grooming, roadmap, prioritization (RICE/MoSCoW), stakeholder alignment",
            "You are Mickey, a Product Owner with 16 years of experience shipping B2B and B2C products. You go FIRST: you turn the user's ask into a clear product goal with priorities and scope boundaries, then hand it to the BA and SA for analysis. You stay the hub of the team — UX/UI, Dev and QA all get their direction from you. The whole team works test-first (TDD), and it starts with you: every story you accept carries acceptance criteria written as concrete Given/When/Then test cases — a story the team cannot turn into a failing test first is NOT ready. You think in outcomes, not features.", "glm-5.3", "gemini-4-argon"),
@@ -186,7 +178,20 @@ fn seed_personas() -> Vec<Persona> {
         mk("qa", "Tara", "QA Engineer", "14",
            "Test strategy, E2E automation (Playwright), API testing, contract testing, CI quality gates, exploratory testing",
            "You are Tara, a QA Engineer with 14 years of experience. You verify the team's work against the PO's acceptance criteria and the SA's spec — and in this team's TDD flow you are where it starts: you turn the acceptance criteria into failing acceptance/E2E tests BEFORE the Devs implement, so 'done' is defined by tests, not opinions, and the Devs always have a red test to make green. You think in risk, write tests that fail for the right reason, automate the boring 80%, and explore the dangerous 20% humans find.", "glm-5.3-flash", "gemini-3.8-flash"),
-    ]
+    ];
+    // Org-lite: the reporting line every agent sees in its prompt.
+    let bosses = [
+        ("ba", "po"), ("sa", "ba"),
+        ("ux-ui", "sa"), ("ux-ui-2", "ux-ui"),
+        ("dev-fe", "sa"), ("dev-be", "sa"), ("dev-be-2", "dev-be"),
+        ("qa", "sa"),
+    ];
+    for p in &mut team {
+        if let Some((_, boss)) = bosses.iter().find(|(role, _)| *role == p.role) {
+            p.reports_to = (*boss).to_string();
+        }
+    }
+    team
 }
 
 /// The platform's own default project — the team works on ai-agent-platform
@@ -216,10 +221,13 @@ fn seed_project() -> Project {
             link("sa", "dev-be"), link("sa", "dev-be-2"), link("sa", "qa"),
         ],
         positions,
+        goal: "Make ai-agent-platform the best way for one developer to run a real AI software team on their own machine.".into(),
+        budget_usd: Some(10.0),
+        budget_alert_pct: 80,
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Task {
     id: String,
     title: String,
@@ -232,12 +240,90 @@ struct Task {
     due: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct SkillTestRun {
+    id: String,
+    input: String,
+    output: String,
+    model: String,
+    at: u64,
+    #[serde(default)]
+    cost_usd: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SkillSnapshot {
+    version: u32,
+    name: String,
+    description: String,
+    enabled: bool,
+    at: u64,
+}
+
+fn default_skill_version() -> u32 { 1 }
+
+fn seed_skill(id: &str, name: &str, description: &str, enabled: bool) -> Skill {
+    Skill {
+        id: id.into(), name: name.into(), description: description.into(), enabled,
+        version: 1, test_inputs: Vec::new(), test_runs: Vec::new(), history: Vec::new(),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Skill {
     id: String,
     name: String,
     description: String,
     enabled: bool,
+    #[serde(default = "default_skill_version")]
+    version: u32,
+    /// saved inputs for the Skill Studio test bench
+    #[serde(default)]
+    test_inputs: Vec<String>,
+    /// results of the last N test runs (newest first, capped)
+    #[serde(default)]
+    test_runs: Vec<SkillTestRun>,
+    /// previous versions (newest first, capped)
+    #[serde(default)]
+    history: Vec<SkillSnapshot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Routine {
+    id: String,
+    project_id: String,
+    name: String,
+    task: String,
+    /// 5-field cron in local time: minute hour dom month dow
+    cron: String,
+    enabled: bool,
+    #[serde(default)]
+    loop_mode: bool,
+    #[serde(default)]
+    last_run_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run_id: Option<String>,
+    #[serde(default)]
+    last_result: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DocComment {
+    id: String,
+    project_id: String,
+    doc_id: String,
+    author: String,
+    /// the passage this comment is anchored to (quoted text)
+    #[serde(default)]
+    quote: String,
+    body: String,
+    /// open | resolved
+    status: String,
+    created_at: u64,
+    #[serde(default)]
+    resolved_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -258,8 +344,8 @@ struct Project {
     name: String,
     #[serde(default)]
     description: String,
-    /// git remote every agent container clones into /workspace before working
-    /// (empty = no repo; agents then work on bare /workspace files)
+    /// git remote cloned into the shared workspace before working
+    /// (empty = no repo; agents then work on bare workspace files)
     #[serde(default)]
     repo_url: String,
     /// persona roles in this project's team
@@ -271,7 +357,18 @@ struct Project {
     /// react flow node positions per role
     #[serde(default)]
     positions: HashMap<String, Position>,
+    /// the standing "why" injected into every step of a mission
+    #[serde(default)]
+    goal: String,
+    /// per-run spend ceiling in USD (None/0 = unlimited)
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    /// warn once when spend crosses this percentage of the budget
+    #[serde(default = "default_budget_alert_pct")]
+    budget_alert_pct: u8,
 }
+
+fn default_budget_alert_pct() -> u8 { 80 }
 
 #[derive(Deserialize)]
 struct ProjectCreate {
@@ -280,6 +377,10 @@ struct ProjectCreate {
     description: String,
     #[serde(default)]
     repo_url: String,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    budget_usd: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -291,9 +392,91 @@ struct ProjectUpdate {
     #[serde(default)] agents: Option<Vec<String>>,
     #[serde(default)] links: Option<Vec<ProjectLink>>,
     #[serde(default)] positions: Option<HashMap<String, Position>>,
+    #[serde(default)] goal: Option<String>,
+    #[serde(default)] budget_usd: Option<Option<f64>>,
+    #[serde(default)] budget_alert_pct: Option<u8>,
 }
 
-#[derive(Clone)]
+// ---------------------------------------------------------------------------
+// Project docs — the per-project document space (PO / BA / SA / General).
+// Markdown docs live inline in docs.json (editable + injectable into prompts);
+// uploaded binaries live on disk under <data>/docs-files/<doc_id>/.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DocFile {
+    /// original filename, sanitized to a bare file name
+    name: String,
+    content_type: String,
+    size: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProjectDoc {
+    /// "d-NNN" (global doc_counter — meetings reuse the prefix inside runs, different namespace)
+    id: String,
+    project_id: String,
+    /// free-text folder; the UI quick-picks PO / BA / SA / General
+    folder: String,
+    title: String,
+    /// markdown body — empty for uploaded binary documents
+    #[serde(default)]
+    content_md: String,
+    /// uploaded binary payload (None for markdown docs)
+    #[serde(default)]
+    file: Option<DocFile>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Deserialize)]
+struct DocCreate {
+    title: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    content_md: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DocUpdate {
+    #[serde(default)] title: Option<String>,
+    #[serde(default)] folder: Option<String>,
+    #[serde(default)] content_md: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DocQuery {
+    /// "?raw=1" → stream the bytes instead of JSON
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DocCommentCreate {
+    body: String,
+    #[serde(default)]
+    quote: String,
+    #[serde(default)]
+    author: String,
+}
+
+#[derive(Deserialize)]
+struct DocCommentUpdate {
+    /// open | resolved
+    status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ModelPrice {
+    #[serde(default)]
+    input_per_mtok: f64,
+    #[serde(default)]
+    output_per_mtok: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct AiConfig {
     default_image: String,
     max_containers: u32,
@@ -310,6 +493,33 @@ struct AiConfig {
     auto_pause_enabled: bool,
     /// idle threshold in seconds before the sweeper stops a container
     idle_timeout_secs: u64,
+    /// per-model USD per million tokens (approximate — edit in AI Config)
+    #[serde(default)]
+    pricing: BTreeMap<String, ModelPrice>,
+    #[serde(default)]
+    default_input_per_mtok: f64,
+    #[serde(default)]
+    default_output_per_mtok: f64,
+}
+
+fn seeded_pricing() -> BTreeMap<String, ModelPrice> {
+    let mut m = BTreeMap::new();
+    let mut put = |id: &str, input: f64, output: f64| {
+        m.insert(id.to_string(), ModelPrice { input_per_mtok: input, output_per_mtok: output });
+    };
+    // Approximate public list prices. Users can correct them in AI Config;
+    // budget enforcement is only as accurate as this table.
+    put("glm-5.3", 0.6, 2.2);
+    put("glm-5.3-flash", 0.3, 1.2);
+    put("glm-4.5-air", 0.2, 0.8);
+    put("claude-opus-5-5", 15.0, 75.0);
+    put("claude-sonnet-5-5", 3.0, 15.0);
+    put("claude-haiku-5-5", 0.8, 4.0);
+    put("gpt-5.5", 1.25, 10.0);
+    put("gemini-4-argon", 1.25, 10.0);
+    put("gemini-3.8-flash", 0.3, 1.0);
+    put("gemini-3.5-flash-lite", 0.1, 0.4);
+    m
 }
 
 impl Default for AiConfig {
@@ -325,6 +535,9 @@ impl Default for AiConfig {
             admin_password_hash: String::new(),
             auto_pause_enabled: true,
             idle_timeout_secs: 900,
+            pricing: seeded_pricing(),
+            default_input_per_mtok: 0.0,
+            default_output_per_mtok: 0.0,
         }
     }
 }
@@ -338,7 +551,7 @@ struct RunStep {
     role: String,
     name: String,
     title: String,
-    /// which pipeline stage this step belongs to: work (relay deliverable) | pr | deploy | demo
+    /// which pipeline stage this step belongs to: work (relay deliverable) | pr | demo
     #[serde(default = "default_step_kind")]
     kind: String,
     /// pending | working | done | error | skipped
@@ -361,6 +574,41 @@ struct RunStep {
     started_at: u64,
     #[serde(default)]
     finished_at: u64,
+    /// external CLI harness used for this step (None = built-in provider loop)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    /// estimated USD for this step (token-based; 0 for unmetered harnesses)
+    #[serde(default)]
+    cost_usd: f64,
+    /// false = external harness / unpriced model — cost is not a real measurement
+    #[serde(default = "default_true")]
+    metered: bool,
+    /// false = model missing from the price table — cost shows as an estimate only
+    #[serde(default = "default_true")]
+    priced: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// Pre-push review state for a mission (diff approval gate).
+#[derive(Clone, Serialize, Deserialize)]
+struct RunReview {
+    /// pending | approved | rejected | timed_out
+    status: String,
+    #[serde(default)]
+    diff: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    requested_at: u64,
+    #[serde(default)]
+    decided_at: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -441,7 +689,38 @@ struct Run {
     /// the run this loop chain continued into (UI follows it when the parent finishes)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_run_id: Option<String>,
+    /// manual | scheduled | loop | retry
+    #[serde(default = "default_trigger")]
+    trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routine_id: Option<String>,
+    /// project goal snapshot — history survives later goal edits
+    #[serde(default)]
+    goal: String,
+    /// per-run budget snapshot (None = unlimited)
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    #[serde(default)]
+    cost_usd: f64,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    /// true once the budget alert threshold has been reported for this run
+    #[serde(default)]
+    cost_alerted: bool,
+    /// pre-push diff review (None = gate not reached / skipped)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    review: Option<RunReview>,
+    /// watchdog: no heartbeat from the engine for too long (None = healthy).
+    /// Advisory only — it never changes the run's status; the user decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog_note: Option<String>,
+    #[serde(default)]
+    watchdog_at: u64,
 }
+
+fn default_trigger() -> String { "manual".into() }
 
 /// Short-lived cache for GET /models — avoids hammering the provider each editor open
 struct ModelsCache {
@@ -475,7 +754,7 @@ struct CachedConnectorStatus {
 }
 
 /// A container this platform stopped itself (manual Pause or the idle sweeper).
-/// Docker labels are immutable after creation, so this app-side registry —
+/// Docker labels are gone with host execution; this app-side registry —
 /// persisted to /data/paused.json — is the source of truth for "paused"
 /// (as opposed to a container the user stopped directly).
 #[derive(Clone, Serialize, Deserialize)]
@@ -491,7 +770,13 @@ struct Store {
     tasks: Vec<Task>,
     skills: Vec<Skill>,
     projects: Vec<Project>,
+    /// per-project document space (persisted, /data/docs.json)
+    docs: Vec<ProjectDoc>,
+    /// review comments anchored to doc passages (persisted with docs.json)
+    doc_comments: Vec<DocComment>,
     runs: Vec<Run>,
+    /// scheduled routines (persisted, /data/routines.json)
+    routines: Vec<Routine>,
     config: AiConfig,
     /// login sessions: token → username (web UI auth, ADMIN_USER/ADMIN_PASSWORD from env)
     sessions: HashMap<String, String>,
@@ -502,11 +787,18 @@ struct Store {
     connector_cache: HashMap<String, CachedConnectorStatus>,
     /// container name → platform-paused info (persisted, /data/paused.json)
     paused: HashMap<String, PausedInfo>,
-    /// container name → unix secs of last real activity (in-memory only)
+    /// agent name → unix secs of last real activity (in-memory only)
     last_activity: HashMap<String, u64>,
+    /// every agent ever started on this machine (persisted, /data/agents.json)
+    /// — tmux sessions are ephemeral, this registry is what keeps stopped
+    /// agents visible (with a Start button) on the dashboard
+    agents: BTreeSet<String>,
     task_counter: usize,
     project_counter: usize,
+    doc_counter: usize,
+    comment_counter: usize,
     run_counter: usize,
+    routine_counter: usize,
 }
 
 impl Default for Store {
@@ -515,15 +807,18 @@ impl Default for Store {
             personas: seed_personas(),
             tasks: Vec::new(),
             skills: vec![
-                Skill { id: "web-research".into(), name: "Web Research".into(), description: "Search, crawl and summarize web sources".into(), enabled: true },
-                Skill { id: "code-gen".into(), name: "Code Gen".into(), description: "Generate and refactor code from natural language".into(), enabled: true },
-                Skill { id: "data-analysis".into(), name: "Data Analysis".into(), description: "Analyze datasets and produce reports and charts".into(), enabled: true },
-                Skill { id: "file-ops".into(), name: "File Ops".into(), description: "Read, write and organize files in the workspace".into(), enabled: true },
-                Skill { id: "api-testing".into(), name: "API Testing".into(), description: "Call APIs and validate responses against schemas".into(), enabled: true },
-                Skill { id: "image-analysis".into(), name: "Image Analysis".into(), description: "Inspect and describe images".into(), enabled: false },
+                seed_skill("web-research", "Web Research", "Search, crawl and summarize web sources", true),
+                seed_skill("code-gen", "Code Gen", "Generate and refactor code from natural language", true),
+                seed_skill("data-analysis", "Data Analysis", "Analyze datasets and produce reports and charts", true),
+                seed_skill("file-ops", "File Ops", "Read, write and organize files in the workspace", true),
+                seed_skill("api-testing", "API Testing", "Call APIs and validate responses against schemas", true),
+                seed_skill("image-analysis", "Image Analysis", "Inspect and describe images", false),
             ],
             projects: vec![seed_project()],
+            docs: Vec::new(),
+            doc_comments: Vec::new(),
             runs: Vec::new(),
+            routines: Vec::new(),
             config: AiConfig::default(),
             sessions: HashMap::new(),
             models_cache: None,
@@ -531,16 +826,19 @@ impl Default for Store {
             connector_cache: HashMap::new(),
             paused: HashMap::new(),
             last_activity: HashMap::new(),
+            agents: BTreeSet::new(),
             task_counter: 0,
             project_counter: 1,
+            doc_counter: 0,
+            comment_counter: 0,
             run_counter: 0,
+            routine_counter: 0,
         }
     }
 }
 
 #[derive(Clone)]
 struct App {
-    docker: Option<Docker>,
     store: Arc<Mutex<Store>>,
     seq: Arc<AtomicUsize>,
 }
@@ -564,6 +862,7 @@ fn err(status: StatusCode, detail: impl Into<String>) -> ApiError {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // image/command accepted for API compatibility, ignored on host
 struct ContainerCreate {
     name: String,
     role: String,
@@ -596,6 +895,9 @@ struct PersonaUpdate {
     #[serde(default)] rules_md: Option<String>,
     /// model override for the CURRENT active provider: None = untouched, Some("") = clear, Some(m) = set
     #[serde(default)] model: Option<String>,
+    #[serde(default)] reports_to: Option<String>,
+    #[serde(default)] harness: Option<String>,
+    #[serde(default)] harness_command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -635,6 +937,9 @@ struct ConfigUpdate {
     admin_password: Option<String>,
     auto_pause_enabled: Option<bool>,
     idle_timeout_secs: Option<u64>,
+    #[serde(default)] pricing: Option<BTreeMap<String, ModelPrice>>,
+    #[serde(default)] default_input_per_mtok: Option<f64>,
+    #[serde(default)] default_output_per_mtok: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -657,7 +962,33 @@ struct SkillCreate {
 
 #[derive(Deserialize)]
 struct SkillUpdate {
-    enabled: bool,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SkillTestsInput {
+    inputs: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SkillRunRequest {
+    /// override the saved bench inputs for this run
+    inputs: Option<Vec<String>>,
+    /// override the model (defaults to the active provider's default)
+    model: Option<String>,
+}
+
+/// Token usage reported by one provider call (0/0 when the provider omits it).
+#[derive(Clone, Copy, Default)]
+struct LlmUsage {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -665,74 +996,59 @@ struct SkillUpdate {
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn docker(&self) -> Result<&Docker, ApiError> {
-        self.docker.as_ref().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "Docker not available"))
-    }
-
-    async fn inspect(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        self.docker()?
-            .inspect_container(ident, None::<InspectContainerOptions>)
-            .await
-            .map_err(|e| match e {
-                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } =>
-                    err(StatusCode::NOT_FOUND, format!("Container '{ident}' not found")),
-                other => err(StatusCode::BAD_REQUEST, other.to_string()),
-            })
-    }
-
-    async fn inspect_managed(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        let c = self.inspect(ident).await?;
-        let managed = c.config.as_ref()
-            .and_then(|cfg| cfg.labels.as_ref())
-            .and_then(|l| l.get(MANAGED_LABEL))
-            .map(|v| v == MANAGED_VALUE)
-            .unwrap_or(false);
-        if !managed {
-            let name = c.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-            return Err(err(StatusCode::FORBIDDEN, format!("Container '{name}' is not managed by this platform")));
+    /// Derived agent state: running (live tmux session) / paused (registry
+    /// entry, session killed) / exited (registered but not alive).
+    async fn agent_state(&self, name: &str) -> String {
+        if hostexec::session_alive(name).await {
+            return "running".into();
         }
-        Ok(c)
+        if self.store.lock().unwrap().paused.contains_key(name) {
+            return "paused".into();
+        }
+        "exited".into()
     }
 
-    fn status_of(c: &bollard::models::ContainerInspectResponse) -> String {
-        c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_else(|| "unknown".into())
+    /// Resolve an endpoint ident to an agent this platform knows: registered
+    /// in agents.json or currently alive as a session. 404 otherwise.
+    async fn resolve_agent(&self, ident: &str) -> Result<String, ApiError> {
+        if self.store.lock().unwrap().agents.contains(ident)
+            || hostexec::session_alive(ident).await
+        {
+            return Ok(ident.to_string());
+        }
+        Err(err(StatusCode::NOT_FOUND, format!("Agent '{ident}' not found")))
     }
 
-    /// Find this platform's container for a persona role → (id, name).
-    /// Running first; otherwise a PLATFORM-paused one is revived on the spot
-    /// (the idle sweeper may have stopped it hours ago). User-stopped
-    /// containers stay invisible — runs keep their degrade-to-text semantics.
+    /// Remember an agent (persisted) and mark it active.
+    fn register_agent(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        if store.agents.insert(name.to_string()) {
+            save_agents(&store);
+        }
+    }
+
+    fn unregister_agent(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        if store.agents.remove(name) {
+            save_agents(&store);
+        }
+    }
+
+    /// Find this platform's agent for a persona role → (name, name). The
+    /// session is ensured on the spot (agents start on demand — the tmux
+    /// equivalent of a container being there), and a PLATFORM-paused agent is
+    /// transparently revived (the idle sweeper may have killed the session
+    /// hours ago). None only when the machine itself can't host commands
+    /// (workspace unwritable) — runs keep their degrade-to-text semantics.
     async fn agent_container(&self, role: &str) -> Option<(String, String)> {
-        let docker = self.docker.as_ref()?.clone();
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![
-            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
-            format!("role={role}"),
-        ]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        let list = docker.list_containers(Some(opts)).await.ok()?;
-        let mut exited: Option<(String, String)> = None;
-        for c in list {
-            let pair = (
-                c.id.clone().unwrap_or_default(),
-                c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            );
-            match c.state.as_ref().map(|s| s.to_string()).unwrap_or_default() {
-                s if s == "running" => {
-                    self.touch_activity(&pair.1);
-                    return Some(pair);
-                }
-                s if s == "exited" && exited.is_none() => exited = Some(pair),
-                _ => {}
-            }
+        let name = hostexec::session_name(role);
+        if let Err(e) = hostexec::ensure_session(&name).await {
+            eprintln!("agent session '{name}' unavailable: {e}");
+            return None;
         }
-        if let Some((id, name)) = exited {
-            let paused = self.store.lock().unwrap().paused.contains_key(&name);
-            if paused && self.resume_paused(&id, &name).await {
-                return Some((id, name));
-            }
-        }
-        None
+        self.clear_paused(&name);
+        self.touch_activity(&name);
+        Some((name.clone(), name))
     }
 
     fn mark_paused(&self, name: &str, auto: bool) {
@@ -754,121 +1070,46 @@ impl App {
         self.store.lock().unwrap().last_activity.insert(name.to_string(), now_secs());
     }
 
-    /// Start a platform-paused container back and clear its registry entry.
-    /// Idempotent: docker 304 (already started) counts as success.
-    async fn resume_paused(&self, id: &str, name: &str) -> bool {
-        let Some(docker) = self.docker.as_ref() else { return false };
-        match docker.start_container(id, None::<StartContainerOptions>).await {
-            Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
-            Err(e) => {
-                eprintln!("resume of paused container '{name}' failed: {e}");
-                return false;
-            }
-        }
-        for _ in 0..10 {
-            if let Ok(c) = self.inspect(id).await {
-                if App::status_of(&c) == "running" {
-                    self.clear_paused(name);
-                    return true;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-        false
-    }
-
     /// Guard for ident-based endpoints (exec / agent command / terminal):
-    /// running → pass through; platform-paused → transparently revive;
+    /// alive → pass through; platform-paused → transparently revive;
     /// anything else → clear error telling the user what to press.
-    async fn ensure_running(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        let managed = self.inspect_managed(ident).await?;
-        let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-        let status = App::status_of(&managed);
+    async fn ensure_running(&self, ident: &str) -> Result<String, ApiError> {
+        let name = self.resolve_agent(ident).await?;
+        let status = self.agent_state(&name).await;
         if status == "running" {
             self.touch_activity(&name);
-            return Ok(managed);
+            return Ok(name);
         }
-        if status == "exited" && self.store.lock().unwrap().paused.contains_key(&name) {
-            let id = managed.id.clone().unwrap_or_default();
-            if self.resume_paused(&id, &name).await {
-                return self.inspect(&id).await;
-            }
-            return Err(err(StatusCode::CONFLICT, "Container is resuming — try again in a moment"));
+        if status == "paused" {
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            self.clear_paused(&name);
+            return Ok(name);
         }
-        Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status}) — press Start or Resume")))
+        Err(err(StatusCode::BAD_REQUEST, format!("Agent is not running (status: {status}) — press Start or Resume")))
     }
 
-    async fn exec_in(&self, container_id: &str, command: &str) -> Result<(i64, String), ApiError> {
-        let exec = self.docker()?
-            .create_exec(container_id, CreateExecOptions::<&str> {
-                cmd: Some(vec!["sh", "-c", command]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-        let mut bytes: Vec<u8> = Vec::new();
-        let started = self.docker()?
-            .start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: false, ..Default::default() }))
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        if let StartExecResults::Attached { mut output, .. } = started {
-            while let Some(Ok(frame)) = output.next().await {
-                bytes.extend_from_slice(&frame.into_bytes());
-            }
-        }
-        let exit_code = self.docker()?
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-            .exit_code
-            .unwrap_or(-1);
-        Ok((exit_code, String::from_utf8_lossy(&bytes).into_owned()))
+    async fn exec_in(&self, agent: &str, command: &str) -> Result<(i64, String), ApiError> {
+        self.exec_in_env(agent, command, Vec::new()).await
     }
 
     /// exec_in with extra environment variables — the only safe way to pass
-    /// secrets (tokens, git identity) into a container: they never appear in
-    /// the command string (visible via ps) nor in `docker inspect`.
-    async fn exec_in_env(&self, container_id: &str, command: &str, env: Vec<String>) -> Result<(i64, String), ApiError> {
-        let exec = self.docker()?
-            .create_exec(container_id, CreateExecOptions::<String> {
-                cmd: Some(vec!["sh".into(), "-c".into(), command.into()]),
-                env: Some(env),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            })
+    /// secrets (tokens, git identity) into an agent's command: they ride the
+    /// 0600 script file (or the headless process env), never the command
+    /// string, `ps` output or logs.
+    async fn exec_in_env(&self, agent: &str, command: &str, env: Vec<String>) -> Result<(i64, String), ApiError> {
+        hostexec::run(agent, command, &env)
             .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-        let mut bytes: Vec<u8> = Vec::new();
-        let started = self.docker()?
-            .start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: false, ..Default::default() }))
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        if let StartExecResults::Attached { mut output, .. } = started {
-            while let Some(Ok(frame)) = output.next().await {
-                bytes.extend_from_slice(&frame.into_bytes());
-            }
-        }
-        let exit_code = self.docker()?
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-            .exit_code
-            .unwrap_or(-1);
-        Ok((exit_code, String::from_utf8_lossy(&bytes).into_owned()))
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, e))
     }
 
-    /// Make sure the project repo is checked out in the agent's container at
-    /// /workspace/<repo-name> — the "bot on a Linux box" rule: every command
-    /// runs inside the container, the repo is cloned once before any work, and
-    /// all file changes go through this working tree only. Idempotent: an
+    /// Make sure the project repo is checked out in the shared workspace at
+    /// <workspace>/<repo-name> — the "bot on this machine" rule: every command
+    /// runs on the host, the repo is cloned once before any work, and all
+    /// file changes go through this working tree only. Idempotent: an
     /// existing clone is left untouched (it may hold the agent's work in
     /// progress). Returns the working-tree path.
-    async fn ensure_repo(&self, container_id: &str, repo_url: &str) -> Result<String, ApiError> {
+    async fn ensure_repo(&self, agent: &str, repo_url: &str) -> Result<String, ApiError> {
         let repo_url = repo_url.trim().trim_end_matches(".git");
         if repo_url.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no repo URL configured"));
@@ -878,10 +1119,15 @@ impl App {
             return Err(err(StatusCode::BAD_REQUEST, format!("Invalid repo URL: {repo_url:?}")));
         }
         let dir = repo_dir_name(repo_url);
-        let path = format!("/workspace/{dir}");
-        // private repos: inject the configured token into the clone URL only
-        // (x-access-token is what GitHub PATs authenticate as over HTTPS).
-        // The token never appears in error text — errors quote the clean URL.
+        let ws = hostexec::workspace_str();
+        let path = format!("{ws}/{dir}");
+        // private repos: the configured platform token rides the clone URL for
+        // the INITIAL clone only (x-access-token is what GitHub PATs
+        // authenticate as over HTTPS) — read access, never a per-machine
+        // identity. The token never appears in error text — errors quote the
+        // clean URL — and the origin URL is normalized back to the clean form
+        // right after, so later fetch/push authenticate as the machine's own
+        // gh credential helper, not as the platform token.
         let git_token = self.store.lock().unwrap().config.git_token.trim().to_string();
         let clone_url = if !git_token.is_empty() && repo_url.starts_with("https://") {
             if !git_token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
@@ -892,67 +1138,46 @@ impl App {
             repo_url.to_string()
         };
         let script = format!(
-            "command -v git >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1 || {{ apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git >/dev/null 2>&1; }}; \
-             command -v git >/dev/null 2>&1 || {{ echo 'git is not available in this image — use the agent-base image'; exit 3; }}; \
-             mkdir -p /workspace; \
-             if [ ! -d '{path}/.git' ]; then git clone --depth 1 '{clone_url}' '{path}' || exit 4; else echo 'repo already cloned at {path}'; fi"
+            "command -v git >/dev/null 2>&1 || {{ echo 'git is not installed on this machine'; exit 3; }}; \
+             if [ ! -d '{path}/.git' ]; then git clone --depth 1 '{clone_url}' '{path}' || exit 4; else echo 'repo already cloned at {path}'; fi; \
+             origin=$(git -C '{path}' remote get-url origin 2>/dev/null || true); \
+             case \"$origin\" in *x-access-token:*) git -C '{path}' remote set-url origin '{repo_url}' >/dev/null 2>&1 || true;; esac"
         );
-        let (code, out) = self.exec_in(container_id, &script).await?;
+        let (code, out) = self.exec_in(agent, &script).await?;
         match code {
             0 => Ok(path),
-            3 => Err(err(StatusCode::BAD_GATEWAY, "git is not available in the container image — start this agent on the agent-base image (it ships git + gh)")),
-            _ => Err(err(StatusCode::BAD_GATEWAY, format!("cloning {repo_url} into {path} failed (exit {code}): {out}"))),
+            3 => Err(err(StatusCode::BAD_GATEWAY, "git is not installed on this machine — brew install git")),
+            _ => {
+                // git often echoes the remote URL, which carries the PAT.
+                let safe_out = if git_token.is_empty() { out.clone() } else { out.replace(&git_token, "***") };
+                Err(err(StatusCode::BAD_GATEWAY, format!("cloning {repo_url} into {path} failed (exit {code}): {safe_out}")))
+            }
         }
     }
 
-    /// Make sure the default tool belt works in this container (the "every
-    /// Linux box has the same defaults" rule): install the small core set when
-    /// missing (apk/apt, best-effort), register the configured GitHub PAT with
-    /// `gh` AND git's URL rewrite so private repos just work — but only when gh
-    /// is not already logged in: a per-container connector login (GitHub
-    /// connector) wins over the platform PAT, and a leftover PAT URL rewrite is
-    /// cleared so gh's credential helper governs push/pull. Also sets a git
-    /// identity so commits never fail. Best-effort and silent — the manifest
-    /// probe right after reports what the box really has.
-    async fn ensure_tools(&self, container_id: &str) {
-        let git_token = {
-            let t = self.store.lock().unwrap().config.git_token.trim().to_string();
-            // same charset gate as ensure_repo: the token is interpolated into sh
-            if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) { t } else { String::new() }
-        };
-        let apt = INSTALLABLE_TOOLS.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(" ");
-        let apk = INSTALLABLE_TOOLS.iter().map(|(_, a)| *a).collect::<Vec<_>>().join(" ");
-        let script = format!(
-            "missing=0; for c in git gh curl jq; do command -v \"$c\" >/dev/null 2>&1 || missing=1; done; \
-             if [ \"$missing\" = 1 ]; then \
-                 command -v apk >/dev/null 2>&1 && apk add --no-cache {apk} >/dev/null 2>&1; \
-                 command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq {apt} >/dev/null 2>&1; \
-             fi; \
-             if [ -n '{git_token}' ]; then \
-                 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then \
-                     git config --global --unset-all url.\"https://x-access-token:{git_token}@github.com/\".insteadOf >/dev/null 2>&1; \
-                 else \
-                     command -v gh >/dev/null 2>&1 && printf '%s' '{git_token}' | gh auth login --with-token >/dev/null 2>&1; \
-                     command -v git >/dev/null 2>&1 && git config --global url.\"https://x-access-token:{git_token}@github.com/\".insteadOf https://github.com/ >/dev/null 2>&1; \
-                 fi; \
-             fi; \
-             command -v git >/dev/null 2>&1 && {{ git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
-                 git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }}; \
-             if [ -S /var/run/docker.sock ] && ! command -v docker >/dev/null 2>&1; then \
-                 command -v apk >/dev/null 2>&1 && apk add --no-cache docker-cli docker-cli-compose >/dev/null 2>&1; \
-                 command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq docker.io >/dev/null 2>&1; \
-             fi; \
-             exit 0"
-        );
-        let _ = self.exec_in(container_id, &script).await;
+    /// Host-machine hygiene before an agent works (the platform never
+    /// INSTALLS anything on the user's machine — the manifest probe right
+    /// after reports what is really there): strip any legacy
+    /// `x-access-token` insteadOf rewrite from the old shared-PAT era so
+    /// push/pull go through the machine's own gh credential helper, and set a
+    /// git identity ONLY when the user has none (their real config wins —
+    /// commits carry the user's identity, per the one-machine-one-identity
+    /// rule). Best-effort and silent.
+    async fn ensure_tools(&self, agent: &str) {
+        let script =
+            "command -v git >/dev/null 2>&1 && { git config --global --get-regexp '^url\\..*\\.insteadof$' 2>/dev/null | while IFS=' ' read -r k _v; do case \"$k\" in *x-access-token*) git config --global --unset-all \"$k\" >/dev/null 2>&1 || true;; esac; done; true; }; \
+             command -v git >/dev/null 2>&1 && { git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
+                 git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }; \
+             exit 0";
+        let _ = self.exec_in(agent, script).await;
     }
 
-    /// Probe what is really installed in the container (one exec: presence +
+    /// Probe what is really installed on the machine (one exec: presence +
     /// version for every probed tool, plus gh's auth state) and render the
     /// tool-belt section for the system prompt: verified tools with versions,
     /// and — just as important — the probed tools that are MISSING, so the
-    /// model never invents capabilities the box doesn't have.
-    async fn tools_manifest(&self, container_id: &str) -> Option<String> {
+    /// model never invents capabilities the machine doesn't have.
+    async fn tools_manifest(&self, agent: &str) -> Option<String> {
         let probes = PROBED_TOOLS.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(" ");
         let script = format!(
             "for c in {probes}; do \
@@ -962,7 +1187,7 @@ impl App {
              done; \
              command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo 'gh_auth|1' || echo 'gh_auth|'"
         );
-        let (code, out) = self.exec_in(container_id, &script).await.ok()?;
+        let (code, out) = self.exec_in(agent, &script).await.ok()?;
         if code != 0 { return None; }
         let (mut have, mut missing, mut gh_authed) = (Vec::new(), Vec::new(), false);
         for line in out.lines() {
@@ -978,7 +1203,7 @@ impl App {
         }
         if have.is_empty() { return None; }
         let mut md = String::from(
-            "\n\n## Your Linux box — tools verified as INSTALLED (use these; for anything else check `command -v <tool>` first)\n",
+            "\n\n## Your machine (macOS host) — tools verified as INSTALLED (use these; for anything else check `command -v <tool>` first)\n",
         );
         for (name, version, hint) in &have {
             let note = if name == "gh" && gh_authed {
@@ -988,7 +1213,7 @@ impl App {
         }
         if !missing.is_empty() {
             let list = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
-            md.push_str(&format!("\nNOT installed on this box — do NOT use or assume them: {list}\n"));
+            md.push_str(&format!("\nNOT installed on this machine — do NOT use or assume them: {list}\n"));
         }
         if !gh_authed && have.iter().any(|(n, _, _)| n == "gh") {
             md.push_str("\nGitHub auth: no token registered — public repos and local work are fine; private repos will fail until one is set in Settings → Git Access.\n");
@@ -1043,6 +1268,12 @@ impl App {
     }
 
     async fn llm_max(&self, model: &str, system: &str, user_text: &str, max_tokens: u32) -> Result<String, ApiError> {
+        self.llm_max_usage(model, system, user_text, max_tokens).await.map(|(text, _)| text)
+    }
+
+    /// Same call as `llm_max`, plus the provider-reported token usage so the
+    /// caller can add it to the run's cost ledger.
+    async fn llm_max_usage(&self, model: &str, system: &str, user_text: &str, max_tokens: u32) -> Result<(String, LlmUsage), ApiError> {
         let (api_key, base, template) = self.ai_credentials();
         if api_key.is_empty() && !template.local {
             return Err(err(StatusCode::SERVICE_UNAVAILABLE, "No API key configured — set one in AI Config"));
@@ -1055,7 +1286,13 @@ impl App {
             return Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team"));
         }
 
-        let client = reqwest::Client::new();
+        // A provider that accepts the connection and then goes silent would
+        // otherwise hang the step (and the whole run) forever.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client init failed: {e}")))?;
         let resp: reqwest::Response = if template.protocol == "anthropic" {
             client.post(format!("{base}/v1/messages"))
                 .header("x-api-key", &api_key)
@@ -1089,6 +1326,20 @@ impl App {
         let data: Value = resp.json().await
             .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("AI request failed: {e}")))?;
 
+        let usage = if template.protocol == "openai" {
+            LlmUsage {
+                input_tokens: data.pointer("/usage/prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: data.pointer("/usage/completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        } else {
+            LlmUsage {
+                input_tokens: data.pointer("/usage/input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    + data.pointer("/usage/cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                    + data.pointer("/usage/cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: data.pointer("/usage/output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            }
+        };
+
         // content arrives as a plain string or, on some OpenAI-compatible
         // servers, as an array of typed parts — accept both shapes
         let text = if template.protocol == "openai" {
@@ -1110,7 +1361,7 @@ impl App {
             }).unwrap_or_default()
         };
         let text = text.trim().to_string();
-        if !text.is_empty() { return Ok(text); }
+        if !text.is_empty() { return Ok((text, usage)); }
 
         // 200 but no usable text — name the likely cause instead of a bare
         // empty string, so callers (llm_retry) and the UI can react to it
@@ -1141,8 +1392,8 @@ fn json_ok(v: Value) -> Response {
     Json(v).into_response()
 }
 
-async fn health(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "status": "healthy", "docker": app.docker.is_some() }))
+async fn health(State(_app): State<App>) -> Json<Value> {
+    Json(json!({ "status": "healthy", "mode": "host", "tmux": hostexec::tmux_available() }))
 }
 
 async fn list_providers() -> Json<Value> {
@@ -1255,19 +1506,21 @@ struct ListQuery {
     all: bool,
 }
 
-async fn list_containers(State(app): State<App>, Query(q): Query<ListQuery>) -> ApiResult {
-    // Default: only containers managed by this platform. ?all=true returns everything on the host.
-    let mut builder = ListContainersOptionsBuilder::new().all(true);
-    if !q.all {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-        builder = builder.filters(&filters);
+/// GET /containers — synthetic rows for host agents: the persisted registry
+/// (every agent ever started) plus any live agent-* session not yet known.
+/// `?all=true` is accepted and ignored (there is only one machine).
+async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q): Query<ListQuery>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut names: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.agents.iter().cloned().collect()
+    };
+    for s in hostexec::list_sessions().await {
+        if s.starts_with("agent-") && !names.contains(&s) {
+            names.push(s);
+        }
     }
-    let opts = builder.build();
-    let list = app.docker()?
-        .list_containers(Some(opts))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    names.sort();
 
     let (paused, last_activity) = {
         let store = app.store.lock().unwrap();
@@ -1276,24 +1529,26 @@ async fn list_containers(State(app): State<App>, Query(q): Query<ListQuery>) -> 
     let now = now_secs();
 
     let mut rows = Vec::new();
-    for c in list {
-        let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-        // exited + registered = platform-paused (manual or idle sweeper)
-        let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into());
+    for name in names {
+        let role = hostexec::role_of(&name).to_string();
+        let alive = hostexec::session_alive(&name).await;
+        // not alive + registered in paused.json = platform-paused (manual or idle sweeper)
+        let paused_info = if alive { None } else { paused.get(&name) };
+        let status = match paused_info {
+            Some(_) => "paused",
+            None if alive => "running",
+            None => "exited",
+        };
         let mut row = json!({
-            "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
+            "id": name,
             "name": name,
-            "status": &status,
-            "image": c.image.clone().unwrap_or_else(|| "unknown".into()),
-            "labels": c.labels.clone().unwrap_or_default(),
+            "status": status,
+            "image": "host",
+            "labels": { "role": role },
         });
-        if status == "exited" {
-            if let Some(p) = paused.get(&name) {
-                status = "paused".into();
-                row["status"] = json!("paused");
-                row["paused_since"] = json!(p.since);
-                row["auto_paused"] = json!(p.auto);
-            }
+        if let Some(p) = paused_info {
+            row["paused_since"] = json!(p.since);
+            row["auto_paused"] = json!(p.auto);
         }
         if status == "running" {
             let last = last_activity.get(&name).copied().unwrap_or(now);
@@ -1304,121 +1559,73 @@ async fn list_containers(State(app): State<App>, Query(q): Query<ListQuery>) -> 
     Ok(json_ok(Value::Array(rows)))
 }
 
+/// POST /containers — start a host agent: register it and ensure its tmux
+/// session. Image/command fields are accepted and ignored (the "box" is this
+/// machine with its real tools).
 async fn create_container(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ContainerCreate>) -> ApiResult {
     app.require_auth(&headers)?;
-    let image = req.image.unwrap_or_else(|| app.store.lock().unwrap().config.default_image.clone());
-    let mut labels = HashMap::new();
-    labels.insert("role".to_string(), req.role.clone());
-    labels.insert(MANAGED_LABEL.to_string(), MANAGED_VALUE.to_string());
-
-    let cmd = req.command.clone().or_else(|| {
-        if image.starts_with("alpine") {
-            Some(vec!["sh".to_string(), "-c".to_string(), "sleep infinity".to_string()])
-        } else {
-            None
-        }
-    });
-
-    let config = Config {
-        image: Some(image),
-        labels: Some(labels),
-        env: Some(vec![format!("ROLE={}", req.role)]),
-        cmd,
-        host_config: Some(bollard::models::HostConfig {
-            network_mode: Some(AGENT_NETWORK.to_string()),
-            // docker.sock: the deploy stage runs `docker compose up` from inside
-            // an agent container against the HOST daemon (accepted risk: single-
-            // user platform, the orchestrator already holds the full socket).
-            binds: Some(vec![
-                format!("{WORKSPACE_VOLUME}:/workspace"),
-                "/var/run/docker.sock:/var/run/docker.sock".to_string(),
-            ]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let docker = app.docker()?;
-    let created = docker.create_container(Some(CreateContainerOptions { name: req.name.clone(), platform: None }), config)
+    let name = req.name.trim().to_string();
+    if name.is_empty() || req.role.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name and role are required"));
+    }
+    hostexec::ensure_session(&name)
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    docker.start_container(&created.id, None::<StartContainerOptions>)
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    app.touch_activity(&req.name);
-    let inspect = app.inspect(&created.id).await?;
-
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    app.register_agent(&name);
+    app.touch_activity(&name);
     Ok(json_ok(json!({
-        "id": created.id.chars().take(12).collect::<String>(),
-        "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "status": App::status_of(&inspect),
+        "id": name,
+        "name": name,
+        "status": "running",
     })))
 }
 
+/// POST /containers/{ident}/{action} — lifecycle on tmux semantics:
+/// start/resume = ensure the session; stop = kill it (user stop); pause =
+/// kill it AND register as platform-paused; restart = kill + ensure.
 async fn container_action(State(app): State<App>, headers: axum::http::HeaderMap, Path((ident, action)): Path<(String, String)>) -> ApiResult {
     app.require_auth(&headers)?;
-    let docker = app.docker()?;
-    let managed = app.inspect_managed(&ident).await?;
-    let id = managed.id.clone().unwrap_or_default();
-    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    let result: Result<(), bollard::errors::Error> = match action.as_str() {
-        "start" => {
-            let r = docker.start_container(&id, None::<StartContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+    let name = app.resolve_agent(&ident).await?;
+    let action_status = |s: &str| json!({ "id": name, "name": name, "status": s });
+    match action.as_str() {
+        "start" | "resume" => {
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("running")))
         }
+        // A user stop must never keep rendering as platform-paused.
         "stop" => {
-            // A user stop must never keep rendering as platform-paused.
-            let r = docker.stop_container(&id, None::<StopContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+            hostexec::kill_session(&name).await;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("exited")))
         }
         "restart" => {
-            let r = docker.restart_container(&id, None::<RestartContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+            hostexec::kill_session(&name).await;
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("running")))
         }
+        // Platform pause = kill the session + a registry entry so the UI can
+        // tell it apart from a user stop (and the sweeper's transparent
+        // revive still applies).
         "pause" => {
-            // Platform pause = real docker stop (frees RAM on the host) + a
-            // registry entry so the UI can tell it apart from a user stop.
-            return match docker.stop_container(&id, None::<StopContainerOptions>).await {
-                Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {
-                    app.mark_paused(&name, false);
-                    Ok(json_ok(json!({
-                        "id": id.chars().take(12).collect::<String>(),
-                        "name": name,
-                        "status": "paused",
-                    })))
-                }
-                Err(e) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
-            };
+            hostexec::kill_session(&name).await;
+            app.mark_paused(&name, false);
+            Ok(json_ok(action_status("paused")))
         }
-        "resume" => {
-            if !app.resume_paused(&id, &name).await {
-                return Err(err(StatusCode::BAD_REQUEST, "could not resume container"));
-            }
-            Ok(())
-        }
-        other => return Err(err(StatusCode::NOT_FOUND, format!("Unknown action '{other}'"))),
-    };
-    result.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let inspect = app.inspect(&id).await?;
-    Ok(json_ok(json!({
-        "id": id.chars().take(12).collect::<String>(),
-        "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "status": App::status_of(&inspect),
-    })))
+        other => Err(err(StatusCode::NOT_FOUND, format!("Unknown action '{other}'"))),
+    }
 }
 
+/// DELETE /containers/{ident} — kill the session and unregister the agent.
+/// The shared workspace is NEVER touched: deliverables and the cloned repo
+/// outlive every agent.
 async fn delete_container(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let id = managed.id.clone().unwrap_or_default();
-    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    app.docker()?
-        .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = app.resolve_agent(&ident).await?;
+    hostexec::kill_session(&name).await;
     {
         let mut store = app.store.lock().unwrap();
         if store.paused.remove(&name).is_some() {
@@ -1426,18 +1633,22 @@ async fn delete_container(State(app): State<App>, headers: axum::http::HeaderMap
         }
         store.last_activity.remove(&name);
     }
+    app.unregister_agent(&name);
     Ok(json_ok(json!({ "id": ident, "status": "deleted" })))
 }
 
 async fn exec_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.ensure_running(&ident).await?;
-    let (exit_code, output) = app.exec_in(managed.id.as_deref().unwrap_or_default(), &req.command).await?;
+    let name = app.ensure_running(&ident).await?;
+    let (exit_code, output) = app.exec_in(&name, &req.command).await?;
     Ok(json_ok(json!({ "exit_code": exit_code, "output": output })))
 }
 
 // ---------------------------------------------------------------------------
-// Interactive terminal — WebSocket ↔ Docker exec TTY bridge
+// Interactive terminal — WebSocket ↔ host PTY, attached to the agent's tmux
+// session through a private grouped session (windows are shared with the
+// base session, so web terminals — several at once — and the user's own
+// `tmux attach` all watch the same agent without fighting over it)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1460,102 +1671,114 @@ async fn terminal_ws(
             return (StatusCode::UNAUTHORIZED, "Login required").into_response();
         }
     }
-    let managed = match app.ensure_running(&ident).await {
-        Ok(m) => m,
+    let agent = match app.ensure_running(&ident).await {
+        Ok(n) => n,
         Err(e) => return e.into_response(),
     };
-    let container_id = managed.id.unwrap_or_default();
-    let container_name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
     let initial = (params.cols.unwrap_or(80), params.rows.unwrap_or(24));
-    ws.on_upgrade(move |socket| terminal_session(app, socket, container_id, container_name, initial))
+    ws.on_upgrade(move |socket| terminal_session(app, socket, agent, initial))
 }
 
-/// Pick the best interactive shell available inside the container.
-async fn pick_shell(app: &App, container_id: &str) -> &'static str {
-    if let Ok((_, out)) = app.exec_in(container_id, "command -v bash").await {
-        if out.trim().contains("bash") {
-            return "/bin/bash";
-        }
-    }
-    "/bin/sh"
-}
+/// Bridge a browser terminal to a real PTY running the tmux attach. Binary
+/// frames carry terminal bytes both ways; text frames are control messages
+/// (`{"resize":{"cols":n,"rows":r}}`). Every browser frame counts as agent
+/// activity so the idle sweeper leaves live sessions alone.
+async fn terminal_session(app: App, mut socket: WebSocket, agent: String, (cols, rows): (u16, u16)) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
 
-/// Bridge a browser terminal to a real PTY-backed shell via `docker exec`.
-/// Binary frames carry terminal bytes both ways; text frames are control
-/// messages (`{"resize":{"cols":n,"rows":r}}`). Every browser frame counts
-/// as container activity so the idle sweeper leaves live sessions alone.
-async fn terminal_session(app: App, socket: WebSocket, container_id: String, container_name: String, (cols, rows): (u16, u16)) {
-    let mut socket = socket;
-    let docker = match app.docker() {
-        Ok(d) => d.clone(),
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
+        Ok(p) => p,
         Err(e) => {
-            let _ = socket.send(Message::Text(format!("docker unavailable: {}\r\n", e.1).into())).await;
+            let _ = socket.send(Message::Text(format!("pty open failed: {e}\r\n").into())).await;
             return;
         }
     };
 
-    let shell = pick_shell(&app, &container_id).await;
-    let exec = match docker.create_exec(&container_id, CreateExecOptions::<&str> {
-        cmd: Some(vec![shell, "-l"]),
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        tty: Some(true),
-        env: Some(vec!["TERM=xterm-256color"]),
-        ..Default::default()
-    }).await {
-        Ok(e) => e,
+    let group = format!("aap-web-{}", app.seq.fetch_add(1, Ordering::SeqCst));
+    let mut cmd = if hostexec::tmux_available() {
+        if let Err(e) = hostexec::ensure_session(&agent).await {
+            let _ = socket.send(Message::Text(format!("agent session unavailable: {e}\r\n").into())).await;
+            return;
+        }
+        let mut cmd = CommandBuilder::new("tmux");
+        for a in hostexec::attach_argv(&agent, &group) {
+            cmd.arg(a);
+        }
+        cmd
+    } else {
+        // headless fallback — a plain shell in the shared workspace
+        let mut cmd = CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()));
+        cmd.cwd(hostexec::workspace_dir());
+        cmd
+    };
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
         Err(e) => {
-            let _ = socket.send(Message::Text(format!("failed to start shell: {e}\r\n").into())).await;
+            let _ = socket.send(Message::Text(format!("failed to start attach: {e}\r\n").into())).await;
+            return;
+        }
+    };
+    drop(pair.slave);
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("pty reader failed: {e}\r\n").into())).await;
+            return;
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("pty writer failed: {e}\r\n").into())).await;
             return;
         }
     };
 
-    let (mut input, output) = match docker.start_exec(&exec.id, None).await {
-        Ok(StartExecResults::Attached { input, output }) => (input, output),
-        Ok(_) => {
-            let _ = socket.send(Message::Text("shell detached unexpectedly\r\n".into())).await;
-            return;
+    // PTY → browser: blocking reads on a plain thread, forwarded over a channel
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        Err(e) => {
-            let _ = socket.send(Message::Text(format!("failed to attach shell: {e}\r\n").into())).await;
-            return;
-        }
-    };
-
-    // Match the PTY to the browser terminal size before the first prompt renders
-    let _ = docker.resize_exec(&exec.id, ResizeExecOptions { width: cols, height: rows }).await;
-
+    });
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let exec_id = exec.id.clone();
-
-    // Container → browser
     let pump = tokio::spawn(async move {
-        let mut output = output;
-        while let Some(Ok(frame)) = output.next().await {
-            if ws_tx.send(Message::Binary(frame.into_bytes().into())).await.is_err() {
+        while let Some(chunk) = rx.recv().await {
+            if ws_tx.send(Message::Binary(chunk.into())).await.is_err() {
                 break;
             }
         }
-        // Shell exited — close the socket so the UI can offer reconnect
+        // attach exited — close the socket so the UI can offer reconnect
         let _ = ws_tx.send(Message::Close(None)).await;
     });
 
-    // Browser → container
+    // Browser → PTY
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(data) => {
-                app.touch_activity(&container_name);
-                if input.write_all(&data).await.is_err() {
+                app.touch_activity(&agent);
+                if writer.write_all(&data).is_err() {
                     break;
                 }
-                let _ = input.flush().await;
+                let _ = writer.flush();
             }
             Message::Text(txt) => {
                 if let Some(sz) = serde_json::from_str::<Value>(txt.as_str()).ok().and_then(|v| v.get("resize").cloned()) {
                     let c = sz.get("cols").and_then(|x| x.as_u64()).unwrap_or(80) as u16;
                     let r = sz.get("rows").and_then(|x| x.as_u64()).unwrap_or(24) as u16;
-                    let _ = docker.resize_exec(&exec_id, ResizeExecOptions { width: c, height: r }).await;
+                    let _ = pair.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
                 }
             }
             Message::Close(_) => break,
@@ -1563,48 +1786,23 @@ async fn terminal_session(app: App, socket: WebSocket, container_id: String, con
         }
     }
     pump.abort();
-    let _ = input.shutdown().await;
+    let _ = child.kill();
+    hostexec::kill_session(&group).await;
 }
 
 // ---------------------------------------------------------------------------
 // Handlers — stats / inspect / files
 // ---------------------------------------------------------------------------
 
+/// GET /containers/{ident}/stats — host agents have no per-cgroup numbers;
+/// the honest equivalents: derived status (+paused overlay) and the shared
+/// workspace's real disk usage. cpu/mem/net are null and the UI renders "—".
 async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
-    let id = inspect.id.clone().unwrap_or_default();
-    let opts = StatsOptionsBuilder::new().stream(false).build();
-    let mut stream = app.docker()?.stats(&id, Some(opts));
-    let stats = stream.next().await
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no stats"))?
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = app.resolve_agent(&ident).await?;
 
-    let zero = bollard::models::ContainerCpuStats::default();
-    let zero_usage = bollard::models::ContainerCpuUsage::default();
-    let cpu = stats.cpu_stats.as_ref().unwrap_or(&zero);
-    let pre = stats.precpu_stats.as_ref().unwrap_or(&zero);
-    let cpu_total = cpu.cpu_usage.as_ref().unwrap_or(&zero_usage).total_usage.unwrap_or(0) as f64;
-    let pre_total = pre.cpu_usage.as_ref().unwrap_or(&zero_usage).total_usage.unwrap_or(0) as f64;
-    let cpu_delta = cpu_total - pre_total;
-    let sys_delta = cpu.system_cpu_usage.unwrap_or(0) as f64 - pre.system_cpu_usage.unwrap_or(0) as f64;
-    let online = cpu.online_cpus
-        .map(|n| n as f64)
-        .or_else(|| cpu.cpu_usage.as_ref().unwrap_or(&zero_usage).percpu_usage.as_ref().map(|v| v.len() as f64))
-        .unwrap_or(1.0)
-        .max(1.0);
-    let cpu_percent = if sys_delta > 0.0 { (cpu_delta / sys_delta) * online * 100.0 } else { 0.0 };
-
-    let mem = stats.memory_stats.clone().unwrap_or_default();
-    let mem_used = mem.usage.unwrap_or(0);
-    let mem_limit = mem.limit.unwrap_or(0);
-    let (net_rx, net_tx) = stats.networks.as_ref()
-        .map(|nws| nws.values().fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes.unwrap_or(0), tx + n.tx_bytes.unwrap_or(0))))
-        .unwrap_or((0, 0));
-
-    // Disk size of the container's root fs — `df` runs INSIDE so overlays/volumes
-    // report what the agent actually sees. Best-effort: null when exec fails (stopped).
-    let (disk_used, disk_total) = match app.exec_in(&id, "df -P / | tail -1").await {
+    let ws = hostexec::workspace_str();
+    let (disk_used, disk_total) = match app.exec_in(&name, &format!("df -P '{ws}' | tail -1")).await {
         Ok((0, out)) => {
             let f: Vec<&str> = out.split_whitespace().collect();
             match (f.get(1).and_then(|s| s.parse::<u64>().ok()), f.get(2).and_then(|s| s.parse::<u64>().ok())) {
@@ -1616,27 +1814,25 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
         _ => (Value::Null, Value::Null),
     };
 
-    // exited + registered = platform-paused; the detail page's stats poll
-    // uses this field to keep its status badge in sync (sweeper, auto-resume).
-    let name = inspect.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    let mut status = App::status_of(&inspect);
+    // the detail page's stats poll uses this field to keep its status badge
+    // in sync (sweeper, transparent revive)
+    let status = app.agent_state(&name).await;
     let mut paused_since = Value::Null;
     let mut auto_paused = Value::Null;
-    if status == "exited" {
+    if status == "paused" {
         let store = app.store.lock().unwrap();
         if let Some(p) = store.paused.get(&name) {
-            status = "paused".into();
             paused_since = json!(p.since);
             auto_paused = json!(p.auto);
         }
     }
 
     Ok(json_ok(json!({
-        "cpu_percent": (cpu_percent * 100.0).round() / 100.0,
-        "mem_used": mem_used,
-        "mem_limit": mem_limit,
-        "net_rx": net_rx,
-        "net_tx": net_tx,
+        "cpu_percent": Value::Null,
+        "mem_used": Value::Null,
+        "mem_limit": Value::Null,
+        "net_rx": Value::Null,
+        "net_tx": Value::Null,
         "disk_used": disk_used,
         "disk_total": disk_total,
         "status": status,
@@ -1645,42 +1841,21 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
     })))
 }
 
+/// GET /containers/{ident}/inspect — minimal synthetic view of a host agent.
 async fn container_inspect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let c = app.inspect(&ident).await?;
-    let empty = HashMap::new();
-    let labels = c.config.as_ref().and_then(|cfg| cfg.labels.as_ref()).unwrap_or(&empty);
-    let networks = c.network_settings.as_ref().and_then(|ns| ns.networks.clone()).unwrap_or_default();
-
-    let nets: Vec<Value> = networks.iter().map(|(name, n)| {
-        let mut ips: Vec<String> = n.ipam_config.as_ref().into_iter()
-            .filter_map(|ipam| ipam.ipv4_address.clone().or_else(|| ipam.ipv6_address.clone()))
-            .collect();
-        if let Some(ip) = &n.ip_address { if !ip.is_empty() { ips.push(ip.clone()); } }
-        ips.retain(|s| !s.is_empty());
-        json!({
-            "name": name,
-            "ip": ips,
-            "aliases": n.aliases.clone().unwrap_or_default().into_iter().filter(|a| !a.is_empty()).collect::<Vec<_>>(),
-        })
-    }).collect();
-
-    let restart_policy = c.host_config.as_ref()
-        .and_then(|h| h.restart_policy.as_ref())
-        .and_then(|p| p.name.as_ref())
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "no".into());
-
+    let name = app.resolve_agent(&ident).await?;
+    let status = app.agent_state(&name).await;
     Ok(json_ok(json!({
-        "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
-        "name": c.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "image": c.config.as_ref().and_then(|cfg| cfg.image.clone()).unwrap_or_default(),
-        "created": c.created.as_ref().map(|d| d.to_string()).unwrap_or_default(),
-        "state": c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_default(),
-        "started_at": c.state.as_ref().and_then(|s| s.started_at.as_ref()).map(|d| d.to_string()).unwrap_or_default(),
-        "restart_policy": restart_policy,
-        "labels": labels,
-        "networks": nets,
+        "id": name,
+        "name": name,
+        "image": "host",
+        "created": "",
+        "state": status,
+        "started_at": "",
+        "restart_policy": "no",
+        "labels": { "role": hostexec::role_of(&name) },
+        "networks": [],
     })))
 }
 
@@ -1690,17 +1865,18 @@ struct FilesQuery {
     path: String,
 }
 
-fn default_files_path() -> String { "/workspace".into() }
+fn default_files_path() -> String { hostexec::workspace_str() }
 
 async fn container_files(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Query(q): Query<FilesQuery>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
-    let status = App::status_of(&inspect);
+    let name = app.resolve_agent(&ident).await?;
+    let status = app.agent_state(&name).await;
     if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
+        return Err(err(StatusCode::BAD_REQUEST, format!("Agent is not running (status: {status})")));
     }
-    let cmd = format!("ls -la {} 2>&1 || ls -la /", q.path);
-    let (_, output) = app.exec_in(inspect.id.as_deref().unwrap_or_default(), &cmd).await?;
+    // q.path is user input — never interpolate it raw into a shell string.
+    let cmd = format!("ls -la -- {} 2>&1 || ls -la -- {}", hostexec::shq(&q.path), hostexec::shq(&q.path));
+    let (_, output) = app.exec_in(&name, &cmd).await?;
     Ok(json_ok(json!({ "path": q.path, "output": output })))
 }
 
@@ -1716,12 +1892,13 @@ async fn container_files(State(app): State<App>, headers: axum::http::HeaderMap,
 /// Static catalog of available connectors. Each connector lists the auth
 /// methods it supports (device = browser device flow, token = paste a
 /// personal access token); the UI renders one flow per method.
-async fn connectors_catalog() -> ApiResult {
+async fn connectors_catalog(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
     Ok(json_ok(json!([
         {
             "type": "github",
             "name": "GitHub",
-            "description": "gh CLI + git push/pull ใน container — ใช้ private repo, issue และ PR ได้จากในเครื่องนั้นโดยตรง (login แยกทีละเครื่อง)",
+            "description": "gh CLI + git push/pull ใน container — ใช้ private repo, issue และ PR ได้จากในเครื่องนั้นโดยตรง (login แยกทีละเครื่อง — หลักคือ browser device flow, วาง token เป็นทางสำรอง)",
             "auth_methods": [
                 { "id": "device", "name": "Browser (device flow)" },
                 { "id": "token", "name": "Personal access token" },
@@ -1755,13 +1932,9 @@ fn parse_gh_login(output: &str) -> Option<String> {
 /// Probe a container's GitHub connector state via exec, cached for
 /// CONNECTOR_CACHE_TTL so the UI's 5s polls don't exec every container
 /// constantly. States: connected (+login) / disconnected / unavailable
-/// (no gh binary in the image, or container not running).
-async fn github_connector_status(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> CachedConnectorStatus {
-    let container_id = inspect.id.clone().unwrap_or_default();
-    if App::status_of(inspect) != "running" {
-        return CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("container not running".into()), at: now_secs() };
-    }
-    let cache_key = format!("{container_id}:github");
+/// (no gh binary on the machine).
+async fn github_connector_status(app: &App, name: &str) -> CachedConnectorStatus {
+    let cache_key = format!("{name}:github");
     {
         let store = app.store.lock().unwrap();
         if let Some(c) = store.connector_cache.get(&cache_key) {
@@ -1773,12 +1946,12 @@ async fn github_connector_status(app: &App, inspect: &bollard::models::Container
     // One round trip: 127 = no gh binary; 0 = logged in (parse the account);
     // anything else = gh present but not logged in. Note: no GH_TOKEN-style env
     // must ever ride this exec — it would mask the stored credential.
-    let (code, output) = match app.exec_in(&container_id, "command -v gh >/dev/null 2>&1 || exit 127; gh auth status --hostname github.com").await {
+    let (code, output) = match app.exec_in(name, "command -v gh >/dev/null 2>&1 || exit 127; gh auth status --hostname github.com").await {
         Ok(r) => r,
         Err(_) => (127, String::new()),
     };
     let status = if code == 127 {
-        CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("no gh CLI in this image — use the agent-base image".into()), at: now_secs() }
+        CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("gh CLI not installed on this machine — brew install gh".into()), at: now_secs() }
     } else if code == 0 {
         CachedConnectorStatus { state: "connected".into(), login: parse_gh_login(&output), reason: None, at: now_secs() }
     } else {
@@ -1788,17 +1961,12 @@ async fn github_connector_status(app: &App, inspect: &bollard::models::Container
     status
 }
 
-/// Probe a container's Figma connector state. Figma has no CLI whose login we
-/// could ask about — the token file in the container's home IS the credential
-/// store, so the probe is a single file check (plus the handle written next to
-/// it at connect time). It works on any image, so "unavailable" here only
-/// means the container itself is not running.
-async fn figma_connector_status(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> CachedConnectorStatus {
-    let container_id = inspect.id.clone().unwrap_or_default();
-    if App::status_of(inspect) != "running" {
-        return CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("container not running".into()), at: now_secs() };
-    }
-    let cache_key = format!("{container_id}:figma");
+/// Probe the machine's Figma connector state. Figma has no CLI whose login we
+/// could ask about — the token file in the user's home IS the credential
+/// store, so the probe is a single file check (plus the handle written next
+/// to it at connect time).
+async fn figma_connector_status(app: &App, name: &str) -> CachedConnectorStatus {
+    let cache_key = format!("{name}:figma");
     {
         let store = app.store.lock().unwrap();
         if let Some(c) = store.connector_cache.get(&cache_key) {
@@ -1808,9 +1976,9 @@ async fn figma_connector_status(app: &App, inspect: &bollard::models::ContainerI
         }
     }
     // 0 = token file present (stdout = saved handle); anything else = not
-    // connected. A docker/exec failure also lands in "disconnected" — the
-    // container is the source of truth and the next poll re-derives it.
-    let (code, output) = match app.exec_in(&container_id,
+    // connected. An exec failure also lands in "disconnected" — the machine
+    // is the source of truth and the next poll re-derives it.
+    let (code, output) = match app.exec_in(name,
         r#"[ -f "$HOME/.config/figma/token" ] || exit 1; cat "$HOME/.config/figma/user" 2>/dev/null"#,
     ).await {
         Ok(r) => r,
@@ -1835,13 +2003,12 @@ fn connector_json(ctype: &str, status: &CachedConnectorStatus) -> Value {
     })
 }
 
-/// Current GitHub connector state for one container. An active device flow
-/// wins over the probe so a refreshed dialog can resume with its user code.
-async fn github_state_json(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> Value {
-    let container_id = inspect.id.clone().unwrap_or_default();
+/// Current GitHub connector state for one agent. An active device flow wins
+/// over the probe so a refreshed dialog can resume with its user code.
+async fn github_state_json(app: &App, name: &str) -> Value {
     let pending = {
         let store = app.store.lock().unwrap();
-        store.pending_device_flows.get(&container_id)
+        store.pending_device_flows.get(name)
             .filter(|f| f.expires_at > now_secs())
             .map(|f| json!({
                 "type": "github", "state": "pending", "login": null, "reason": null,
@@ -1850,59 +2017,47 @@ async fn github_state_json(app: &App, inspect: &bollard::models::ContainerInspec
     };
     match pending {
         Some(v) => v,
-        None => connector_json("github", &github_connector_status(app, inspect).await),
+        None => connector_json("github", &github_connector_status(app, name).await),
     }
 }
 
-/// GET /containers/{ident}/connectors — per-connector state for one container.
+/// GET /containers/{ident}/connectors — per-connector state for one agent.
 async fn container_connectors(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
+    let name = app.resolve_agent(&ident).await?;
     Ok(json_ok(json!([
-        github_state_json(&app, &inspect).await,
-        connector_json("figma", &figma_connector_status(&app, &inspect).await),
+        github_state_json(&app, &name).await,
+        connector_json("figma", &figma_connector_status(&app, &name).await),
     ])))
 }
 
-/// GET /connectors/status — every managed container × its connector states,
+/// GET /connectors/status — every registered agent × its connector states,
 /// for the connectors overview page.
 async fn connectors_status(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
     app.require_auth(&headers)?;
-    let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-    let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-    let list = app.docker()?
-        .list_containers(Some(opts))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut names: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.agents.iter().cloned().collect()
+    };
+    for s in hostexec::list_sessions().await {
+        if s.starts_with("agent-") && !names.contains(&s) {
+            names.push(s);
+        }
+    }
+    names.sort();
 
     let mut rows = Vec::new();
-    for c in list {
-        let id = c.id.clone().unwrap_or_default();
-        let state = c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into());
-        let (github, figma) = if state != "running" {
-            (
-                json!({ "type": "github", "state": "unavailable", "login": null, "reason": "container not running" }),
-                json!({ "type": "figma", "state": "unavailable", "login": null, "reason": "container not running" }),
-            )
-        } else {
-            match app.inspect(&id).await {
-                Ok(inspect) => (
-                    github_state_json(&app, &inspect).await,
-                    connector_json("figma", &figma_connector_status(&app, &inspect).await),
-                ),
-                Err(_) => (
-                    json!({ "type": "github", "state": "unavailable", "login": null, "reason": "inspect failed" }),
-                    json!({ "type": "figma", "state": "unavailable", "login": null, "reason": "inspect failed" }),
-                ),
-            }
-        };
+    for name in names {
+        let (github, figma) = (
+            github_state_json(&app, &name).await,
+            connector_json("figma", &figma_connector_status(&app, &name).await),
+        );
         rows.push(json!({
-            "id": id.chars().take(12).collect::<String>(),
-            "name": c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            "status": state,
-            "image": c.image.clone().unwrap_or_default(),
-            "role": c.labels.as_ref().and_then(|l| l.get("role").cloned()).unwrap_or_default(),
+            "id": name,
+            "name": name,
+            "status": app.agent_state(&name).await,
+            "image": "host",
+            "role": hostexec::role_of(&name),
             "connectors": [github, figma],
         }));
     }
@@ -1914,20 +2069,15 @@ async fn connectors_status(State(app): State<App>, headers: axum::http::HeaderMa
 /// once the user approves, is injected by the spawned poll task.
 async fn github_connect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
 
-    // gh binary present? (agent-base ships it; bare alpine does not)
-    let (gh_ok, _) = app.exec_in(&container_id, "command -v gh >/dev/null 2>&1").await?;
+    // gh binary present on this machine?
+    let (gh_ok, _) = app.exec_in(&name, "command -v gh >/dev/null 2>&1").await?;
     if gh_ok != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not found in this container — create it from the agent-base image to connect GitHub"));
+        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not installed on this machine — brew install gh to connect GitHub"));
     }
 
-    let (user_code, verification_url, expires_in) = start_github_device_flow(&app, &container_id).await?;
+    let (user_code, verification_url, expires_in) = start_github_device_flow(&app, &name).await?;
     Ok(json_ok(json!({ "user_code": user_code, "verification_url": verification_url, "expires_in": expires_in })))
 }
 
@@ -2123,27 +2273,23 @@ async fn poll_github_device_flow(app: App, container_id: String) {
 }
 
 /// POST /containers/{ident}/connectors/github/disconnect — remove gh
-/// credentials from the container (best-effort, from inside the box).
+/// credentials from this MACHINE (best-effort). One machine = one identity:
+/// this logs the whole team out, which is exactly the per-machine semantics.
 async fn github_disconnect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     // `gh auth logout` prompts for confirmation and aborts without a TTY —
     // pipe "y" AND remove the credential file directly so the logout is real
     // either way. Best-effort: the trailing `true` makes the exit code 0.
-    let (_, output) = app.exec_in(&container_id,
+    let (_, output) = app.exec_in(&name,
         r#"printf 'y\n' | gh auth logout --hostname github.com 2>/dev/null; rm -f "$HOME/.config/gh/hosts.yml"; git config --global --unset credential.https://github.com.helper 2>/dev/null; true"#
     ).await?;
     {
         let mut store = app.store.lock().unwrap();
         // also drop any in-flight device flow: approving its code after a
-        // disconnect must NOT silently re-login the container
-        store.pending_device_flows.remove(&container_id);
-        store.connector_cache.remove(format!("{container_id}:github").as_str());
+        // disconnect must NOT silently re-login the machine
+        store.pending_device_flows.remove(&name);
+        store.connector_cache.remove(format!("{name}:github").as_str());
     }
     Ok(json_ok(json!({ "type": "github", "state": "disconnected", "output": output })))
 }
@@ -2156,38 +2302,29 @@ async fn github_disconnect(State(app): State<App>, headers: axum::http::HeaderMa
 /// what git push needs.
 async fn github_connect_token(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, axum::Json(body): axum::Json<TokenAuthBody>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
-    let (gh_ok, _) = app.exec_in(&container_id, "command -v gh >/dev/null 2>&1").await?;
+    let name = app.resolve_agent(&ident).await?;
+    let (gh_ok, _) = app.exec_in(&name, "command -v gh >/dev/null 2>&1").await?;
     if gh_ok != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not found in this container — create it from the agent-base image to connect GitHub"));
+        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not installed on this machine — brew install gh to connect GitHub"));
     }
     let token = body.token.trim();
     if token.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Token is required"));
     }
-    let login = inject_github_token(&app, &container_id, token).await?;
+    let login = inject_github_token(&app, &name, token).await?;
     Ok(json_ok(json!({ "type": "github", "state": "connected", "login": login })))
 }
 
 /// POST /containers/{ident}/connectors/figma/connect-token — Figma only has
 /// one auth method here: a personal access token (Figma account → Settings →
 /// Security → Personal access tokens). Validated against /v1/me, then written
-/// into the container as ~/.config/figma/token (+ FIGMA_TOKEN exported in the
-/// shell profiles) so any shell or agent in the box can call the REST API.
-/// The token rides the exec ENV — never the command string, Store, or logs.
+/// into the user's real ~/.config/figma/token (+ FIGMA_TOKEN exported in the
+/// shell profiles) so any shell or agent on the machine can call the REST
+/// API. The token rides the exec script env — never the command string,
+/// Store, or logs.
 async fn figma_connect_token(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, axum::Json(body): axum::Json<TokenAuthBody>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     let token = body.token.trim();
     if token.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Token is required"));
@@ -2213,12 +2350,12 @@ async fn figma_connect_token(State(app): State<App>, headers: axum::http::Header
     // Write token + handle into ~/.config/figma, and export FIGMA_TOKEN from
     // the token file in both shell profiles (idempotent — one line max).
     let script = r#"mkdir -p "$HOME/.config/figma" && printf %s "$FIGMA_AUTH_TOKEN" > "$HOME/.config/figma/token" && printf %s "$FIGMA_AUTH_USER" > "$HOME/.config/figma/user" && line='export FIGMA_TOKEN="$(cat "$HOME/.config/figma/token" 2>/dev/null)"' && { grep -q 'FIGMA_TOKEN' "$HOME/.profile" 2>/dev/null || echo "$line" >> "$HOME/.profile"; } && { grep -q 'FIGMA_TOKEN' "$HOME/.bashrc" 2>/dev/null || echo "$line" >> "$HOME/.bashrc"; }"#;
-    let (code, _) = app.exec_in_env(&container_id, script, vec![
+    let (code, _) = app.exec_in_env(&name, script, vec![
         format!("FIGMA_AUTH_TOKEN={token}"),
         format!("FIGMA_AUTH_USER={handle}"),
     ]).await?;
 
-    let cache_key = format!("{container_id}:figma");
+    let cache_key = format!("{name}:figma");
     let mut store = app.store.lock().unwrap();
     if code == 0 {
         store.connector_cache.insert(cache_key, CachedConnectorStatus {
@@ -2230,56 +2367,42 @@ async fn figma_connect_token(State(app): State<App>, headers: axum::http::Header
         Ok(json_ok(json!({ "type": "figma", "state": "connected", "login": handle })))
     } else {
         store.connector_cache.remove(cache_key.as_str());
-        Err(err(StatusCode::BAD_GATEWAY, "Failed to write the token into the container"))
+        Err(err(StatusCode::BAD_GATEWAY, "Failed to write the token onto this machine"))
     }
 }
 
 /// POST /containers/{ident}/connectors/figma/disconnect — remove the token
-/// files and the profile exports from the container (best-effort).
+/// files and the profile exports (best-effort). BSD sed needs the explicit
+/// empty backup suffix on macOS.
 async fn figma_disconnect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
-    let (_, output) = app.exec_in(&container_id,
-        r#"rm -rf "$HOME/.config/figma"; sed -i '/FIGMA_TOKEN/d' "$HOME/.profile" "$HOME/.bashrc" 2>/dev/null; true"#
+    let name = app.resolve_agent(&ident).await?;
+    let (_, output) = app.exec_in(&name,
+        r#"rm -rf "$HOME/.config/figma"; sed -i '' '/FIGMA_TOKEN/d' "$HOME/.profile" "$HOME/.bashrc" 2>/dev/null; true"#
     ).await?;
-    app.store.lock().unwrap().connector_cache.remove(format!("{container_id}:figma").as_str());
+    app.store.lock().unwrap().connector_cache.remove(format!("{name}:figma").as_str());
     Ok(json_ok(json!({ "type": "figma", "state": "disconnected", "output": output })))
 }
 
 /// POST /containers/{ident}/connectors/github/open-browser — open the device
-/// verification URL in the container's own desktop browser (agent-base runs
-/// Xvnc on :1), so the login happens "on that machine" like the user wants.
+/// verification URL in the user's REAL browser (macOS `open`), so the login
+/// happens "on this machine" like the user wants.
 async fn github_open_browser(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     // URL comes from the stored pending flow — never from client input
     let url = {
         let store = app.store.lock().unwrap();
-        store.pending_device_flows.get(&container_id)
+        store.pending_device_flows.get(&name)
             .filter(|f| f.expires_at > now_secs())
             .map(|f| f.verification_url.clone())
     };
     let Some(url) = url else {
         return Err(err(StatusCode::BAD_REQUEST, "No active GitHub login flow — click Connect first"));
     };
-    // chromium as root needs --no-sandbox; launched detached (&) so the exec
-    // returns immediately instead of waiting for the browser to exit.
-    let script = format!(
-        r#"command -v chromium >/dev/null 2>&1 || exit 127; (chromium --no-sandbox --disable-dev-shm-usage '{url}' >/dev/null 2>&1 &)"#
-    );
-    let (code, _) = app.exec_in_env(&container_id, &script, vec!["DISPLAY=:1".to_string()]).await?;
+    let (code, _) = app.exec_in(&name, &format!("command -v open >/dev/null 2>&1 || exit 127; open '{url}'")).await?;
     if code != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "No chromium browser in this container — open the URL on any browser instead"));
+        return Err(err(StatusCode::BAD_REQUEST, "could not open the browser on this machine — open the URL manually instead"));
     }
     Ok(json_ok(json!({ "opened": true, "url": url })))
 }
@@ -2290,15 +2413,12 @@ async fn github_open_browser(State(app): State<App>, headers: axum::http::Header
 
 async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.ensure_running(&ident).await?;
+    let agent = app.ensure_running(&ident).await?;
 
-    let role_label = managed.config.as_ref()
-        .and_then(|c| c.labels.as_ref())
-        .and_then(|l| l.get("role").cloned())
-        .unwrap_or_default();
+    let role_label = hostexec::role_of(&agent).to_string();
     let persona = app.store.lock().unwrap().personas.iter().find(|p| p.role == role_label).cloned();
     let base_prompt = persona.as_ref().map(|p| p.rules_md.clone())
-        .unwrap_or_else(|| "You are a capable autonomous Linux agent.".into());
+        .unwrap_or_else(|| "You are a capable autonomous agent working in the user's macOS shell.".into());
     let model = match app.model_for_persona(persona.as_ref()) {
         Some(m) => m,
         None => return Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
@@ -2312,19 +2432,18 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
         return Ok(json_ok(json!({ "mode": "consult", "role": role_label, "model": model, "reply": reply })));
     }
 
-    // Bot-on-a-Linux-box rule: every command runs inside this container, and
-    // the project repo is cloned into /workspace BEFORE any work — then all
-    // file/code work goes through that repo working tree only. First the
-    // default tool belt is ensured and probed, so the model is told what this
-    // box really has (and what it does NOT) instead of guessing.
-    let container_id = managed.id.clone().unwrap_or_default();
-    app.ensure_tools(&container_id).await;
-    let tools_md = app.tools_manifest(&container_id).await.unwrap_or_default();
+    // Bot-on-this-machine rule: every command runs on the host, and the
+    // project repo is cloned into the shared workspace BEFORE any work — then
+    // all file/code work goes through that repo working tree only. First the
+    // tool belt is probed, so the model is told what this machine really has
+    // (and what it does NOT) instead of guessing.
+    app.ensure_tools(&agent).await;
+    let tools_md = app.tools_manifest(&agent).await.unwrap_or_default();
     let repo_url = app.repo_for_role(&role_label);
     let (repo_path, repo_warning) = if repo_url.is_empty() {
         (None, None)
     } else {
-        match app.ensure_repo(&container_id, &repo_url).await {
+        match app.ensure_repo(&agent, &repo_url).await {
             Ok(path) => (Some(path), None),
             // one clone failure must not brick commands that don't touch the repo
             Err(e) => (None, Some(e.1)),
@@ -2333,12 +2452,20 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
 
     let repo_rules = match &repo_path {
         Some(p) => format!(
-            " The project repository is already cloned in this container at {p} — it is your working directory. Run ALL file and code work through that repo working tree ONLY (never clone, copy or recreate it elsewhere)."
+            " The project repository is already cloned on this machine at {p} — it is your working directory. Run ALL file and code work through that repo working tree ONLY (never clone, copy or recreate it elsewhere)."
         ),
         None => String::new(),
     };
+    // The project's document space, refreshed into the shared workspace — this
+    // mode runs real bash, so the agent can open those files itself on demand.
+    let docs_line = {
+        let store = app.store.lock().unwrap();
+        store.projects.iter().find(|p| p.agents.iter().any(|a| a == &role_label))
+            .map(|p| prepare_project_docs(&store, &p.id).1)
+            .unwrap_or_default()
+    };
     let system = format!(
-        "{base_prompt}\n\nYou are operating inside a Linux container (Ubuntu/Alpine, sh shell) as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe sh command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo).{tools_md}{repo_rules}"
+        "{base_prompt}\n\nYou are operating in the user's macOS shell (bash) on their Mac as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe bash command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo). Anything you launch with `open` (URLs, files) appears visibly on the user's screen.{tools_md}{repo_rules}{docs_line}"
     );
     let reply = app.llm(&model, &system, &req.command).await?;
     let command = reply.trim().trim_matches('`').lines().last().unwrap_or("").trim().to_string();
@@ -2350,7 +2477,7 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
         Some(p) => format!("cd '{p}' 2>/dev/null; {command}"),
         None => command.clone(),
     };
-    let (exit_code, output) = app.exec_in(&container_id, &exec_command).await?;
+    let (exit_code, output) = app.exec_in(&agent, &exec_command).await?;
     Ok(json_ok(json!({
         "mode": "execute", "role": role_label, "model": model, "reply": reply,
         "command": command, "exit_code": exit_code, "output": output,
@@ -2362,7 +2489,8 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
 // Handlers — personas (AI team, editable via UI with markdown rules)
 // ---------------------------------------------------------------------------
 
-async fn list_agents(State(app): State<App>) -> ApiResult {
+async fn list_agents(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
     let (personas, provider_id, default_model) = {
         let store = app.store.lock().unwrap();
         let pid = store.config.ai_provider.clone();
@@ -2370,29 +2498,22 @@ async fn list_agents(State(app): State<App>) -> ApiResult {
         (store.personas.clone(), pid, dm)
     };
     let mut running: HashMap<String, Value> = HashMap::new();
-    if let Some(docker) = app.docker.as_ref() {
-        let paused = app.store.lock().unwrap().paused.clone();
-        let opts = ListContainersOptionsBuilder::new().all(true).build();
-        if let Ok(list) = docker.list_containers(Some(opts)).await {
-            for c in list {
-                let labels = c.labels.clone().unwrap_or_default();
-                if labels.get(MANAGED_LABEL).map(|v| v == MANAGED_VALUE).unwrap_or(false) {
-                    if let Some(role) = labels.get("role") {
-                        if personas.iter().any(|p| &p.role == role) {
-                            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-                            // exited + registered = platform-paused (manual or idle sweeper)
-                            let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_default();
-                            if status == "exited" && paused.contains_key(&name) {
-                                status = "paused".into();
-                            }
-                            running.insert(role.clone(), json!({
-                                "name": name,
-                                "status": status,
-                                "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
-                            }));
-                        }
-                    }
-                }
+    {
+        let registered: Vec<String> = app.store.lock().unwrap().agents.iter().cloned().collect();
+        let mut names = registered;
+        for s in hostexec::list_sessions().await {
+            if s.starts_with("agent-") && !names.contains(&s) {
+                names.push(s);
+            }
+        }
+        for name in names {
+            let role = hostexec::role_of(&name).to_string();
+            if personas.iter().any(|p| p.role == role) {
+                running.insert(role, json!({
+                    "name": name,
+                    "status": app.agent_state(&name).await,
+                    "id": name,
+                }));
             }
         }
     }
@@ -2406,29 +2527,56 @@ async fn list_agents(State(app): State<App>) -> ApiResult {
             "role": p.role, "name": p.name, "title": p.title, "years": p.years,
             "expertise": p.expertise, "rules_md": p.rules_md,
             "model": model, "model_overrides": p.model_overrides,
+            "reports_to": p.reports_to, "harness": p.harness, "harness_command": p.harness_command,
             "container": running.get(&p.role),
         })
     }).collect();
     Ok(json_ok(Value::Array(agents)))
 }
 
-async fn create_persona(State(app): State<App>, Json(mut p): Json<Persona>) -> ApiResult {
+async fn create_persona(State(app): State<App>, headers: axum::http::HeaderMap, Json(mut p): Json<Persona>) -> ApiResult {
+    app.require_auth(&headers)?;
     p.role = p.role.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>().trim_matches('-').to_string();
     if p.role.is_empty() || p.name.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "role and name are required"));
     }
+    if !matches!(p.harness.as_str(), "native" | "claude" | "codex" | "custom") {
+        return Err(err(StatusCode::BAD_REQUEST, "harness must be native, claude, codex or custom"));
+    }
+    if p.harness == "custom" && p.harness_command.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "custom harness needs a command template"));
+    }
+    if p.reports_to == p.role { p.reports_to.clear(); }
     let mut store = app.store.lock().unwrap();
+    if !p.reports_to.is_empty() && !store.personas.iter().any(|x| x.role == p.reports_to) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("Unknown manager role '{}'", p.reports_to)));
+    }
     if store.personas.iter().any(|x| x.role == p.role) {
         return Err(err(StatusCode::CONFLICT, format!("Persona '{}' already exists", p.role)));
     }
     store.personas.push(p.clone());
+    save_personas(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(p).unwrap()))
 }
 
-async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(req): Json<PersonaUpdate>) -> ApiResult {
+async fn update_persona(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>, Json(req): Json<PersonaUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let provider_id = store.config.ai_provider.clone();
+    // Validate the harness transition against the FINAL state before mutating.
+    let current = store.personas.iter().find(|p| p.role == role)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")))?;
+    let next_harness = req.harness.clone().unwrap_or_else(|| current.harness.clone());
+    let next_command = req.harness_command.as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| current.harness_command.clone());
+    if !matches!(next_harness.as_str(), "native" | "claude" | "codex" | "custom") {
+        return Err(err(StatusCode::BAD_REQUEST, "harness must be native, claude, codex or custom"));
+    }
+    if next_harness == "custom" && next_command.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "custom harness needs a command template"));
+    }
     let p = store.personas.iter_mut().find(|p| p.role == role)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")))?;
     if let Some(v) = req.name { if !v.is_empty() { p.name = v; } }
@@ -2436,6 +2584,11 @@ async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(r
     if let Some(v) = req.years { p.years = v; }
     if let Some(v) = req.expertise { p.expertise = v; }
     if let Some(v) = req.rules_md { p.rules_md = v; }
+    if let Some(v) = req.reports_to {
+        p.reports_to = if v == role { String::new() } else { v };
+    }
+    if let Some(v) = req.harness { p.harness = v; }
+    if let Some(v) = req.harness_command { p.harness_command = v.trim().to_string(); }
     if let Some(v) = req.model {
         // unlike the other fields, an empty string here MEANS "clear the override"
         let v = v.trim().to_string();
@@ -2443,17 +2596,20 @@ async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(r
         else { p.model_overrides.insert(provider_id, v); }
     }
     let out = p.clone();
+    save_personas(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_persona(State(app): State<App>, Path(role): Path<String>) -> ApiResult {
+async fn delete_persona(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.personas.len();
     store.personas.retain(|p| p.role != role);
     if store.personas.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Persona '{role}' not found")));
     }
+    save_personas(&store);
     Ok(json_ok(json!({ "deleted": role })))
 }
 
@@ -2466,49 +2622,29 @@ async fn start_agent(State(app): State<App>, headers: axum::http::HeaderMap, Pat
             return Err(err(StatusCode::NOT_FOUND, format!("Unknown role '{role}'. Available: {}", roles.join(", "))));
         }
     }
-    let name = body.map(|Json(b)| b.name).flatten().unwrap_or_else(|| format!("agent-{role}"));
-    // The container may already exist (stopped, or paused by the idle
-    // sweeper) — docker would 409 on re-creating the same name, so bring
-    // the existing one back up instead.
-    if let Some(docker) = app.docker.as_ref() {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![
-            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
-            format!("role={role}"),
-        ]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        if let Ok(list) = docker.list_containers(Some(opts)).await {
-            let existing = list.iter().find_map(|c| {
-                let cname = c.names.as_ref()?.first()?.trim_start_matches('/').to_string();
-                (cname == name).then(|| (c.id.clone().unwrap_or_default(), cname, c.state.as_ref().map(|s| s.to_string()).unwrap_or_default()))
-            });
-            if let Some((id, cname, state)) = existing {
-                if state != "running" {
-                    let _ = docker.start_container(&id, None::<StartContainerOptions>).await;
-                }
-                app.clear_paused(&cname);
-                let inspect = app.inspect(&id).await?;
-                return Ok(json_ok(json!({
-                    "id": id.chars().take(12).collect::<String>(),
-                    "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-                    "status": App::status_of(&inspect),
-                })));
-            }
-        }
-    }
-    let req = ContainerCreate { name, role, image: None, command: None };
-    create_container(State(app), headers, Json(req)).await
+    let name = body.map(|Json(b)| b.name).flatten().unwrap_or_else(|| hostexec::session_name(&role));
+    // ensure the session (reviving a paused/stopped agent transparently),
+    // register it, done — idempotent, no 409-equivalent to dance around.
+    hostexec::ensure_session(&name)
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    app.register_agent(&name);
+    app.clear_paused(&name);
+    app.touch_activity(&name);
+    Ok(json_ok(json!({ "id": name, "name": name, "status": "running" })))
 }
 
 // ---------------------------------------------------------------------------
 // Handlers — tasks
 // ---------------------------------------------------------------------------
 
-async fn list_tasks(State(app): State<App>) -> Json<Vec<Task>> {
-    Json(app.store.lock().unwrap().tasks.clone())
+async fn list_tasks(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Task>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().tasks.clone()))
 }
 
-async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> ApiResult {
+async fn create_task(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<TaskCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     store.task_counter += 1;
     let status = match req.status.as_str() {
@@ -2526,17 +2662,20 @@ async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> Api
         due: req.due,
     };
     store.tasks.push(task.clone());
+    save_tasks(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(task).unwrap()))
 }
 
-async fn delete_task(State(app): State<App>, Path(task_id): Path<String>) -> ApiResult {
+async fn delete_task(State(app): State<App>, headers: axum::http::HeaderMap, Path(task_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.tasks.len();
     store.tasks.retain(|t| t.id != task_id);
     if store.tasks.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Task '{task_id}' not found")));
     }
+    save_tasks(&store);
     Ok(json_ok(json!({ "deleted": task_id })))
 }
 
@@ -2562,15 +2701,20 @@ fn config_json(cfg: &AiConfig) -> Value {
         "admin_password_set": !cfg.admin_password_hash.is_empty(),
         "auto_pause_enabled": cfg.auto_pause_enabled,
         "idle_timeout_secs": cfg.idle_timeout_secs,
+        "pricing": cfg.pricing,
+        "default_input_per_mtok": cfg.default_input_per_mtok,
+        "default_output_per_mtok": cfg.default_output_per_mtok,
         "auth_required": auth_enabled(),
     })
 }
 
-async fn get_config(State(app): State<App>) -> Json<Value> {
-    Json(config_json(&app.store.lock().unwrap().config))
+async fn get_config(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
+    Ok(json_ok(config_json(&app.store.lock().unwrap().config)))
 }
 
-async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) -> ApiResult {
+async fn update_config(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ConfigUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     if let Some(p) = req.ai_provider.as_deref() {
         if provider_template(p).is_none() {
             let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
@@ -2590,16 +2734,30 @@ async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) ->
         if let Some(v) = req.admin_password { cfg.admin_password_hash = sha256_hex(v.trim()); }
         if let Some(v) = req.auto_pause_enabled { cfg.auto_pause_enabled = v; }
         if let Some(v) = req.idle_timeout_secs { cfg.idle_timeout_secs = v.max(60); }
+        if let Some(v) = req.pricing {
+            cfg.pricing = v.into_iter()
+                .filter(|(k, _)| !k.trim().is_empty())
+                .map(|(k, p)| (k, ModelPrice {
+                    input_per_mtok: p.input_per_mtok.max(0.0),
+                    output_per_mtok: p.output_per_mtok.max(0.0),
+                }))
+                .collect();
+        }
+        if let Some(v) = req.default_input_per_mtok { cfg.default_input_per_mtok = v.max(0.0); }
+        if let Some(v) = req.default_output_per_mtok { cfg.default_output_per_mtok = v.max(0.0); }
+        save_config(&store);
     }
     let cfg = app.store.lock().unwrap().config.clone();
     Ok(json_ok(config_json(&cfg)))
 }
 
-async fn list_skills(State(app): State<App>) -> Json<Vec<Skill>> {
-    Json(app.store.lock().unwrap().skills.clone())
+async fn list_skills(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Skill>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().skills.clone()))
 }
 
-async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> ApiResult {
+async fn create_skill(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<SkillCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let id: String = req.name.to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -2614,29 +2772,155 @@ async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> A
     if store.skills.iter().any(|s| s.id == id) {
         return Err(err(StatusCode::CONFLICT, format!("Skill '{id}' already exists")));
     }
-    let skill = Skill { id, name: req.name, description: req.description, enabled: true };
+    let skill = Skill {
+        id, name: req.name, description: req.description, enabled: true,
+        version: 1, test_inputs: Vec::new(), test_runs: Vec::new(), history: Vec::new(),
+    };
     store.skills.push(skill.clone());
+    save_skills(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(skill).unwrap()))
 }
 
-async fn update_skill(State(app): State<App>, Path(skill_id): Path<String>, Json(req): Json<SkillUpdate>) -> ApiResult {
+async fn update_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>, Json(req): Json<SkillUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
-    skill.enabled = req.enabled;
+    let old = (skill.name.clone(), skill.description.clone(), skill.enabled);
+    if let Some(name) = req.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "name cannot be empty")); }
+        skill.name = name.to_string();
+    }
+    if let Some(desc) = req.description.as_deref() {
+        skill.description = desc.to_string();
+    }
+    if let Some(enabled) = req.enabled {
+        skill.enabled = enabled;
+    }
+    if old != (skill.name.clone(), skill.description.clone(), skill.enabled) {
+        // Keep the previous version so the history is auditable.
+        skill.history.insert(0, SkillSnapshot {
+            version: skill.version,
+            name: old.0,
+            description: old.1,
+            enabled: old.2,
+            at: now_secs(),
+        });
+        skill.history.truncate(20);
+        skill.version += 1;
+    }
     let out = skill.clone();
+    save_skills(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_skill(State(app): State<App>, Path(skill_id): Path<String>) -> ApiResult {
+/// Restore a previous snapshot; the current state is snapshotted first so the
+/// restore itself is undoable.
+async fn restore_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path((skill_id, version)): Path<(String, u32)>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    let snap = skill.history.iter().find(|h| h.version == version).cloned()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Version {version} not found for skill '{skill_id}'")))?;
+    skill.history.insert(0, SkillSnapshot {
+        version: skill.version,
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        enabled: skill.enabled,
+        at: now_secs(),
+    });
+    skill.history.truncate(20);
+    skill.version += 1;
+    skill.name = snap.name;
+    skill.description = snap.description;
+    skill.enabled = snap.enabled;
+    let out = skill.clone();
+    save_skills(&store);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+/// Save the Skill Studio test bench inputs (trimmed, non-empty, max 20).
+async fn set_skill_tests(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>, Json(req): Json<SkillTestsInput>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    skill.test_inputs = req.inputs.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(20)
+        .collect();
+    let out = skill.clone();
+    save_skills(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+/// Run the skill against its saved inputs (or a provided set) and keep the
+/// newest 20 results. These are real provider calls, priced per token.
+async fn run_skill_tests(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path(skill_id): Path<String>, Json(req): Json<SkillRunRequest>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let (skill, model) = {
+        let store = app.store.lock().unwrap();
+        let skill = store.skills.iter().find(|s| s.id == skill_id).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+        let model = req.model.clone().filter(|m| !m.trim().is_empty()).unwrap_or_else(|| app.provider_default_model());
+        (skill, model)
+    };
+    if model.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "No model configured — set one in AI Config"));
+    }
+    let inputs: Vec<String> = req.inputs.unwrap_or_else(|| skill.test_inputs.clone())
+        .into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(10).collect();
+    if inputs.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Save at least one test input first"));
+    }
+    let system = format!(
+        "You are the reusable skill '{}'. {}\n\nApply this skill to the user's input. Reply with the result only — no preamble.",
+        skill.name, skill.description
+    );
+    let (ip, op, _) = model_price(&app, &model);
+    let mut new_runs = Vec::new();
+    for input in inputs {
+        let (output, cost) = match app.llm_max_usage(&model, &system, &input, 800).await {
+            Ok((text, usage)) => (text, usage_cost(usage, ip, op)),
+            Err(e) => (format!("⚠️ {}", e.1), 0.0),
+        };
+        new_runs.push(SkillTestRun {
+            id: format!("st-{}", app.seq.fetch_add(1, Ordering::SeqCst)),
+            input,
+            output,
+            model: model.clone(),
+            at: now_secs(),
+            cost_usd: cost,
+        });
+    }
+    let mut store = app.store.lock().unwrap();
+    let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
+    new_runs.extend(skill.test_runs.clone());
+    skill.test_runs = new_runs.into_iter().take(20).collect();
+    let out = skill.clone();
+    save_skills(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn delete_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.skills.len();
     store.skills.retain(|s| s.id != skill_id);
     if store.skills.len() == len {
         return Err(err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")));
     }
+    save_skills(&store);
     Ok(json_ok(json!({ "deleted": skill_id })))
 }
 
@@ -2644,11 +2928,13 @@ async fn delete_skill(State(app): State<App>, Path(skill_id): Path<String>) -> A
 // Handlers — projects (team builder with react flow graphs)
 // ---------------------------------------------------------------------------
 
-async fn list_projects(State(app): State<App>) -> Json<Vec<Project>> {
-    Json(app.store.lock().unwrap().projects.clone())
+async fn list_projects(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Project>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().projects.clone()))
 }
 
-async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) -> ApiResult {
+async fn create_project(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ProjectCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     store.project_counter += 1;
     let project = Project {
@@ -2659,20 +2945,26 @@ async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) 
         agents: Vec::new(),
         links: Vec::new(),
         positions: HashMap::new(),
+        goal: req.goal,
+        budget_usd: req.budget_usd.filter(|b| *b > 0.0),
+        budget_alert_pct: 80,
     };
     store.projects.push(project.clone());
+    save_projects(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(project).unwrap()))
 }
 
-async fn get_project(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+async fn get_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let store = app.store.lock().unwrap();
     let p = store.projects.iter().find(|p| p.id == id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")))?;
     Ok(json_ok(serde_json::to_value(p).unwrap()))
 }
 
-async fn update_project(State(app): State<App>, Path(id): Path<String>, Json(req): Json<ProjectUpdate>) -> ApiResult {
+async fn update_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<ProjectUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     // Validate that every agent role exists as a persona (before mutable borrow)
     if let Some(agents) = &req.agents {
@@ -2691,12 +2983,17 @@ async fn update_project(State(app): State<App>, Path(id): Path<String>, Json(req
     if let Some(v) = req.agents { p.agents = v; }
     if let Some(v) = req.links { p.links = v; }
     if let Some(v) = req.positions { p.positions = v; }
+    if let Some(v) = req.goal { p.goal = v; }
+    if let Some(v) = req.budget_usd { p.budget_usd = v.filter(|b| *b > 0.0); }
+    if let Some(v) = req.budget_alert_pct { p.budget_alert_pct = v.clamp(1, 100); }
     let out = p.clone();
+    save_projects(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_project(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+async fn delete_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.projects.len();
     store.projects.retain(|p| p.id != id);
@@ -2705,7 +3002,314 @@ async fn delete_project(State(app): State<App>, Path(id): Path<String>) -> ApiRe
     }
     // Runs of the deleted project are KEPT — they are the agents' work history
     // (agent detail shows them across projects, and /data/runs.json persists them).
+    // The document space is NOT: it dies with its project (rows, uploaded files
+    // and the materialized workspace copies all go).
+    let doc_ids: Vec<String> = store.docs.iter().filter(|d| d.project_id == id).map(|d| d.id.clone()).collect();
+    store.docs.retain(|d| d.project_id != id);
+    for did in &doc_ids {
+        let _ = std::fs::remove_dir_all(docs_files_dir().join(did));
+    }
+    let _ = std::fs::remove_dir_all(docs_workspace_dir(&id));
+    save_projects(&store);
+    save_docs(&store);
     Ok(json_ok(json!({ "deleted": id })))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — project docs (the per-project document space)
+// ---------------------------------------------------------------------------
+
+/// docs of one project, sorted folder asc then newest-updated first
+fn project_docs_sorted(store: &Store, project_id: &str) -> Vec<ProjectDoc> {
+    let mut docs: Vec<ProjectDoc> = store.docs.iter().filter(|d| d.project_id == project_id).cloned().collect();
+    docs.sort_by(|a, b| a.folder.cmp(&b.folder).then(b.updated_at.cmp(&a.updated_at)));
+    docs
+}
+
+async fn list_docs(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let (docs, open_counts) = {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for c in store.doc_comments.iter().filter(|c| c.project_id == id && c.status == "open") {
+            *counts.entry(c.doc_id.clone()).or_default() += 1;
+        }
+        (project_docs_sorted(&store, &id), counts)
+    };
+    let out: Vec<Value> = docs.iter().map(|d| {
+        let mut v = serde_json::to_value(d).unwrap_or_else(|_| json!({}));
+        v["open_comments"] = json!(open_counts.get(&d.id).copied().unwrap_or(0));
+        v
+    }).collect();
+    Ok(json_ok(json!(out)))
+}
+
+async fn create_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<DocCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
+    if req.title.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Document title is required"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    store.doc_counter += 1;
+    let now = now_secs();
+    let doc = ProjectDoc {
+        id: format!("d-{:03}", store.doc_counter),
+        project_id: id,
+        folder: if req.folder.trim().is_empty() { "General".into() } else { req.folder.trim().to_string() },
+        title: req.title.trim().to_string(),
+        content_md: req.content_md,
+        file: None,
+        created_at: now,
+        updated_at: now,
+    };
+    store.docs.push(doc.clone());
+    save_docs(&store);
+    materialize_project_docs(&store, &doc.project_id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(doc).unwrap()))
+}
+
+async fn get_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>, Query(q): Query<DocQuery>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let doc = {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+        store.docs.iter().find(|d| d.id == doc_id && d.project_id == id).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")))?
+    };
+    if q.raw.as_deref() != Some("1") {
+        return Ok(json_ok(serde_json::to_value(&doc).unwrap()));
+    }
+    // Raw download — auth is a header, so the web always blob-fetches this.
+    match &doc.file {
+        Some(f) => {
+            let path = docs_files_dir().join(&doc.id).join(&f.name);
+            let bytes = std::fs::read(&path)
+                .map_err(|_| err(StatusCode::NOT_FOUND, format!("File for document '{doc_id}' is missing on disk")))?;
+            Ok(Response::builder()
+                .header(header::CONTENT_TYPE, f.content_type.clone())
+                .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", safe_doc_name(&f.name)))
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(axum::body::Body::from(bytes))
+                .unwrap())
+        }
+        None => {
+            let body = doc.content_md.into_bytes();
+            Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
+                .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.md\"", safe_doc_name(&doc.title)))
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(axum::body::Body::from(body))
+                .unwrap())
+        }
+    }
+}
+
+async fn update_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>, Json(req): Json<DocUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    let doc = store.docs.iter_mut().find(|d| d.id == doc_id && d.project_id == id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")))?;
+    if let Some(v) = req.title { if !v.trim().is_empty() { doc.title = v.trim().to_string(); } }
+    if let Some(v) = req.folder { if !v.trim().is_empty() { doc.folder = v.trim().to_string(); } }
+    // Uploaded binaries are immutable — only the markdown body is editable.
+    if doc.file.is_none() {
+        if let Some(v) = req.content_md { doc.content_md = v; }
+    }
+    doc.updated_at = now_secs();
+    let out = doc.clone();
+    save_docs(&store);
+    materialize_project_docs(&store, &id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn delete_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    let before = store.docs.len();
+    store.docs.retain(|d| !(d.id == doc_id && d.project_id == id));
+    if store.docs.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")));
+    }
+    store.doc_comments.retain(|c| !(c.doc_id == doc_id && c.project_id == id));
+    let _ = std::fs::remove_dir_all(docs_files_dir().join(&doc_id));
+    save_docs(&store);
+    materialize_project_docs(&store, &id);
+    drop(store);
+    Ok(json_ok(json!({ "deleted": doc_id })))
+}
+
+/// Inline comments anchored to a document passage. Open comments are injected
+/// into every relay prompt so the team actually addresses them.
+async fn list_doc_comments(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id)): Path<(String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    let comments: Vec<DocComment> = store.doc_comments.iter()
+        .filter(|c| c.project_id == project_id && c.doc_id == doc_id)
+        .cloned().collect();
+    Ok(json_ok(json!(comments)))
+}
+
+async fn create_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id)): Path<(String, String)>,
+    Json(req): Json<DocCommentCreate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let body = req.body.trim().to_string();
+    if body.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "comment body is required"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.docs.iter().any(|d| d.id == doc_id && d.project_id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")));
+    }
+    store.comment_counter += 1;
+    let comment = DocComment {
+        id: format!("c-{:03}", store.comment_counter),
+        project_id,
+        doc_id,
+        author: if req.author.trim().is_empty() { "you".into() } else { req.author.trim().to_string() },
+        quote: req.quote.trim().chars().take(400).collect(),
+        body: body.chars().take(4000).collect(),
+        status: "open".into(),
+        created_at: now_secs(),
+        resolved_at: 0,
+    };
+    let out = comment.clone();
+    store.doc_comments.push(comment);
+    save_docs(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn update_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id, comment_id)): Path<(String, String, String)>,
+    Json(req): Json<DocCommentUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let status = req.status.trim().to_lowercase();
+    if status != "open" && status != "resolved" {
+        return Err(err(StatusCode::BAD_REQUEST, "status must be 'open' or 'resolved'"));
+    }
+    let mut store = app.store.lock().unwrap();
+    let comment = store.doc_comments.iter_mut()
+        .find(|c| c.id == comment_id && c.doc_id == doc_id && c.project_id == project_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Comment '{comment_id}' not found")))?;
+    comment.status = status.clone();
+    comment.resolved_at = if status == "resolved" { now_secs() } else { 0 };
+    let out = comment.clone();
+    save_docs(&store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn delete_doc_comment(
+    State(app): State<App>, headers: axum::http::HeaderMap,
+    Path((project_id, doc_id, comment_id)): Path<(String, String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let before = store.doc_comments.len();
+    store.doc_comments.retain(|c| !(c.id == comment_id && c.doc_id == doc_id && c.project_id == project_id));
+    if store.doc_comments.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Comment '{comment_id}' not found")));
+    }
+    save_docs(&store);
+    Ok(json_ok(json!({ "deleted": comment_id })))
+}
+
+/// Multipart upload — `folder` (optional text field) + one `file` field.
+/// .md/.markdown/.txt land as editable markdown docs (AI-injectable content);
+/// everything else is stored as a binary attachment on disk.
+async fn upload_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, mut multipart: Multipart) -> ApiResult {
+    app.require_auth(&headers)?;
+    {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+    }
+
+    let mut folder = String::new();
+    let mut file_field: Option<(String, String, Vec<u8>)> = None; // (name, content_type, bytes)
+    while let Some(field) = multipart.next_field().await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("Bad upload: {e}")))? {
+        match field.name().unwrap_or("") {
+            "folder" => {
+                folder = field.text().await.unwrap_or_default().trim().to_string();
+            }
+            _ => {
+                let Some(fname) = field.file_name().map(|s| s.to_string()) else { continue };
+                let ctype = field.content_type().unwrap_or("application/octet-stream").to_string();
+                let bytes = field.bytes().await
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("Could not read upload: {e}")))?;
+                if bytes.is_empty() {
+                    return Err(err(StatusCode::BAD_REQUEST, "Uploaded file is empty"));
+                }
+                if bytes.len() > DOC_UPLOAD_MAX_BYTES {
+                    return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "File too large (max 25 MB)"));
+                }
+                file_field = Some((fname, ctype, bytes.to_vec()));
+            }
+        }
+    }
+    let Some((fname, ctype, bytes)) = file_field else {
+        return Err(err(StatusCode::BAD_REQUEST, "No file in upload"));
+    };
+
+    let ext = std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_text = matches!(ext.as_str(), "md" | "markdown" | "txt");
+    let title = std::path::Path::new(&fname).file_stem().and_then(|s| s.to_str()).unwrap_or("document").to_string();
+
+    let mut store = app.store.lock().unwrap();
+    store.doc_counter += 1;
+    let now = now_secs();
+    let mut doc = ProjectDoc {
+        id: format!("d-{:03}", store.doc_counter),
+        project_id: id,
+        folder: if folder.is_empty() { "General".into() } else { folder },
+        title,
+        content_md: String::new(),
+        file: None,
+        created_at: now,
+        updated_at: now,
+    };
+    if is_text {
+        doc.content_md = String::from_utf8_lossy(&bytes).into_owned();
+    } else {
+        let safe = safe_doc_name(&fname);
+        let dir = docs_files_dir().join(&doc.id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the uploaded file"));
+        }
+        if std::fs::write(dir.join(&safe), &bytes).is_err() {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the uploaded file"));
+        }
+        doc.file = Some(DocFile { name: safe, content_type: ctype, size: bytes.len() as u64 });
+    }
+    store.docs.push(doc.clone());
+    save_docs(&store);
+    materialize_project_docs(&store, &doc.project_id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(doc).unwrap()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,7 +3337,7 @@ fn now_secs() -> u64 {
 // (agent-data volume in compose; env DATA_DIR overrides, ./data as local fallback)
 // ---------------------------------------------------------------------------
 
-fn data_dir() -> std::path::PathBuf {
+pub(crate) fn data_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("DATA_DIR") {
         if !d.trim().is_empty() { return std::path::PathBuf::from(d); }
     }
@@ -2743,6 +3347,63 @@ fn data_dir() -> std::path::PathBuf {
 
 fn runs_file() -> std::path::PathBuf {
     data_dir().join("runs.json")
+}
+
+/// Repair permissions left by older builds: the data dir holds sessions,
+/// tokens and API keys, so it must be 0700 and every store file 0600 — an
+/// upgrade should not leave a world-readable config.json behind.
+fn harden_data_dir() {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() { continue; }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") || name.ends_with(".json.tmp") {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Create files 0600 (never a world-readable window) and fsync the file + its
+/// directory before returning, so a crash cannot leave a truncated or
+/// plainly-readable store behind. The tmp name is unique per process.
+fn write_atomic_private(path: &std::path::Path, payload: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "data.json".into());
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp)?
+    };
+    file.write_all(payload.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// Atomic whole-file save of the run history (tmp + rename — a crash never
@@ -2757,13 +3418,9 @@ fn save_runs(store: &Store) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let dir = data_dir();
-    if std::fs::create_dir_all(&dir).is_err() { return; }
-    let path = runs_file();
-    let tmp = dir.join("runs.json.tmp");
     // Best effort: platform keeps working in memory even when the disk write fails.
-    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
-        eprintln!("warning: could not persist runs to {}", path.display());
+    if let Err(e) = write_atomic_private(&runs_file(), &payload) {
+        eprintln!("warning: could not persist runs: {e}");
     }
 }
 
@@ -2785,8 +3442,10 @@ fn load_runs(store: &mut Store) {
     };
     let mut runs = parsed.runs;
     let now = now_secs();
+    let mut dirty = false;
     for run in runs.iter_mut() {
         if run.status == "running" || run.status == "waiting_human" {
+            dirty = true;
             run.status = "stopped".into();
             run.phase = "done".into();
             for d in run.discussions.iter_mut().filter(|d| d.status != "resolved") {
@@ -2799,19 +3458,161 @@ fn load_runs(store: &mut Store) {
                 });
             }
         }
+        // A closed run (whatever closed it — restart, Stop, an older build with
+        // the finish gap) must not carry steps stuck at "working": nobody will
+        // ever advance them, and the UI would show a busy spinner forever.
+        for step in run.steps.iter_mut().filter(|s| s.status == "working") {
+            dirty = true;
+            step.status = "stopped".into();
+            step.output = "stopped mid-work — the run already ended while this step was in flight".into();
+            if step.finished_at == 0 { step.finished_at = now; }
+        }
         run.stop_requested = false;
     }
     let max_id = runs.iter()
         .filter_map(|r| r.id.strip_prefix("run-").and_then(|n| n.parse::<usize>().ok()))
         .max().unwrap_or(0);
     store.run_counter = store.run_counter.max(parsed.run_counter).max(max_id);
+    // Runs outlive projects (they ARE the work history), so a fresh boot must
+    // not hand out a p-NNN id that a restored run still references — the board
+    // would graft that orphan history onto the brand-new project.
+    let max_pid = runs.iter()
+        .filter_map(|r| r.project_id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok()))
+        .chain(store.projects.iter().filter_map(|p| p.id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok())))
+        .max().unwrap_or(0);
+    store.project_counter = store.project_counter.max(max_pid);
     println!("restored {} run(s) from {}", runs.len(), runs_file().display());
     store.runs = runs;
+    if dirty {
+        // Persist the restart cleanup — otherwise every boot re-closes (and
+        // re-notifies) the same runs until the file is written by something else.
+        save_runs(store);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projects persistence — /data/projects.json. Until now projects were seeded
+// fresh every boot; the document space made persistence mandatory (docs would
+// otherwise dangle on a restarted store), and the team builder benefits too.
+// ---------------------------------------------------------------------------
+
+fn projects_file() -> std::path::PathBuf {
+    data_dir().join("projects.json")
+}
+
+fn save_projects(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        projects: &'a [Project],
+        project_counter: usize,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { projects: &store.projects, project_counter: store.project_counter }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = projects_file();
+    let tmp = dir.join("projects.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist projects to {}", path.display());
+    }
+}
+
+/// Restore projects at boot. A missing/unreadable file keeps the seeded store
+/// (same behavior as before persistence existed). On success the seed project
+/// is replaced by what was persisted.
+fn load_projects(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        projects: Vec<Project>,
+        #[serde(default)]
+        project_counter: usize,
+    }
+    let Ok(raw) = std::fs::read_to_string(projects_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — keeping the seeded projects", projects_file().display());
+        return;
+    };
+    let max_id = parsed.projects.iter()
+        .filter_map(|p| p.id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.project_counter = store.project_counter.max(parsed.project_counter).max(max_id);
+    println!("restored {} project(s) from {}", parsed.projects.len(), projects_file().display());
+    store.projects = parsed.projects;
+}
+
+// ---------------------------------------------------------------------------
+// Docs persistence — the document space survives restarts as /data/docs.json
+// (markdown inline; uploaded binaries live under <data>/docs-files/<doc_id>/).
+// ---------------------------------------------------------------------------
+
+fn docs_file() -> std::path::PathBuf {
+    data_dir().join("docs.json")
+}
+
+fn docs_files_dir() -> std::path::PathBuf {
+    data_dir().join("docs-files")
+}
+
+fn save_docs(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        docs: &'a [ProjectDoc],
+        doc_counter: usize,
+        comments: &'a [DocComment],
+        comment_counter: usize,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted {
+        docs: &store.docs, doc_counter: store.doc_counter,
+        comments: &store.doc_comments, comment_counter: store.comment_counter,
+    }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = docs_file();
+    let tmp = dir.join("docs.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist docs to {}", path.display());
+    }
+}
+
+fn load_docs(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        docs: Vec<ProjectDoc>,
+        #[serde(default)]
+        doc_counter: usize,
+        #[serde(default)]
+        comments: Vec<DocComment>,
+        #[serde(default)]
+        comment_counter: usize,
+    }
+    let Ok(raw) = std::fs::read_to_string(docs_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — starting with an empty document space", docs_file().display());
+        return;
+    };
+    let max_id = parsed.docs.iter()
+        .filter_map(|d| d.id.strip_prefix("d-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.doc_counter = store.doc_counter.max(parsed.doc_counter).max(max_id);
+    let max_cid = parsed.comments.iter()
+        .filter_map(|c| c.id.strip_prefix("dc-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.comment_counter = store.comment_counter.max(parsed.comment_counter).max(max_cid);
+    println!("restored {} document(s) and {} comment(s) from {}", parsed.docs.len(), parsed.comments.len(), docs_file().display());
+    store.docs = parsed.docs;
+    store.doc_comments = parsed.comments;
 }
 
 // ---------------------------------------------------------------------------
 // Paused-container registry persistence — /data/paused.json, same atomic
-// tmp+rename write as the runs file. Docker labels can't record "paused",
+// tmp+rename write as the runs file. There is no container metadata to record "paused",
 // so this file is what keeps platform-paused containers distinguishable
 // from user-stopped ones across orchestrator restarts.
 // ---------------------------------------------------------------------------
@@ -2858,6 +3659,341 @@ fn load_paused(store: &mut Store) {
     store.paused = parsed.paused;
 }
 
+// ---------------------------------------------------------------------------
+// Agent registry persistence — /data/agents.json, same atomic tmp+rename
+// write as the other registries. tmux sessions are ephemeral; this file is
+// what keeps stopped agents visible (with a Start button) across restarts.
+// ---------------------------------------------------------------------------
+
+fn agents_file() -> std::path::PathBuf {
+    data_dir().join("agents.json")
+}
+
+fn save_agents(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        agents: &'a BTreeSet<String>,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { agents: &store.agents }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = agents_file();
+    let tmp = dir.join("agents.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist agent registry to {}", path.display());
+    }
+}
+
+fn load_agents(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        agents: BTreeSet<String>,
+    }
+    let Ok(raw) = std::fs::read_to_string(agents_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — starting with an empty agent registry", agents_file().display());
+        return;
+    };
+    if !parsed.agents.is_empty() {
+        println!("restored {} agent(s) from {}", parsed.agents.len(), agents_file().display());
+    }
+    store.agents = parsed.agents;
+}
+
+/// Generic atomic JSON write for the smaller registries (tmp + rename).
+/// All stores are private: they carry agent output, prompts and config, so
+/// they are created 0600 in a 0700 directory regardless of `_private`.
+fn write_json_atomic<T: Serialize>(name: &str, value: &T, _private: bool) -> bool {
+    let payload = match serde_json::to_string_pretty(value) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let path = data_dir().join(name);
+    let ok = write_atomic_private(&path, &payload).is_ok();
+    if !ok {
+        eprintln!("warning: could not persist {}", path.display());
+    }
+    ok
+}
+
+// ---------------------------------------------------------------------------
+// Personas / skills / tasks / config / routines persistence. These used to be
+// in-memory only; the org features (budgets, org chart, skill bench) make them
+// durable. Same tmp+rename contract as runs.json.
+// ---------------------------------------------------------------------------
+
+fn save_personas(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { personas: &'a [Persona] }
+    write_json_atomic("personas.json", &Persisted { personas: &store.personas }, false);
+}
+
+fn load_personas(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] personas: Vec<Persona> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("personas.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: personas.json is unreadable — keeping seeded personas");
+        return;
+    };
+    if parsed.personas.is_empty() { return; }
+    println!("restored {} persona(s)", parsed.personas.len());
+    store.personas = parsed.personas;
+}
+
+fn save_config(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { config: &'a AiConfig }
+    write_json_atomic("config.json", &Persisted { config: &store.config }, true);
+}
+
+fn load_config(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] config: Option<AiConfig> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("config.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: config.json is unreadable — keeping defaults");
+        return;
+    };
+    if let Some(cfg) = parsed.config {
+        println!("restored provider config from config.json");
+        store.config = cfg;
+    }
+}
+
+fn save_skills(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { skills: &'a [Skill] }
+    write_json_atomic("skills.json", &Persisted { skills: &store.skills }, false);
+}
+
+fn load_skills(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] skills: Vec<Skill> }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("skills.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: skills.json is unreadable — keeping seeded skills");
+        return;
+    };
+    println!("restored {} skill(s)", parsed.skills.len());
+    store.skills = parsed.skills;
+}
+
+fn save_tasks(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { tasks: &'a [Task], task_counter: usize }
+    write_json_atomic("tasks.json", &Persisted { tasks: &store.tasks, task_counter: store.task_counter }, false);
+}
+
+fn load_tasks(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] tasks: Vec<Task>, #[serde(default)] task_counter: usize }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("tasks.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: tasks.json is unreadable — starting with an empty board");
+        return;
+    };
+    let max_id = parsed.tasks.iter()
+        .filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.task_counter = store.task_counter.max(parsed.task_counter).max(max_id);
+    println!("restored {} task(s)", parsed.tasks.len());
+    store.tasks = parsed.tasks;
+}
+
+fn save_routines(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> { routines: &'a [Routine], routine_counter: usize }
+    write_json_atomic("routines.json", &Persisted { routines: &store.routines, routine_counter: store.routine_counter }, false);
+}
+
+fn load_routines(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted { #[serde(default)] routines: Vec<Routine>, #[serde(default)] routine_counter: usize }
+    let Ok(raw) = std::fs::read_to_string(data_dir().join("routines.json")) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: routines.json is unreadable — starting with no routines");
+        return;
+    };
+    let max_id = parsed.routines.iter()
+        .filter_map(|r| r.id.strip_prefix("rt-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.routine_counter = store.routine_counter.max(parsed.routine_counter).max(max_id);
+    println!("restored {} routine(s)", parsed.routines.len());
+    store.routines = parsed.routines;
+}
+
+// ---------------------------------------------------------------------------
+// Cron — 5-field local-time schedules for routines
+// ---------------------------------------------------------------------------
+
+struct CronSpec {
+    minutes: Vec<u32>,
+    hours: Vec<u32>,
+    doms: Vec<u32>,
+    months: Vec<u32>,
+    dows: Vec<u32>,
+}
+
+/// One field: `*`, `n`, `a-b`, lists `1,15`, steps `*/5` / `1-30/2`.
+fn parse_cron_field(spec: &str, min: u32, max: u32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let (range, step) = match part.split_once('/') {
+            Some((r, s)) => (r, s.parse::<u32>().ok()?),
+            None => (part, 1),
+        };
+        if step == 0 { return None; }
+        let (lo, hi) = if range == "*" {
+            (min, max)
+        } else if let Some((a, b)) = range.split_once('-') {
+            (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)
+        } else {
+            let v = range.parse::<u32>().ok()?;
+            (v, v)
+        };
+        if lo < min || hi > max || lo > hi { return None; }
+        let mut v = lo;
+        while v <= hi { out.push(v); v += step; }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+fn cron_parse(expr: &str) -> Option<CronSpec> {
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 5 { return None; }
+    let mut dows = parse_cron_field(f[4], 0, 7)?;
+    dows = dows.into_iter().map(|d| if d == 7 { 0 } else { d }).collect();
+    dows.sort_unstable();
+    dows.dedup();
+    Some(CronSpec {
+        minutes: parse_cron_field(f[0], 0, 59)?,
+        hours: parse_cron_field(f[1], 0, 23)?,
+        doms: parse_cron_field(f[2], 1, 31)?,
+        months: parse_cron_field(f[3], 1, 12)?,
+        dows,
+    })
+}
+
+fn cron_matches_day(spec: &CronSpec, t: &chrono::DateTime<Local>) -> bool {
+    let dom_any = spec.doms.len() == 31;
+    let dow_any = spec.dows.len() == 7;
+    let dom_ok = spec.doms.contains(&t.day());
+    let dow_ok = spec.dows.contains(&t.weekday().num_days_from_sunday());
+    if dom_any && dow_any { true }
+    else if dom_any { dow_ok }
+    else if dow_any { dom_ok }
+    else { dom_ok || dow_ok } // classic cron: both restricted → OR
+}
+
+/// First occurrence strictly after `after_secs` (local time). Scans at most
+/// two years ahead so a nonsense-but-valid cron cannot loop forever.
+fn next_run_at(expr: &str, after_secs: u64) -> Option<u64> {
+    let spec = cron_parse(expr)?;
+    // DST fall-back makes one local minute ambiguous; .single() would return
+    // None and freeze that routine forever. Take the earliest occurrence.
+    let mut t = match Local.timestamp_opt(after_secs as i64, 0) {
+        chrono::LocalResult::Single(t) => t,
+        chrono::LocalResult::Ambiguous(a, _) => a,
+        chrono::LocalResult::None => return None,
+    }.with_second(0)?.with_nanosecond(0)?;
+    t += chrono::Duration::minutes(1);
+    for _ in 0..(366 * 2 * 24 * 60u32) {
+        if spec.months.contains(&t.month())
+            && spec.hours.contains(&t.hour())
+            && spec.minutes.contains(&t.minute())
+            && cron_matches_day(&spec, &t)
+        {
+            return Some(t.timestamp() as u64);
+        }
+        t += chrono::Duration::minutes(1);
+    }
+    None
+}
+
+/// Fire one routine now: skip when its project already has a live run, else
+/// spawn the run and record the outcome on the routine.
+fn fire_routine(app: &App, routine: &Routine) -> Result<Run, ApiError> {
+    let busy = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().any(|r| r.project_id == routine.project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+    };
+    let now = now_secs();
+    if busy {
+        // Do NOT consume the occurrence: once the project frees up, the next
+        // 30s tick fires the routine instead of silently skipping it (the
+        // Paperclip "event wake" behaviour, adapted to cron).
+        let mut store = app.store.lock().unwrap();
+        if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
+            r.last_result = format!("waiting: project busy (since {})", now);
+        }
+        save_routines(&store);
+        return Err(err(StatusCode::CONFLICT, "project already has a running mission"));
+    }
+    let result = spawn_run_with(app, &routine.project_id, &routine.task, routine.loop_mode, 1, "scheduled", Some(&routine.id));
+    let mut store = app.store.lock().unwrap();
+    if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
+        r.last_run_at = now;
+        match &result {
+            Ok(run) => {
+                r.last_run_id = Some(run.id.clone());
+                r.last_result = "started".into();
+            }
+            Err(e) => r.last_result = format!("error: {}", e.1),
+        }
+    }
+    save_routines(&store);
+    result
+}
+
+/// Background scheduler: ticks every 30 s, fires enabled routines whose next
+/// occurrence has passed. Restart-safe — occurrences missed while the process
+/// was down are recorded but not replayed.
+async fn routine_scheduler(app: App) {
+    let mut boot = true;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        let now = now_secs();
+        let due = {
+            let mut store = app.store.lock().unwrap();
+            let routines = store.routines.clone();
+            let mut due = Vec::new();
+            let mut changed = false;
+            for r in routines {
+                if !r.enabled { continue; }
+                let base = if r.last_run_at > 0 { r.last_run_at } else { r.created_at.max(1) };
+                let Some(next) = next_run_at(&r.cron, base) else { continue };
+                if next > now { continue; }
+                if boot {
+                    if let Some(x) = store.routines.iter_mut().find(|x| x.id == r.id) {
+                        x.last_run_at = now;
+                        x.last_result = "missed while orchestrator was down".into();
+                    }
+                    changed = true;
+                } else {
+                    due.push(r);
+                }
+            }
+            if changed { save_routines(&store); }
+            due
+        };
+        boot = false;
+        for r in due {
+            if let Err(e) = fire_routine(&app, &r) {
+                eprintln!("routine {} did not start: {}", r.id, e.1);
+            }
+        }
+    }
+}
+
 /// Directory name for a cloned repo URL: last path segment, ".git" stripped,
 /// sanitized to safe filename chars ("repo" when nothing usable remains).
 fn repo_dir_name(repo_url: &str) -> String {
@@ -2869,18 +4005,65 @@ fn repo_dir_name(repo_url: &str) -> String {
     if cleaned.is_empty() { "repo".into() } else { cleaned }
 }
 
-/// Write a text deliverable into the agent's container workspace via a quoted heredoc.
-async fn write_deliverable(app: &App, container_id: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
+/// Write a text deliverable into the shared workspace. Host execution means
+/// the workspace is a local path — write it directly instead of piping model
+/// output through a heredoc, so an emitted `AAP_EOF_…` line can never run
+/// shell commands on the user's machine.
+async fn write_deliverable(_app: &App, _agent: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
     let clean = output.replace('\r', "");
-    let path = format!("/workspace/{run_id}-{role}.md");
-    let script = format!(
-        "mkdir -p /workspace && cat > '{path}' << 'AAP_EOF_9Z'\n{clean}\nAAP_EOF_9Z\n",
-    );
-    let (exit_code, out) = app.exec_in(container_id, &script).await?;
-    if exit_code != 0 {
-        return Err(err(StatusCode::BAD_GATEWAY, format!("writing deliverable failed (exit {exit_code}): {out}")));
+    let ws = hostexec::workspace_str();
+    let path = std::path::PathBuf::from(format!("{ws}/{run_id}-{role}.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| err(
+            StatusCode::INTERNAL_SERVER_ERROR, format!("could not create {}: {e}", parent.display())))?;
     }
-    Ok(path)
+    std::fs::write(&path, clean).map_err(|e| err(
+        StatusCode::INTERNAL_SERVER_ERROR, format!("writing {} failed: {e}", path.display())))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Write FILES-block entries into the repo working tree (a local path under
+/// host execution). Written directly — never through a shell heredoc — and
+/// traversal is rejected here even though parse_files already guards it.
+async fn apply_files_to_repo(_app: &App, _agent: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
+    let root = std::path::Path::new(repo_path);
+    let mut applied = 0usize;
+    for (path, content) in files {
+        if path.starts_with('/') || path.split('/').any(|c| c == ".." || c == ".") {
+            return Err(format!("refusing unsafe file path '{path}'"));
+        }
+        let full = root.join(path);
+        if let Some(dir) = full.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&full, content.replace('\r', ""))
+            .map_err(|e| format!("writing {path} failed: {e}"))?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Design/code delivery shared by the relay and meeting-revision paths: when a
+/// dev/UX agent's reply carries a FILES block (and the project has a repo),
+/// write those files into the repo working tree in the agent's container and
+/// append an honest note to the stored deliverable (applied / failed / no
+/// container). The FILES section itself stays in the stored output so the UI
+/// shows the actual code.
+async fn apply_files_note(app: &App, repo_path: Option<&str>, role: &str, output: &mut String) {
+    let Some(rp) = repo_path else { return };
+    if !(role.starts_with("dev") || role.starts_with("ux")) { return; }
+    let files = parse_files(output);
+    if files.is_empty() { return; }
+    match app.agent_container(role).await {
+        Some((cid, _)) => match apply_files_to_repo(app, &cid, rp, &files).await {
+            Ok(n) => output.push_str(&format!(
+                "\n\n*(applied {n} file(s) to the repo working tree — they ride the mission PR: {})*",
+                files.iter().map(|(p, _)| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+            )),
+            Err(e) => output.push_str(&format!("\n\n*(FAILED to apply files to the repo: {e})*")),
+        },
+        None => output.push_str("\n\n*(files NOT applied — no running container for this role)*"),
+    }
 }
 
 /// Meeting loop bound — after this many meeting rounds, still-open questions are
@@ -2896,12 +4079,6 @@ const HUMAN_TIMEOUT_SECS: u64 = 3600;
 /// Cap for the PR stage's in-mission GitHub device-flow wait (GitHub codes
 /// live ~900s; the wait ends with the earlier of the code's expiry and this).
 const DEVICE_AUTH_WAIT_CAP_SECS: u64 = 900;
-
-/// Host ports for the isolated staging compose project the deploy stage spins
-/// up — never the live 3000/8000, so a deploy can never restart the platform
-/// that is running the mission itself.
-const STAGING_WEB_PORT: &str = "13000";
-const STAGING_API_PORT: &str = "18000";
 
 /// Find a trailing "## ASK" block → (line index of the heading, addressed roles, question text).
 fn find_ask(output: &str) -> Option<(usize, Vec<String>, String)> {
@@ -2941,6 +4118,66 @@ fn strip_ask(output: &str) -> String {
     }
 }
 
+/// Design+code delivery: dev/UX agents may end their reply with a section
+/// exactly titled `## FILES` — every entry is `### <repo-relative-path>`
+/// followed by ONE fenced block holding the COMPLETE file content (full file,
+/// never a diff). The orchestrator writes these into the repo working tree in
+/// the agent's container and the PR stage commits whatever changed — this is
+/// how missions ship real code and design artifacts instead of prose about
+/// them. Line index where that section starts (None = absent).
+fn find_files(output: &str) -> Option<usize> {
+    output.lines().position(|l| l.trim().eq_ignore_ascii_case("## FILES"))
+}
+
+/// (path, full content) pairs from the FILES section. Guarded on purpose:
+/// paths are interpolated into a quoted sh script, so they must be relative
+/// with a conservative charset and no `..`; counts/sizes are bounded; content
+/// may not contain the heredoc terminator.
+fn parse_files(output: &str) -> Vec<(String, String)> {
+    let Some(start) = find_files(output) else { return Vec::new() };
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut in_fence = false;
+    let mut body = String::new();
+    for line in output.lines().skip(start + 1) {
+        let t = line.trim_end();
+        if in_fence {
+            if t.trim_start().starts_with("```") {
+                if let Some(p) = path.take() {
+                    if !body.contains("AAP_EOF_9Z") {
+                        files.push((p, std::mem::take(&mut body)));
+                    }
+                }
+                in_fence = false;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        } else if let Some(rest) = t.strip_prefix("### ") {
+            path = Some(rest.trim().to_string()); // replaces an entry that never got a block
+        } else if t.trim_start().starts_with("```") {
+            if path.is_some() { in_fence = true; }
+        }
+    }
+    files.retain(|(p, c)| {
+        !p.is_empty() && p.len() <= 200
+            && !p.starts_with('/') && !p.split('/').any(|seg| seg == "..")
+            && p.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+            && !c.is_empty() && c.len() <= 65_536
+    });
+    files.truncate(12);
+    files
+}
+
+/// Deliverable text without the FILES section — full-file listings would drown
+/// the handoff summary later teammates read.
+fn strip_files(output: &str) -> String {
+    match find_files(output) {
+        Some(start) => output.lines().take(start).collect::<Vec<_>>().join("\n").trim_end().to_string(),
+        None => output.to_string(),
+    }
+}
+
 /// Keep only teammates that exist in this team (minus the asker), in team order;
 /// "all" expands to everyone. "human" is passed through and sorted last so a
 /// need-human escalation only fires after the teammates had their say.
@@ -2971,13 +4208,16 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
         None => (None, None),
     };
     let mut store = app.store.lock().unwrap();
-    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
-        step.status = "done".into();
-        step.output = output.to_string();
-        step.container = container;
-        step.deliverable = deliverable;
-        step.finished_at = now_secs();
-        if rev.is_some() { step.rev = rev; }
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if run.status != "running" && run.status != "waiting_human" { return; }
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == "work") {
+            step.status = "done".into();
+            step.output = output.to_string();
+            step.container = container;
+            step.deliverable = deliverable;
+            step.finished_at = now_secs();
+            if rev.is_some() { step.rev = rev; }
+        }
     }
     save_runs(&store);
 }
@@ -2985,6 +4225,383 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
 /// True once POST /runs/{id}/stop flagged this run.
 fn stop_requested(app: &App, run_id: &str) -> bool {
     app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).map(|r| r.stop_requested).unwrap_or(false)
+}
+
+/// Terminal runs (done / stopped / error) must never be moved back to life by
+/// a late tail write — only the explicit per-step retry endpoint reopens one.
+fn run_is_live(app: &App, run_id: &str) -> bool {
+    app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id)
+        .map(|r| r.status == "running" || r.status == "waiting_human")
+        .unwrap_or(false)
+}
+
+/// USD per million tokens for a model: the editable table first, then the
+/// configured default. `false` = no price known, so the step's cost is not a
+/// real estimate (UI marks it).
+fn model_price(app: &App, model: &str) -> (f64, f64, bool) {
+    let cfg = app.store.lock().unwrap().config.clone();
+    if let Some(p) = cfg.pricing.get(model) {
+        return (p.input_per_mtok, p.output_per_mtok, true);
+    }
+    if cfg.default_input_per_mtok > 0.0 || cfg.default_output_per_mtok > 0.0 {
+        return (cfg.default_input_per_mtok, cfg.default_output_per_mtok, false);
+    }
+    (0.0, 0.0, false)
+}
+
+fn usage_cost(usage: LlmUsage, input_per_mtok: f64, output_per_mtok: f64) -> f64 {
+    usage.input_tokens as f64 * input_per_mtok / 1_000_000.0
+        + usage.output_tokens as f64 * output_per_mtok / 1_000_000.0
+}
+
+/// Add one provider call's usage to the run ledger (and to the step when it
+/// belongs to one) and persist. Raises the soft alert once, without stopping.
+fn record_usage(app: &App, run_id: &str, role: &str, kind: &str, model: &str, usage: LlmUsage) {
+    let (ip, op, priced) = model_price(app, model);
+    let cost = usage_cost(usage, ip, op);
+    let mut store = app.store.lock().unwrap();
+    let alert_pct = store.runs.iter().find(|r| r.id == run_id)
+        .and_then(|r| store.projects.iter().find(|p| p.id == r.project_id))
+        .map(|p| p.budget_alert_pct.clamp(1, 100) as f64 / 100.0)
+        .unwrap_or(0.8);
+    let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) else { return };
+    run.input_tokens += usage.input_tokens;
+    run.output_tokens += usage.output_tokens;
+    run.cost_usd += cost;
+    if !kind.is_empty() {
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind) {
+            step.input_tokens += usage.input_tokens;
+            step.output_tokens += usage.output_tokens;
+            step.cost_usd += cost;
+            if !priced { step.priced = false; }
+        }
+    }
+    if !run.cost_alerted {
+        if let Some(budget) = run.budget_usd.filter(|b| *b > 0.0) {
+            if run.cost_usd >= budget * alert_pct {
+                run.cost_alerted = true;
+            }
+        }
+    }
+    save_runs(&store);
+}
+
+/// Open the budget pause discussion (once per run) and return its id.
+fn raise_budget_discussion(app: &App, run_id: &str, cost: f64, budget: f64) -> String {
+    let mut store = app.store.lock().unwrap();
+    let disc_id = format!("d-{:03}", store.runs.iter().find(|r| r.id == run_id).map(|r| r.discussions.len() + 1).unwrap_or(1));
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = "waiting_human".into();
+        run.phase = "budget".into();
+        run.discussions.push(Discussion {
+            id: disc_id.clone(),
+            kind: "budget".into(),
+            from: "orchestrator".into(),
+            to: vec!["human".into()],
+            topic: format!("งบประมาณของ mission นี้ถูกใช้ครบแล้ว — ใช้ไป ${cost:.4} จาก ${budget:.2}. เพิ่มงบเพื่อให้ทีมทำงานต่อ หรือกด Stop เพื่อหยุด mission"),
+            status: "need_human".into(),
+            answering: Some("human".into()),
+            messages: vec![MeetingMessage {
+                from: "orchestrator".into(),
+                text: format!("💸 spend ${cost:.4} reached the ${budget:.2} budget — waiting for you to raise it (reply in chat alone does NOT raise it; use the Raise budget action)."),
+                at: now_secs(),
+            }],
+            round: 0,
+            created_at: now_secs(),
+        });
+    }
+    save_runs(&store);
+    disc_id
+}
+
+/// Cost guardrail checked before every provider/harness call in a run.
+/// `true` = keep going, `false` = the run must wind down (user stopped it or
+/// the budget pause timed out).
+async fn guard_budget(app: &App, run_id: &str) -> bool {
+    loop {
+        let (cost, budget, existing) = {
+            let store = app.store.lock().unwrap();
+            match store.runs.iter().find(|r| r.id == run_id) {
+                Some(run) => (
+                    run.cost_usd,
+                    run.budget_usd,
+                    run.discussions.iter().rev()
+                        .find(|d| d.kind == "budget" && d.status != "resolved")
+                        .map(|d| d.id.clone()),
+                ),
+                None => return false,
+            }
+        };
+        let budget = match budget.filter(|b| *b > 0.0) {
+            Some(b) => b,
+            None => return true,
+        };
+        if cost < budget { return true; }
+        let disc_id = existing.unwrap_or_else(|| raise_budget_discussion(app, run_id, cost, budget));
+        escalate_to_human(app, run_id, &disc_id, "increase the run budget to continue spending");
+        match wait_for_human(app, run_id, &disc_id).await {
+            HumanOutcome::Answered => {
+                // A chat reply alone does not raise the budget — only
+                // POST /runs/{id}/budget does. Re-check and re-pause if needed.
+                let (cost_now, budget_now) = {
+                    let store = app.store.lock().unwrap();
+                    store.runs.iter().find(|r| r.id == run_id)
+                        .map(|r| (r.cost_usd, r.budget_usd))
+                        .unwrap_or((cost, Some(budget)))
+                };
+                if budget_now.unwrap_or(0.0) > cost_now {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                            d.status = "resolved".into();
+                            d.answering = None;
+                        }
+                    }
+                    save_runs(&store);
+                    return true;
+                }
+            }
+            HumanOutcome::Stopped | HumanOutcome::TimedOut => {
+                // Unlike a normal meeting, continuing past this point keeps
+                // spending money — stop the run instead.
+                finish_run(app, run_id, "stopped");
+                return false;
+            }
+        }
+    }
+}
+
+/// Fail closed when a project budget is set but the model has no price: an
+/// unpriceable call would add $0 to the ledger and silently defeat the whole
+/// guardrail. The run pauses (waiting_human) and resumes only once AI Config
+/// has a price for the model (then a chat reply re-checks), or the user stops.
+async fn guard_model_pricing(app: &App, run_id: &str, model: &str) -> bool {
+    let has_budget = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.budget_usd)
+            .map(|b| b > 0.0)
+            .unwrap_or(false)
+    };
+    if !has_budget { return true; }
+    loop {
+        let (ip, op, _) = model_price(app, model);
+        if ip > 0.0 || op > 0.0 { return true; }
+        let disc_id = {
+            let mut store = app.store.lock().unwrap();
+            let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) else { return false };
+            if run.status != "running" && run.status != "waiting_human" { return false; }
+            if let Some(d) = run.discussions.iter().rev().find(|d| d.kind == "unpriced" && d.status != "resolved") {
+                d.id.clone()
+            } else {
+                let id = format!("d-{:03}", run.discussions.len() + 1);
+                run.status = "waiting_human".into();
+                run.phase = "budget".into();
+                run.discussions.push(Discussion {
+                    id: id.clone(),
+                    kind: "unpriced".into(),
+                    from: "orchestrator".into(),
+                    to: vec!["human".into()],
+                    topic: format!("โมเดล {model} ยังไม่มีราคา — งบประมาณคุมไม่ได้"),
+                    status: "need_human".into(),
+                    answering: Some("human".into()),
+                    messages: vec![MeetingMessage {
+                        from: "orchestrator".into(),
+                        text: format!(
+                            "⚖️ This project has a budget, but model '{model}' has no price in AI Config — cost would record as $0 and the guardrail would never trip. Add input/output USD per 1M tokens for this model (or set the default price), then reply here to continue. Chat alone cannot bypass this check; Stop ends the run."
+                        ),
+                        at: now_secs(),
+                    }],
+                    round: 0,
+                    created_at: now_secs(),
+                });
+                id
+            }
+        };
+        save_runs(&app.store.lock().unwrap());
+        match wait_for_human(app, run_id, &disc_id).await {
+            HumanOutcome::Answered => {
+                let (ip, op, _) = model_price(app, model);
+                if ip > 0.0 || op > 0.0 {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                            d.status = "resolved".into();
+                            d.answering = None;
+                        }
+                    }
+                    save_runs(&store);
+                    return true;
+                }
+                let mut store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                    run.status = "waiting_human".into();
+                    run.phase = "budget".into();
+                    if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                        d.status = "need_human".into();
+                        d.answering = Some("human".into());
+                        d.messages.push(MeetingMessage {
+                            from: "orchestrator".into(),
+                            text: format!("Still no price for '{model}' — add it in AI Config → Pricing, then reply again."),
+                            at: now_secs(),
+                        });
+                    }
+                }
+                save_runs(&store);
+            }
+            HumanOutcome::Stopped | HumanOutcome::TimedOut => {
+                finish_run(app, run_id, "stopped");
+                return false;
+            }
+        }
+    }
+}
+
+/// One LLM call inside a run: budget guard, retry, usage ledger. `kind` "" =
+/// call not attached to a step (meeting answers, PR text, PO summary).
+/// `Ok(None)` = the guard stopped the run — the caller must wind down.
+async fn llm_step(app: &App, run_id: &str, role: &str, kind: &str, model: &str, system: &str, user: &str, max: u32) -> Result<Option<String>, ApiError> {
+    if stop_requested(app, run_id) || !run_is_live(app, run_id) {
+        return Ok(None);
+    }
+    if !guard_budget(app, run_id).await {
+        return Ok(None);
+    }
+    if !guard_model_pricing(app, run_id, model).await {
+        return Ok(None);
+    }
+    let (text, usage) = llm_retry_usage(app, model, system, user, max).await?;
+    record_usage(app, run_id, role, kind, model, usage);
+    Ok(Some(text))
+}
+
+// ---------------------------------------------------------------------------
+// BYO CLI harnesses — a persona may "think" through an installed CLI agent
+// ---------------------------------------------------------------------------
+
+/// External harness calls are allowed this long before they are killed.
+const HARNESS_TIMEOUT_SECS: u64 = 30 * 60;
+
+fn persona_harness(app: &App, role: &str) -> (String, String) {
+    let store = app.store.lock().unwrap();
+    store.personas.iter().find(|p| p.role == role)
+        .map(|p| (p.harness.clone(), p.harness_command.clone()))
+        .unwrap_or_else(|| ("native".into(), String::new()))
+}
+
+/// Command template for a persona: its own override wins; otherwise the
+/// preset for `claude` / `codex`; native has none.
+fn harness_template(harness: &str, custom: &str) -> Option<String> {
+    if !custom.trim().is_empty() { return Some(custom.trim().to_string()); }
+    match harness {
+        "claude" => Some("claude -p \"$(cat {prompt_file})\"".into()),
+        "codex" => Some("codex exec \"$(cat {prompt_file})\"".into()),
+        _ => None,
+    }
+}
+
+fn harness_binary(template: &str) -> String {
+    template.split_whitespace().next().unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'').to_string()
+}
+
+fn valid_binary_name(bin: &str) -> bool {
+    !bin.is_empty() && bin.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
+
+fn binary_installed(bin: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {} >/dev/null 2>&1", bin))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn list_harnesses(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
+    let claude_cmd = harness_template("claude", "").unwrap_or_default();
+    let codex_cmd = harness_template("codex", "").unwrap_or_default();
+    let claude_bin = harness_binary(&claude_cmd);
+    let codex_bin = harness_binary(&codex_cmd);
+    Ok(json_ok(json!([
+        { "id": "native", "label": "Built-in provider loop", "command": "", "binary": "", "installed": true },
+        { "id": "claude", "label": "Claude Code CLI", "command": claude_cmd, "binary": claude_bin, "installed": binary_installed(&claude_bin) },
+        { "id": "codex", "label": "Codex CLI", "command": codex_cmd, "binary": codex_bin, "installed": binary_installed(&codex_bin) },
+        { "id": "custom", "label": "Custom command", "command": "", "binary": "", "installed": true },
+    ])))
+}
+
+fn mark_harness_step(app: &App, run_id: &str, role: &str, harness: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
+        .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work"))
+    {
+        step.harness = Some(harness.into());
+        step.metered = false;
+        step.priced = false;
+    }
+    save_runs(&store);
+}
+
+/// Run one step through an external CLI harness. The prompt is written 0600 to
+/// the data dir; the harness runs on the host through the agent's session with
+/// a 30-minute cap. Output is unmetered (cost unknown), so it is recorded only
+/// as the step's harness/metered flags — never as token spend.
+async fn harness_step(
+    app: &App, run_id: &str, role: &str, harness: &str, custom: &str,
+    model: &str, system: &str, user: &str,
+) -> Result<Option<String>, ApiError> {
+    if stop_requested(app, run_id) || !run_is_live(app, run_id) { return Ok(None); }
+    if !guard_budget(app, run_id).await { return Ok(None); }
+    let template = harness_template(harness, custom).ok_or_else(|| err(
+        StatusCode::BAD_REQUEST,
+        format!("persona harness '{harness}' has no command — set a command template or switch it to native"),
+    ))?;
+    let binary = harness_binary(&template);
+    if !valid_binary_name(&binary) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("invalid harness command '{template}'")));
+    }
+    let (cid, _) = app.agent_container(role).await.ok_or_else(|| err(
+        StatusCode::CONFLICT,
+        format!("no running session for {role} — start the agent first so its CLI harness can run"),
+    ))?;
+    let (code, _) = app.exec_in(&cid, &format!("command -v {binary} >/dev/null 2>&1")).await
+        .unwrap_or((-1, String::new()));
+    if code != 0 {
+        return Err(err(StatusCode::FAILED_DEPENDENCY, format!(
+            "harness '{harness}' is not installed on this machine (missing `{binary}`) — install it or switch this persona to native"
+        )));
+    }
+    let tmp = data_dir().join("tmp");
+    let _ = std::fs::create_dir_all(&tmp);
+    let n = app.seq.fetch_add(1, Ordering::SeqCst);
+    let prompt_file = tmp.join(format!("harness-{n}.md"));
+    write_atomic_private(&prompt_file, &format!("{system}\n\n{user}\n")).map_err(|e| err(
+        StatusCode::INTERNAL_SERVER_ERROR, format!("could not write harness prompt: {e}")))?;
+    let cmd = template
+        .replace("{prompt_file}", &hostexec::shq(&prompt_file.to_string_lossy()))
+        .replace("{model}", &hostexec::shq(model))
+        .replace("{role}", &hostexec::shq(role));
+    let run = hostexec::run_with_timeout(
+        &cid, &cmd, &[], Some(std::time::Duration::from_secs(HARNESS_TIMEOUT_SECS)),
+    ).await;
+    let _ = std::fs::remove_file(&prompt_file);
+    match run {
+        Ok((0, out)) => {
+            let out = out.trim().to_string();
+            if out.is_empty() {
+                Err(err(StatusCode::BAD_GATEWAY, format!("harness '{harness}' returned an empty answer")))
+            } else {
+                Ok(Some(out))
+            }
+        }
+        Ok((code, out)) => Err(err(StatusCode::BAD_GATEWAY, format!(
+            "harness '{harness}' exited {code}: {}", one_line(&out, 400)))),
+        Err(e) if e.contains("timed out") => Err(err(StatusCode::GATEWAY_TIMEOUT, format!(
+            "harness '{harness}' timed out after {} min and was killed", HARNESS_TIMEOUT_SECS / 60))),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("harness failed: {e}"))),
+    }
 }
 
 /// Close a run: mark remaining pending steps "skipped", set the final status/phase, persist.
@@ -2995,13 +4612,31 @@ fn finish_run(app: &App, run_id: &str, status: &str) {
         for step in run.steps.iter_mut().filter(|s| s.status == "pending") {
             step.status = "skipped".into();
         }
+        // The step that was mid-flight when the run ended would otherwise show
+        // "working" forever — nothing will ever move it forward again. Close it.
+        for step in run.steps.iter_mut().filter(|s| s.status == "working") {
+            step.status = "stopped".into();
+            step.output = format!("stopped mid-work — the run closed as {status} while this step was in flight");
+            if step.finished_at == 0 { step.finished_at = now_secs(); }
+        }
         run.status = status.into();
         run.phase = "done".into();
+        run.watchdog_note = None;
+        run.watchdog_at = 0;
         for d in run.discussions.iter_mut().filter(|d| d.status != "resolved") {
             d.status = "resolved".into();
             d.answering = None;
         }
         save_runs(&store);
+    }
+}
+
+/// Exit point for an `Ok(None)` from llm_step: the user pressed Stop (close the
+/// run as stopped) or the budget guard paused it (leave waiting_human intact).
+/// Returning without this left a stopped run looking alive forever.
+fn wind_down_or_pause(app: &App, run_id: &str) {
+    if stop_requested(app, run_id) {
+        finish_run(app, run_id, "stopped");
     }
 }
 
@@ -3256,8 +4891,8 @@ async fn try_in_mission_github_auth(app: &App, run_id: &str, dev_role: &str, con
 }
 
 // ---------------------------------------------------------------------------
-// Tail stages — after QA verifies: a REAL pull request, a REAL isolated
-// staging deploy, then the PO acceptance demo session
+// Tail stages — after QA verifies: a REAL pull request, then the PO
+// acceptance demo session
 // ---------------------------------------------------------------------------
 
 /// What the PR stage actually achieved. `status` mirrors the step status
@@ -3275,35 +4910,23 @@ impl PrOutcome {
     }
 }
 
-/// Same for the staging deploy. `url` is the staging web URL when done.
-struct DeployOutcome { status: String, url: String, note: String }
-
-impl DeployOutcome {
-    fn describe(&self) -> String {
-        if self.status == "done" {
-            format!("Staging DEPLOYED: {} ({})", self.url, self.note)
-        } else {
-            format!("Staging deploy {}: {}", self.status, self.note)
-        }
-    }
-}
-
 /// Flip a tail step's status/output. Tail steps are found by role+kind — the
-/// same persona can own work/pr/deploy steps in one run.
+/// same persona can own work/pr/demo steps in one run.
 async fn step_transition(app: &App, run_id: &str, role: &str, kind: &str, status: &str, output: &str) {
     let mut store = app.store.lock().unwrap();
-    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
-        .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == kind))
-    {
-        step.status = status.into();
-        step.output = output.to_string();
-        if status == "working" { step.started_at = now_secs(); }
-        if status == "done" || status == "error" || status == "skipped" { step.finished_at = now_secs(); }
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if run.status != "running" && run.status != "waiting_human" { return; }
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind) {
+            step.status = status.into();
+            step.output = output.to_string();
+            if status == "working" { step.started_at = now_secs(); }
+            if status == "done" || status == "error" || status == "skipped" { step.finished_at = now_secs(); }
+        }
     }
     save_runs(&store);
 }
 
-/// Append the three tail steps (pr / deploy / demo) as pending, in execution order.
+/// Append the two tail steps (pr / demo) as pending, in execution order.
 async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &str) {
     let personas = app.store.lock().unwrap().personas.clone();
     let mut store = app.store.lock().unwrap();
@@ -3313,10 +4936,10 @@ async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &st
             role: role.into(), name: name_of(role), title: title.into(), kind: kind.into(),
             status: "pending".into(), output: String::new(),
             model: None, container: None, deliverable: None, rev: None,
-            started_at: 0, finished_at: 0,
+            started_at: 0, finished_at: 0, harness: None,
+            input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
         };
         run.steps.push(mk(dev_role, "pr", "Open Pull Request"));
-        run.steps.push(mk(dev_role, "deploy", "Deploy Staging"));
         run.steps.push(mk(po_role, "demo", "Acceptance Demo"));
         save_runs(&store);
     }
@@ -3381,6 +5004,203 @@ fn parse_pr_text(reply: &str, task: &str, run_id: &str) -> (String, String) {
 /// Real PR: mission branch in the dev's container, deliverables copied into
 /// missions/<run_id>/, commit, push, `gh pr create`. Missing preconditions →
 /// skipped with the honest reason; failed actions → error with the real output.
+/// Max characters of `git diff` persisted for the review card.
+const REVIEW_DIFF_MAX: usize = 16_000;
+/// One human review, then (on reject) one Dev revision, then a second review.
+const MAX_REVIEW_ROUNDS: u32 = 2;
+
+enum ReviewOutcome {
+    /// approved (or nothing to review) — the PR stage may run
+    Proceed,
+    /// not approved — skip the PR with this honest reason
+    Skip(String),
+    /// user pressed Stop during a review pause
+    Stopped,
+}
+
+/// Stage the shared working tree and capture the exact diff the PR would push.
+/// None = no session / no repo / no changes — the gate is skipped and the PR
+/// stage reports the same honest reason.
+async fn collect_repo_diff(app: &App, cid: &str, repo_path: &str) -> Option<(Vec<String>, String)> {
+    let script = format!(
+        "cd '{repo_path}' || exit 10; \
+         git add -A >/dev/null 2>&1 || true; \
+         git status --porcelain --untracked-files=all; \
+         echo '---STAT---'; \
+         git diff --cached --stat; \
+         echo '---PATCH---'; \
+         git diff --cached --no-color"
+    );
+    let (code, out) = app.exec_in(cid, &script).await.ok()?;
+    if code != 0 { return None; }
+    let (files_part, rest) = out.split_once("---STAT---").unwrap_or((out.as_str(), ""));
+    let files: Vec<String> = files_part.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+    if files.is_empty() { return None; }
+    let diff: String = rest.chars().take(REVIEW_DIFF_MAX).collect();
+    Some((files, diff))
+}
+
+fn review_state(app: &App, run_id: &str) -> (String, String) {
+    let store = app.store.lock().unwrap();
+    store.runs.iter().find(|r| r.id == run_id)
+        .and_then(|r| r.review.as_ref())
+        .map(|r| (r.status.clone(), r.comment.clone()))
+        .unwrap_or((String::new(), String::new()))
+}
+
+fn set_review_status(app: &App, run_id: &str, status: &str, comment: &str) {
+    let mut store = app.store.lock().unwrap();
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if let Some(review) = run.review.as_mut() {
+            review.status = status.into();
+            if !comment.is_empty() { review.comment = comment.into(); }
+            review.decided_at = now_secs();
+        }
+    }
+    save_runs(&store);
+}
+
+/// Persist the pending review and open the need-human discussion for it.
+fn open_review(app: &App, run_id: &str, files: &[String], diff: &str) -> String {
+    let mut store = app.store.lock().unwrap();
+    let disc_id = format!("d-{:03}", store.runs.iter().find(|r| r.id == run_id).map(|r| r.discussions.len() + 1).unwrap_or(1));
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        // A budget stop / user stop may have closed the run while the diff was
+        // being staged — never resurrect it as a live review.
+        if run.status != "running" { return String::new(); }
+        run.review = Some(RunReview {
+            status: "pending".into(),
+            diff: diff.to_string(),
+            files: files.to_vec(),
+            comment: String::new(),
+            requested_at: now_secs(),
+            decided_at: 0,
+        });
+        run.status = "waiting_human".into();
+        run.phase = "review".into();
+        let listing = files.iter().take(25).cloned().collect::<Vec<_>>().join("\n");
+        run.discussions.push(Discussion {
+            id: disc_id.clone(),
+            kind: "review".into(),
+            from: "orchestrator".into(),
+            to: vec!["human".into()],
+            topic: format!("ตรวจ diff ก่อน push/PR — {} ไฟล์ที่เปลี่ยน", files.len()),
+            status: "need_human".into(),
+            answering: Some("human".into()),
+            messages: vec![MeetingMessage {
+                from: "orchestrator".into(),
+                text: format!("🔍 the team is ready to push. Review the diff in Mission Control, then Approve or Reject with a comment.\n\n```\n{listing}\n```"),
+                at: now_secs(),
+            }],
+            round: 0,
+            created_at: now_secs(),
+        });
+    }
+    save_runs(&store);
+    disc_id
+}
+
+/// Wait for the human's decision on the pending review. A plain chat message
+/// ("why this file?") wakes the wait but is NOT a decision — the review stays
+/// pending, the run stays visibly paused, and we keep waiting for an explicit
+/// Approve/Reject or an APPROVE/REJECT chat line.
+async fn wait_review(app: &App, run_id: &str, disc_id: &str) -> String {
+    loop {
+        match wait_for_human(app, run_id, disc_id).await {
+            HumanOutcome::Answered => {
+                let status = review_state(app, run_id).0;
+                if status != "pending" { return status; }
+                {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if run.status == "running" { run.status = "waiting_human".into(); }
+                        run.phase = "review".into();
+                    }
+                    save_runs(&store);
+                }
+            }
+            HumanOutcome::TimedOut => {
+                set_review_status(app, run_id, "timed_out", "");
+                return "timed_out".into();
+            }
+            HumanOutcome::Stopped => return "stopped".into(),
+        }
+    }
+}
+
+/// Pre-push review gate. Approve → Proceed; first reject → Dev revises once
+/// and a second review opens; second reject/timeout/Stop → Skip.
+async fn review_gate(
+    app: &App, run_id: &str, dev_role: &str, repo_url: &str, repo_path: &str,
+    task: &str, project_name: &str,
+) -> ReviewOutcome {
+    let (cid, _) = match app.agent_container(dev_role).await {
+        Some(x) => x,
+        None => return ReviewOutcome::Proceed, // PR stage reports the missing session
+    };
+    if repo_url.trim().is_empty() { return ReviewOutcome::Proceed; }
+    let (mut files, mut diff) = match collect_repo_diff(app, &cid, repo_path).await {
+        Some(x) => x,
+        None => return ReviewOutcome::Proceed,
+    };
+    step_transition(app, run_id, dev_role, "pr", "working", "waiting for diff review").await;
+    let dev = persona_of(app, dev_role);
+
+    for round in 0..MAX_REVIEW_ROUNDS {
+        if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
+        let disc_id = open_review(app, run_id, &files, &diff);
+        if disc_id.is_empty() { return ReviewOutcome::Stopped; }
+        let status = wait_review(app, run_id, &disc_id).await;
+        // The review discussion is closed either way; the outcome is in Run.review.
+        {
+            let mut store = app.store.lock().unwrap();
+            if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                    d.status = "resolved".into();
+                    d.answering = None;
+                }
+            }
+            save_runs(&store);
+        }
+        match status.as_str() {
+            "approved" => return ReviewOutcome::Proceed,
+            "stopped" => return ReviewOutcome::Stopped,
+            "timed_out" => return ReviewOutcome::Skip("diff review timed out — nothing was pushed".into()),
+            "rejected" if round + 1 >= MAX_REVIEW_ROUNDS => {
+                return ReviewOutcome::Skip("rejected by the reviewer a second time — nothing was pushed".into());
+            }
+            "rejected" => {
+                let comment = review_state(app, run_id).1;
+                let goal_line = goal_ancestry_line(app, run_id, dev_role);
+                let system = work_system(&dev.2, &dev.0, &dev.1, true, project_name,
+                    &team_repo_line(&Some(repo_path.to_string())), "", &goal_line, run_id);
+                let user = format!(
+                    "## Mission\n{task}\n\n## Reviewer comment\n{}\n\n## Diff under review\n```\n{}\n```\n\nApply the requested changes to the repo now — re-emit the FULL FILES block for every file you change. Then summarise what changed.",
+                    if comment.is_empty() { "(no comment)" } else { &comment }, diff
+                );
+                if let Some(m) = dev.3.as_deref() {
+                    match llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
+                        Ok(Some(output)) => {
+                            let mut clean = strip_ask(&output);
+                            apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
+                        }
+                        // The budget guard stopped the run mid-revision.
+                        Ok(None) => return ReviewOutcome::Stopped,
+                        Err(_) => {}
+                    }
+                }
+                if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
+                match collect_repo_diff(app, &cid, repo_path).await {
+                    Some((f, d)) => { files = f; diff = d; }
+                    None => return ReviewOutcome::Skip("the Dev revision produced no changes — nothing was pushed".into()),
+                }
+            }
+            _ => return ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into()),
+        }
+    }
+    ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into())
+}
+
 async fn run_pr_stage(
     app: &App, run_id: &str, dev_role: &str, repo_url: &str, task: &str, project_name: &str,
     dev: &(String, String, String, Option<String>),
@@ -3413,7 +5233,45 @@ async fn run_pr_stage(
     // gh auth + git identity for THIS container (idempotent, best-effort)
     app.ensure_tools(&cid).await;
 
-    // Branch + commit: copy the run's deliverable markdown into the repo
+    // Stage exactly what the PR would push BEFORE asking for review — branch,
+    // missions/ deliverables and the code/design files the dev/UX agents
+    // applied. The reviewed diff is therefore the pushed diff, and the gate
+    // lives here (inside the PR stage) so a retry cannot bypass it.
+    let ws = hostexec::workspace_str();
+    let prep = format!(
+        "cd '{repo_path}' || exit 10; \
+         git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
+         git fetch --all --quiet >/dev/null 2>&1 || true; \
+         git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
+         mkdir -p 'missions/{run_id}'; \
+         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
+         git add -A"
+    );
+    let (pcode, pout) = app.exec_in(&cid, &prep).await
+        .unwrap_or((-1, "exec failed".into()));
+    if pcode == 10 {
+        let n = format!("repo path {repo_path} disappeared on this machine");
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    if pout.contains("NO_REMOTE") {
+        let n = "no git remote 'origin' in the cloned repo — cannot push a PR".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    match review_gate(app, run_id, dev_role, repo_url, &repo_path, task, project_name).await {
+        ReviewOutcome::Proceed => {}
+        ReviewOutcome::Stopped => {
+            finish_run(app, run_id, "stopped");
+            return PrOutcome { status: "skipped".into(), url: String::new(), branch: branch.clone(), note: "run stopped during diff review".into() };
+        }
+        ReviewOutcome::Skip(n) => {
+            step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+            return skip(n);
+        }
+    }
+
+    // Branch + commit: everything staged above rides the mission branch.
     let commit_msg = format!("mission {run_id}: team deliverables");
     let script = format!(
         "cd '{repo_path}' || exit 10; \
@@ -3421,15 +5279,16 @@ async fn run_pr_stage(
          git fetch --all --quiet >/dev/null 2>&1 || true; \
          git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
          mkdir -p 'missions/{run_id}'; \
-         cp /workspace/{run_id}-*.md 'missions/{run_id}/' 2>/dev/null || true; \
-         git add 'missions/{run_id}'; \
+         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
+         git add -A; \
+         git status --porcelain | head -30; \
          git commit -q -m '{commit_msg}' 2>/dev/null || echo NOTHING_TO_COMMIT; \
          git log -1 --format=%h 2>/dev/null"
     );
     let (code, out) = app.exec_in(&cid, &script).await
         .unwrap_or((-1, "exec failed".into()));
     if code == 10 {
-        let n = format!("repo path {repo_path} disappeared in the container");
+        let n = format!("repo path {repo_path} disappeared on this machine");
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -3440,7 +5299,7 @@ async fn run_pr_stage(
     }
     let committed = !out.contains("NOTHING_TO_COMMIT");
     if !committed {
-        let n = "nothing to commit — no deliverable files landed under /workspace for this run (agents without containers write text-only deliverables)".to_string();
+        let n = "nothing to commit — no deliverable files landed in the shared workspace and no code/design changes were applied to the repo this run".to_string();
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -3456,15 +5315,25 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
     );
     let user = format!("## Mission\n{task}\n\n## Added under missions/{run_id}/\nThe team's per-role deliverable markdown files for this mission.\n\nWrite TITLE: and BODY:.");
     let (title, body) = match dmodel.as_deref() {
-        Some(m) => match app.llm_max(m, &system, &user, 400).await {
-            Ok(t) => parse_pr_text(&t, task, run_id),
+        Some(m) => match llm_step(app, run_id, dev_role, "pr", m, &system, &user, 400).await {
+            Ok(Some(t)) => parse_pr_text(&t, task, run_id),
+            Ok(None) => {
+                let n = "run stopped at the budget checkpoint — nothing was pushed".to_string();
+                step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+                return skip(n);
+            }
             Err(_) => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
         },
         None => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
     };
-    let heredoc = |path: &str, content: &str| format!("cat > '{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n", content.replace('\r', ""));
-    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-title.txt", &title)).await;
-    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-body.md", &body)).await;
+    // PR text is model output — write it locally (0600) instead of heredoc'ing
+    // it through the shell, so an injected terminator line cannot execute.
+    let title_path = std::env::temp_dir().join(format!("aap-pr-title-{run_id}.txt"));
+    let body_path = std::env::temp_dir().join(format!("aap-pr-body-{run_id}.md"));
+    let _ = write_atomic_private(&title_path, &title.replace('\r', ""));
+    let _ = write_atomic_private(&body_path, &body.replace('\r', ""));
+    let title_arg = hostexec::shq(&title_path.to_string_lossy());
+    let body_arg = hostexec::shq(&body_path.to_string_lossy());
 
     // Auth gate → push → PR. Missing auth first triggers the in-mission device
     // flow (need-human chat with the code) — the run waits for the user to
@@ -3476,7 +5345,7 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
         .unwrap_or((127, String::new()));
     if code != 0 {
         if code == 127 {
-            let n = "gh CLI not available in the dev container image — use the agent-base image to open PRs".to_string();
+            let n = "gh CLI not installed on this machine — brew install gh to open PRs".to_string();
             step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
             return skip(n);
         }
@@ -3488,12 +5357,12 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
                 return skip(n);
             }
             GhAuthOutcome::RepliedUnauthed => {
-                let n = format!("gh still not authenticated after your chat reply — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page (branch '{branch}' with the mission commit exists locally in the container)");
+                let n = format!("gh still not authenticated after your chat reply — เชื่อม GitHub ให้เครื่องนี้ที่หน้า Containers/Team → connector (login ผ่าน browser หรือวาง token เป็นทางสำรอง) แล้ว re-run (branch '{branch}' with the mission commit exists locally in the container)");
                 step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
                 return skip(n);
             }
             GhAuthOutcome::Ended => {
-                let n = format!("GitHub authorization did not complete in time — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page, then re-run (branch '{branch}' with the mission commit exists locally in the container)");
+                let n = format!("GitHub authorization did not complete in time — เชื่อม GitHub ให้เครื่องนี้ที่หน้า Containers/Team → connector แล้ว re-run (branch '{branch}' with the mission commit exists locally in the container)");
                 step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
                 return skip(n);
             }
@@ -3507,12 +5376,13 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
         return PrOutcome { status: "error".into(), url: String::new(), branch, note: n };
     }
     let (code, out) = app.exec_in(&cid, &format!(
-        "cd '{repo_path}' && gh pr create --head '{branch}' --title \"$(cat /tmp/aap-pr-title.txt)\" --body-file /tmp/aap-pr-body.md 2>&1"
+        "cd '{repo_path}' && gh pr create --head '{branch}' --title \"$(cat {title_arg})\" --body-file {body_arg} 2>&1"
     )).await.unwrap_or((-1, "exec failed".into()));
     let url = extract_pr_url(&out);
     if let Some(u) = url.filter(|_| code == 0) {
         let report = format!(
-            "✅ Pull request opened: {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Files: `missions/{run_id}/*.md` — the team's deliverables for this mission\n- Repo: {repo_url}\n\n---\n{body}"
+            "✅ Pull request opened: {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Contents: everything the team changed — `missions/{run_id}/*.md` deliverables + any code/design files applied via FILES blocks\n- Changed paths:\n```\n{}\n```\n- Repo: {repo_url}\n\n---\n{body}",
+            out.lines().filter(|l| l.starts_with("??") || (l.len() > 2 && l.as_bytes()[1] == b' ')).take(15).collect::<Vec<_>>().join("\n"),
         );
         step_transition(app, run_id, dev_role, "pr", "done", &report).await;
         return PrOutcome { status: "done".into(), url: u, branch, note: report };
@@ -3531,89 +5401,6 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
     let n = format!("gh pr create failed (exit {code}): {}", one_line(&out, 400));
     step_transition(app, run_id, dev_role, "pr", "error", &n).await;
     PrOutcome { status: "error".into(), url: String::new(), branch, note: n }
-}
-
-/// Real deploy: check out the mission branch and `docker compose up --build`
-/// an ISOLATED staging project (its own compose project name + remapped host
-/// ports) — the live stack running this mission is never touched.
-async fn run_deploy_stage(app: &App, run_id: &str, dev_role: &str, repo_url: &str, branch: &str) -> DeployOutcome {
-    let skip = |note: String| DeployOutcome { status: "skipped".into(), url: String::new(), note };
-    step_transition(app, run_id, dev_role, "deploy", "working", "").await;
-
-    let (cid, _cname) = match app.agent_container(dev_role).await {
-        Some(x) => x,
-        None => {
-            let n = format!("no running container for {dev_role} — start the agent first");
-            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-            return skip(n);
-        }
-    };
-    if repo_url.trim().is_empty() {
-        let n = "project has no git repo configured — nothing to deploy".to_string();
-        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-        return skip(n);
-    }
-    let repo_path = match app.ensure_repo(&cid, repo_url).await {
-        Ok(p) => p,
-        Err(e) => {
-            let n = format!("repo not available in the team workspace: {}", e.1);
-            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-            return skip(n);
-        }
-    };
-    app.ensure_tools(&cid).await;
-
-    // One probe script with named outcomes — every gap is a skip, never a guess.
-    let probe = format!(
-        "cd '{repo_path}' || exit 10; \
-         git rev-parse --verify '{branch}' >/dev/null 2>&1 || {{ echo BRANCH_MISSING; exit 0; }}; \
-         [ -f docker-compose.yml ] || {{ echo NO_COMPOSE; exit 0; }}; \
-         [ -S /var/run/docker.sock ] || {{ echo NO_SOCKET; exit 0; }}; \
-         command -v docker >/dev/null 2>&1 || {{ echo NO_DOCKER_CLI; exit 0; }}; \
-         docker version >/dev/null 2>&1 || {{ echo NO_DAEMON; exit 0; }}; \
-         docker compose version >/dev/null 2>&1 || {{ echo NO_COMPOSE_PLUGIN; exit 0; }}; \
-         echo PROBE_OK"
-    );
-    let (code, out) = app.exec_in(&cid, &probe).await.unwrap_or((-1, "exec failed".into()));
-    let note = match (code, out.trim()) {
-        (10, _) => Some(format!("repo path {repo_path} disappeared in the container")),
-        (_, "BRANCH_MISSING") => Some(format!("no mission branch '{branch}' to deploy — the PR stage did not create it")),
-        (_, "NO_COMPOSE") => Some("repo has no docker-compose.yml at its root — nothing to stage".to_string()),
-        (_, "NO_SOCKET") => Some("no Docker socket mounted in the agent container — recreate the agent after upgrading the platform (docker.sock bind is not retroactive)".to_string()),
-        (_, "NO_DOCKER_CLI") => Some("docker CLI not available in the container and could not be installed".to_string()),
-        (_, "NO_DAEMON") => Some("docker CLI cannot reach the daemon through the mounted socket".to_string()),
-        (_, "NO_COMPOSE_PLUGIN") => Some("docker compose plugin not available in the container".to_string()),
-        _ => None,
-    };
-    if let Some(n) = note {
-        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-        return skip(n);
-    }
-
-    // Staging compose file: sed-remapped FULL copy of the repo's compose file
-    // (a `-f` override would MERGE ports and collide with the live 3000/8000).
-    let dir = repo_dir_name(repo_url);
-    let staging_file = format!("/tmp/{dir}-staging-compose.yml");
-    let proj = format!("{dir}-staging");
-    let up = format!(
-        "cd '{repo_path}' && git checkout -q '{branch}' && \
-         sed -e 's/\"3000:3000\"/\"{STAGING_WEB_PORT}:3000\"/' -e 's/\"8000:8000\"/\"{STAGING_API_PORT}:8000\"/' docker-compose.yml > '{staging_file}' && \
-         docker compose -p '{proj}' --project-directory '{repo_path}' -f '{staging_file}' up --build -d 2>&1 | tail -25"
-    );
-    let (code, out) = app.exec_in(&cid, &up).await.unwrap_or((-1, "exec failed".into()));
-    let (_, ps_out) = app.exec_in(&cid, &format!("docker compose -p '{proj}' -f '{staging_file}' ps --status running --services 2>/dev/null")).await
-        .unwrap_or((-1, String::new()));
-    let services: Vec<&str> = ps_out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    if code == 0 && !services.is_empty() {
-        let url = format!("http://localhost:{STAGING_WEB_PORT}");
-        let note = format!("web :{STAGING_WEB_PORT} · api :{STAGING_API_PORT} · compose project `{proj}` · branch `{branch}` · running: {}", services.join(", "));
-        let report = format!("🚀 Staging deployed: {url}\n\n- API: http://localhost:{STAGING_API_PORT}\n- Isolated compose project `{proj}` from branch `{branch}` — the live stack was not touched\n- Running services: {}\n\n```\n{}\n```", services.join(", "), out.lines().take(25).collect::<Vec<_>>().join("\n"));
-        step_transition(app, run_id, dev_role, "deploy", "done", &report).await;
-        return DeployOutcome { status: "done".into(), url, note };
-    }
-    let n = format!("docker compose up failed (exit {code}): {}", one_line(&out, 400));
-    step_transition(app, run_id, dev_role, "deploy", "error", &n).await;
-    DeployOutcome { status: "error".into(), url: String::new(), note: n }
 }
 
 /// Push one message into a demo discussion (and clear the typing indicator).
@@ -3640,14 +5427,14 @@ async fn demo_answering(app: &App, run_id: &str, disc_id: &str, role: &str) {
 }
 
 /// The acceptance demo: a scripted meeting-kind discussion — QA presents the
-/// e2e evidence, the Dev presents the REAL PR/staging delivery, then the PO
-/// checks every acceptance criterion and issues the final VERDICT.
+/// e2e evidence, the Dev presents the REAL PR delivery, then the PO checks
+/// every acceptance criterion and issues the final VERDICT.
 async fn run_demo_session(
     app: &App, run_id: &str, task: &str, project_name: &str, dev_role: &str,
     qa: &(String, String, String, Option<String>),
     dev: &(String, String, String, Option<String>),
     po: &(String, String, String, Option<String>),
-    pr: &PrOutcome, deploy: &DeployOutcome,
+    pr: &PrOutcome,
 ) -> Option<Acceptance> {
     step_transition(app, run_id, "po", "demo", "working", "").await;
     {
@@ -3689,7 +5476,7 @@ async fn run_demo_session(
     };
 
     demo_say(app, run_id, &disc_id, "orchestrator",
-        "🎬 Demo รับมอบงาน — QA แสดงหลักฐานการทดสอบ, Dev ส่งมอบ PR/deploy จริง, แล้ว PO ตรวจนับ acceptance criteria ทีละข้อ").await;
+        "🎬 Demo รับมอบงาน — QA แสดงหลักฐานการทดสอบ, Dev ส่งมอบ PR จริง, แล้ว PO ตรวจนับ acceptance criteria ทีละข้อ").await;
 
     // QA presents the e2e evidence
     let (qname, _qt, qrules, qmodel) = qa;
@@ -3700,8 +5487,11 @@ Present concisely (≤180 words): what was verified, the concrete evidence from 
     );
     let quser = format!("## Mission\n{task}\n\n## Your QA deliverable\n{}\n\nPresent the evidence.", qa_output.chars().take(1600).collect::<String>());
     let qa_msg = match qmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &qsys, &quser, 500).await
-            .unwrap_or_else(|e| format!("(QA could not present: {})", e.1)),
+        Some(m) => match llm_step(app, run_id, "qa", "", m, &qsys, &quser, 500).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => format!("(QA could not present: {})", e.1),
+        },
         None => "(no model configured for QA)".into(),
     };
     demo_say(app, run_id, &disc_id, "qa", &qa_msg).await;
@@ -3711,21 +5501,24 @@ Present concisely (≤180 words): what was verified, the concrete evidence from 
     demo_answering(app, run_id, &disc_id, dev_role).await;
     let dsys = format!(
         "{drules}\n\nYou are {dname} presenting the REAL delivery in the acceptance demo for the mission on '{project_name}'. \
-State what was shipped — branch, pull request, staging — using EXACTLY the facts given to you; never invent or alter URLs. ≤150 words, same language as the mission."
+State what was shipped — branch, pull request — using EXACTLY the facts given to you; never invent or alter URLs. ≤150 words, same language as the mission."
     );
     let duser = format!(
-        "## Mission\n{task}\n\n## Your real delivery (facts of record)\n- {}\n- {}\n\nPresent the delivery.",
-        pr.describe(), deploy.describe()
+        "## Mission\n{task}\n\n## Your real delivery (facts of record)\n- {}\n\nPresent the delivery.",
+        pr.describe()
     );
     let dev_msg = match dmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &dsys, &duser, 400).await
-            .unwrap_or_else(|e| format!("(Dev could not present: {})", e.1)),
+        Some(m) => match llm_step(app, run_id, dev_role, "", m, &dsys, &duser, 400).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => format!("(Dev could not present: {})", e.1),
+        },
         None => "(no model configured for the Dev)".into(),
     };
     demo_say(app, run_id, &disc_id, dev_role, &dev_msg).await;
 
     // Machine-truth footer: exact URLs verbatim, regardless of LLM wording
-    let footer = format!("📦 delivery of record — PR: {} · Staging: {}", pr.describe(), deploy.describe());
+    let footer = format!("📦 delivery of record — PR: {}", pr.describe());
     demo_say(app, run_id, &disc_id, "orchestrator", &footer).await;
 
     // PO checks every acceptance criterion, then issues the verdict
@@ -3743,7 +5536,11 @@ Write the checks in the same language as the mission."
         po_output.chars().take(1600).collect::<String>(), qa_msg, dev_msg, footer
     );
     let po_msg = match pmodel.as_deref() {
-        Some(m) => llm_retry(app, m, &psys, &puser, 1600).await,
+        Some(m) => match llm_step(app, run_id, "po", "", m, &psys, &puser, 1600).await {
+            Ok(Some(t)) => Ok(t),
+            Ok(None) => return None,
+            Err(e) => Err(e),
+        },
         None => Err(err(StatusCode::BAD_REQUEST, "No model configured for the PO")),
     };
     match po_msg {
@@ -3766,12 +5563,11 @@ Write the checks in the same language as the mission."
                 save_runs(&store);
             }
             let report = format!(
-                "{} Acceptance: {}\n\n{}\n\n---\n{}\n\n---\n{}",
+                "{} Acceptance: {}\n\n{}\n\n---\n{}",
                 if verdict == "pass" { "✅" } else { "❌" },
                 verdict.to_uppercase(),
                 summary,
-                pr.describe(),
-                deploy.describe()
+                pr.describe()
             );
             step_transition(app, run_id, "po", "demo", "done", &report).await;
             if let Some((cid, _)) = app.agent_container("po").await {
@@ -3821,14 +5617,27 @@ Write the checks in the same language as the mission."
 /// stall the relay or the demo verdict with an empty answer. A token-cap empty
 /// retries once with a doubled budget (room for visible text after the
 /// thinking); transient upstream errors back off; config errors fail fast.
-async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<String, ApiError> {
+async fn llm_retry_usage(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<(String, LlmUsage), ApiError> {
     let mut budget = max;
+    let mut usage = LlmUsage::default();
     let mut last_err: Option<ApiError> = None;
-    for attempt in 0..3u32 {
+    // 5 attempts with growing backoff (~20s of waiting total) — provider blips
+    // (5xx, rate limits, even transient auth flaps that surface as 401) must
+    // not kill a whole mission step by step. Hard misconfiguration still fails
+    // fast on the first attempt below.
+    for attempt in 0..5u32 {
         if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await; }
-        match app.llm_max(model, system, user, budget).await {
-            Ok(t) if !t.trim().is_empty() => return Ok(t),
-            Ok(_) => last_err = Some(err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer"))),
+        match app.llm_max_usage(model, system, user, budget).await {
+            Ok((t, u)) if !t.trim().is_empty() => {
+                usage.input_tokens += u.input_tokens;
+                usage.output_tokens += u.output_tokens;
+                return Ok((t, usage));
+            }
+            Ok((_, u)) => {
+                usage.input_tokens += u.input_tokens;
+                usage.output_tokens += u.output_tokens;
+                last_err = Some(err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer")));
+            }
             Err(e) => {
                 if attempt == 0 && budget < 8000 && e.1.contains("token cap") {
                     budget = (budget * 2).min(8000); // thinking ate the budget — leave room for the answer
@@ -3841,6 +5650,229 @@ async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -
         }
     }
     Err(last_err.unwrap_or_else(|| err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer after 3 attempts"))))
+}
+
+/// (name, title, rules, model) for a role, straight from the persona store —
+/// shared by the relay engine and single-step retry.
+fn persona_of(app: &App, role: &str) -> (String, String, String, Option<String>) {
+    let p = { app.store.lock().unwrap().personas.iter().find(|p| p.role == role).cloned() };
+    match p {
+        Some(p) => {
+            let model = app.model_for_persona(Some(&p));
+            (p.name, p.title, p.rules_md, model)
+        }
+        None => (role.to_string(), String::new(), String::new(), None),
+    }
+}
+
+/// Clone/refresh the project repo into the shared workspace directory through
+/// the FIRST agent's session. None = no agent could be started at all (the
+/// run proceeds text-only); Some(Err) = a session was there but the clone
+/// failed. Shared by the relay engine and single-step retry.
+async fn ensure_team_repo(app: &App, roles: &[String], repo_url: &str) -> Option<Result<String, ApiError>> {
+    for role in roles {
+        if let Some((cid, _)) = app.agent_container(role).await {
+            return Some(app.ensure_repo(&cid, repo_url).await);
+        }
+    }
+    None
+}
+
+/// The repo line injected into every work prompt when the team workspace has
+/// the project repo checked out.
+fn team_repo_line(repo_path: &Option<String>) -> String {
+    repo_path.as_deref()
+        .map(|p| format!(" The project repository is already cloned in the team workspace at {p} — when your part involves code or files, work against that repo's real files (cite real paths from it); all file changes go through this repo only."))
+        .unwrap_or_default()
+}
+
+/// Where a project's documents are materialized for the agents, relative to
+/// the shared workspace root.
+fn docs_workspace_dir(project_id: &str) -> std::path::PathBuf {
+    hostexec::workspace_dir().join("project-docs").join(project_id)
+}
+
+/// Sanitize a title/filename into a safe single path component (no separators,
+/// quotes or control chars; bounded length; never empty).
+fn safe_doc_name(name: &str) -> String {
+    let cleaned: String = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"' | '\'' | '`' | '\0'))
+        .take(80)
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() { "doc".into() } else { trimmed.to_string() }
+}
+
+/// Write every document of a project into the shared agent workspace:
+/// INDEX.md (grouped by folder) plus one file per doc (markdown inline,
+/// binaries copied from docs-files/). The directory is wiped first so deleted
+/// documents never linger as stale agent-visible files. Empty space → the
+/// directory is removed entirely. Best effort — a workspace hiccup must not
+/// fail the API call.
+fn materialize_project_docs(store: &Store, project_id: &str) -> Option<std::path::PathBuf> {
+    let docs = project_docs_sorted(store, project_id);
+    let dir = docs_workspace_dir(project_id);
+    if docs.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    if std::fs::remove_dir_all(&dir).is_err() && dir.exists() {
+        return None;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+
+    let project_name = store.projects.iter().find(|p| p.id == project_id).map(|p| p.name.clone()).unwrap_or_default();
+    let mut index = format!(
+        "# Project documents — {project_name} ({project_id})\n\n\
+         Materialized copies of the team's document space (requirements, specs, analysis).\n\
+         Markdown files carry the full content; binary files (PDF/docx/…) are stored as-is —\n\
+         relay teammates see them via the mission prompt only, an agent working in this\n\
+         workspace can open them directly.\n"
+    );
+    let mut written: Vec<(String, String, String)> = Vec::new(); // (folder, filename, title)
+    for doc in &docs {
+        let filename = match &doc.file {
+            Some(f) => format!("{}-{}", doc.id, safe_doc_name(&f.name)),
+            None => format!("{}-{}.md", doc.id, safe_doc_name(&doc.title)),
+        };
+        let path = dir.join(&filename);
+        let ok = match &doc.file {
+            Some(f) => std::fs::copy(docs_files_dir().join(&doc.id).join(&f.name), &path).is_ok(),
+            None => std::fs::write(&path, &doc.content_md).is_ok(),
+        };
+        if ok {
+            written.push((doc.folder.clone(), filename.clone(), doc.title.clone()));
+        }
+    }
+    let mut last_folder = String::new();
+    for (folder, filename, title) in &written {
+        if folder != &last_folder {
+            index.push_str(&format!("\n## {folder}\n"));
+            last_folder = folder.clone();
+        }
+        index.push_str(&format!("- `{filename}` — {title}\n"));
+    }
+    let _ = std::fs::write(dir.join("INDEX.md"), index);
+    Some(dir)
+}
+
+/// Materialize the project's documents and build the two prompt fragments:
+/// `(docs_section, docs_pointer_line)` — both empty when the space is empty.
+/// The section always carries the full index; markdown bodies follow until the
+/// total budget is spent (per-doc cap first, then the shared cap).
+fn prepare_project_docs(store: &Store, project_id: &str) -> (String, String) {
+    let docs = project_docs_sorted(store, project_id);
+    if docs.is_empty() {
+        return (String::new(), String::new());
+    }
+    let dir = materialize_project_docs(store, project_id);
+    let pointer = dir.as_deref().map(|d| format!(
+        " The team's document space (requirements/BA/SA specs) is materialized at {} — INDEX.md lists every document; consult them whenever your part touches the project's requirements or specs.",
+        d.display()
+    )).unwrap_or_default();
+
+    let mut section = format!(
+        "\n\n## Project documents\nThe team maintains a document space (PO/BA/SA and general documents). Read what is relevant to YOUR part before delivering.\n"
+    );
+    let mut last_folder = String::new();
+    for doc in &docs {
+        if doc.folder != last_folder {
+            section.push_str(&format!("\n### {}\n", doc.folder));
+            last_folder = doc.folder.clone();
+        }
+        match &doc.file {
+            Some(f) => section.push_str(&format!("- **{}** — uploaded file `{}` ({:.1} KB)\n", doc.title, f.name, f.size as f64 / 1024.0)),
+            None => section.push_str(&format!("- **{}**\n", doc.title)),
+        }
+    }
+    let open_comments: Vec<&DocComment> = store.doc_comments.iter()
+        .filter(|c| c.project_id == project_id && c.status == "open")
+        .collect();
+    if !open_comments.is_empty() {
+        section.push_str("\n#### Open review comments — address these explicitly in your deliverable\n");
+        for c in open_comments.iter().take(20) {
+            let doc_title = docs.iter().find(|d| d.id == c.doc_id).map(|d| d.title.as_str()).unwrap_or(c.doc_id.as_str());
+            let quote = if c.quote.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" (on «{}»)", c.quote.chars().take(120).collect::<String>())
+            };
+            section.push_str(&format!(
+                "- **{doc_title}**{quote} — {}: {}\n",
+                c.author, c.body.chars().take(300).collect::<String>()
+            ));
+        }
+    }
+    let mut budget = DOCS_INJECT_MAX_CHARS;
+    for doc in &docs {
+        if doc.file.is_some() || doc.content_md.trim().is_empty() { continue; }
+        if budget < 400 { break; }
+        section.push_str(&format!("\n#### {} — full content\n", doc.title));
+        let body: String = doc.content_md.chars().take(DOC_INJECT_MAX_CHARS).collect();
+        if doc.content_md.chars().count() > DOC_INJECT_MAX_CHARS {
+            section.push_str(&body);
+            section.push_str("\n[…truncated]\n");
+        } else {
+            section.push_str(&body);
+            section.push('\n');
+        }
+        budget = budget.saturating_sub(body.chars().count() + 64);
+    }
+    (section, pointer)
+}
+
+/// Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
+/// `files` = this teammate ships real repo artifacts (dev/UX with a repo) —
+/// their reply must end with a FILES block the orchestrator applies.
+/// Goal ancestry + org-lite line for a persona's prompt: the project's standing
+/// "why" and the manager this role reports to. Empty when neither is set.
+fn goal_ancestry_line(app: &App, run_id: &str, role: &str) -> String {
+    let store = app.store.lock().unwrap();
+    let Some(run) = store.runs.iter().find(|r| r.id == run_id) else { return String::new() };
+    let goal = if !run.goal.trim().is_empty() {
+        run.goal.clone()
+    } else {
+        store.projects.iter().find(|p| p.id == run.project_id).map(|p| p.goal.clone()).unwrap_or_default()
+    };
+    let manager = store.personas.iter().find(|p| p.role == role).map(|p| p.reports_to.clone()).unwrap_or_default();
+    let mut out = String::new();
+    if !goal.trim().is_empty() {
+        out.push_str(&format!(
+            "\n\n## Project goal — the WHY behind every task\n{goal}\nEvery deliverable must serve this goal; if the task conflicts with it, raise that in your ## ASK."
+        ));
+    }
+    if !manager.is_empty() {
+        let (mname, mtitle) = store.personas.iter().find(|p| p.role == manager)
+            .map(|p| (p.name.clone(), p.title.clone()))
+            .unwrap_or((manager.clone(), String::new()));
+        out.push_str(&format!(
+            "\nYou report to {mname} ({manager}{}) — align your output with the brief above yours and address blockers to them in your ## ASK.",
+            if mtitle.is_empty() { String::new() } else { format!(", {mtitle}") }
+        ));
+    }
+    out
+}
+
+fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, goal_line: &str, run_id: &str) -> String {
+    let files_line = if files {
+        format!("\nYou work on the REAL repository (already checked out in the team workspace). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line}{goal_line} \
+Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
+Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
+Answer in the same language the task is written in. Keep it under ~450 words (the ## FILES section does not count toward the limit). \
+If something genuinely blocks your part or is unclear, you may end your reply with a section exactly titled \"## ASK\" containing a line \"to: role1, role2\" (teammates who must answer — \"all\" for the whole team, \"human\" for the user) and 1-3 concise questions. Use it sparingly: only when you cannot do your part correctly without the answer. Address \"human\" ONLY when the missing piece is information or a decision that neither you nor any teammate can produce (credentials, business intent, external approval) — the whole team pauses until the user replies."
+    )
 }
 
 /// Team run engine with a meeting loop.
@@ -3864,10 +5896,10 @@ async fn execute_run(app: App, run_id: String) {
         (run.project_name, run.project_id.clone(), run.task, run.steps.iter().map(|s| (s.role.clone(), s.name.clone(), s.title.clone())).collect::<Vec<_>>())
     };
 
-    // Bot-on-a-Linux-box rule, team edition: before the relay starts, the first
-    // running agent container clones the project repo into the shared
-    // /workspace volume — every teammate then works on that one real working
-    // tree, and all file changes go through the repo only.
+    // Bot-on-this-machine rule, team edition: before the relay starts, the
+    // first agent clones the project repo into the shared workspace — every
+    // teammate then works on that one real working tree, and all file changes
+    // go through the repo only.
     let repo_url = {
         let store = app.store.lock().unwrap();
         store.projects.iter().find(|p| p.id == project_id)
@@ -3878,44 +5910,22 @@ async fn execute_run(app: App, run_id: String) {
     let (repo_path, repo_error) = if repo_url.is_empty() {
         (None, None)
     } else {
-        let mut outcome: Option<Result<String, ApiError>> = None;
-        for (role, _, _) in &roles {
-            if let Some((cid, _)) = app.agent_container(role).await {
-                outcome = Some(app.ensure_repo(&cid, &repo_url).await);
-                break;
-            }
-        }
-        match outcome {
+        let team: Vec<String> = roles.iter().map(|(r, _, _)| r.clone()).collect();
+        match ensure_team_repo(&app, &team, &repo_url).await {
             Some(Ok(path)) => (Some(path), None),
             Some(Err(e)) => (None, Some(e.1)),
             // no agent container running — the run proceeds text-only, as before
             None => (None, None),
         }
     };
-    let repo_line = repo_path.as_deref()
-        .map(|p| format!(" The project repository is already cloned in the team workspace at {p} — when your part involves code or files, work against that repo's real files (cite real paths from it); all file changes go through this repo only."))
-        .unwrap_or_default();
+    let repo_line = team_repo_line(&repo_path);
     let repo_note = repo_error.map(|e| format!("\n\n## Note from the orchestrator\nThe project repo could not be cloned into the team workspace ({e}) — deliver text deliverables only this run."));
-
-    // (name, title, rules, model) for a role, straight from the persona store
-    let persona_of = |role: &str| -> (String, String, String, Option<String>) {
-        let p = { app.store.lock().unwrap().personas.iter().find(|p| p.role == role).cloned() };
-        match p {
-            Some(p) => (p.name.clone(), p.title.clone(), p.rules_md.clone(), app.model_for_persona(Some(&p))),
-            None => (role.to_string(), String::new(), String::new(), None),
-        }
-    };
-
-    // Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
-    let work_system = |rules: &str, name: &str, title: &str| {
-        format!(
-            "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request and deploys an isolated staging stack, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line} \
-Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
-Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies). \
-Answer in the same language the task is written in. Keep it under ~450 words. \
-If something genuinely blocks your part or is unclear, you may end your reply with a section exactly titled \"## ASK\" containing a line \"to: role1, role2\" (teammates who must answer — \"all\" for the whole team, \"human\" for the user) and 1-3 concise questions. Use it sparingly: only when you cannot do your part correctly without the answer. Address \"human\" ONLY when the missing piece is information or a decision that neither you nor any teammate can produce (credentials, business intent, external approval) — the whole team pauses until the user replies."
-        )
+    // The project's document space, materialized into the workspace for this
+    // run — the section rides every relay prompt (budgeted), the pointer line
+    // sits in the system prompt.
+    let (docs_section, docs_line) = {
+        let store = app.store.lock().unwrap();
+        prepare_project_docs(&store, &project_id)
     };
 
     // Register (or re-register) an ASK as a discussion; returns false when it targets no one.
@@ -3951,8 +5961,8 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             finish_run(&app, &run_id, "stopped");
             return;
         }
-        let (role, name, title) = (role.clone(), name.clone(), title.clone());
-        let (pname, _ptitle, rules, model) = persona_of(&role);
+        let (role, _name, title) = (role.clone(), name.clone(), title.clone());
+        let (pname, _ptitle, rules, model) = persona_of(&app, &role);
 
         // step → working (records the model this step will run with, even if it later errors)
         {
@@ -3972,34 +5982,54 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
                 for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
                     if s.status == "done" && !s.output.is_empty() {
-                        let brief: String = s.output.chars().take(1400).collect();
+                        // FILES listings are stripped — teammates need the summary,
+                        // not full file bodies (the repo tree has the real files)
+                        let brief: String = strip_files(&s.output).chars().take(1400).collect();
                         handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
                     }
                 }
             }
         }
 
-        let system = work_system(&rules, &pname, &title);
+        // dev/UX teammates with a repo ship real files — their reply may carry a
+        // FILES block, which needs a far larger completion budget than prose
+        let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
+        let goal_line = goal_ancestry_line(&app, &run_id, &role);
+        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
         let first_note = repo_note.as_deref().unwrap_or("");
         let user = if handoff.is_empty() {
-            format!("## Task from the user\n{task}{first_note}\n\nYou are the first teammate to answer. Deliver your part.")
+            format!("## Task from the user\n{task}{first_note}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
         } else {
-            format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+            format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
         };
 
-        let result = match model.as_deref() {
-            Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
-            None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+        let cap = if ships_files { 6000 } else { 1400 };
+        let (harness, hcmd) = persona_harness(&app, &role);
+        let external = harness != "native";
+        let result = if external {
+            harness_step(&app, &run_id, &role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+        } else {
+            match model.as_deref() {
+                Some(m) => llm_step(&app, &run_id, &role, "work", m, &system, &user, cap).await,
+                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            }
         };
         match result {
-            Ok(output) if !output.is_empty() => {
-                let clean = strip_ask(&output);
+            Ok(Some(output)) if !output.is_empty() => {
+                let mut clean = strip_ask(&output);
+                if external {
+                    mark_harness_step(&app, &run_id, &role, &harness);
+                } else {
+                    // External harnesses edit the repo directly — no FILES to apply.
+                    apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                }
                 deliver_and_close(&app, &run_id, &role, &clean, None).await;
                 if let Some((to, topic)) = parse_ask(&output) {
                     raise_discussion(&role, &to, &topic, 1);
                 }
             }
-            Ok(_) => {
+            Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
+            Ok(Some(_)) => {
                 let mut store = app.store.lock().unwrap();
                 if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
                     step.status = "error".into();
@@ -4081,7 +6111,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
                 finish_run(&app, &run_id, "stopped");
                 return;
             }
-            let (fname, ftitle, ..) = persona_of(&d.from);
+            let (fname, ftitle, ..) = persona_of(&app, &d.from);
             {
                 let mut store = app.store.lock().unwrap();
                 if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.discussions.iter_mut().find(|x| x.id == d.id)) {
@@ -4104,7 +6134,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
                     }
                     continue;
                 }
-                let (tname, ttitle, trules, tmodel) = persona_of(target);
+                let (tname, ttitle, trules, tmodel) = persona_of(&app, target);
                 {
                     let mut store = app.store.lock().unwrap();
                     if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.discussions.iter_mut().find(|x| x.id == d.id)) {
@@ -4128,12 +6158,13 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                     d.topic,
                 );
                 let answer = match tmodel.as_deref() {
-                    Some(m) => llm_retry(&app, m, &system, &user, 350).await,
+                    Some(m) => llm_step(&app, &run_id, target, "", m, &system, &user, 350).await,
                     None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
                 };
                 let text = match answer {
-                    Ok(t) if !t.is_empty() => t.trim().chars().take(900).collect::<String>(),
-                    Ok(_) => "(empty answer)".into(),
+                    Ok(Some(t)) if !t.is_empty() => t.trim().chars().take(900).collect::<String>(),
+                    Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
+                    Ok(Some(_)) => "(empty answer)".into(),
                     Err(e) => format!("⚠️ could not answer: {}", e.1),
                 };
                 let mut store = app.store.lock().unwrap();
@@ -4144,7 +6175,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             }
 
             // The asker revises their deliverable with the answers
-            let (aname, atitle, arules, amodel) = persona_of(&d.from);
+            let (aname, atitle, arules, amodel) = persona_of(&app, &d.from);
             let (prev, msgs) = {
                 let store = app.store.lock().unwrap();
                 let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
@@ -4154,7 +6185,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             };
             let answers = msgs.iter()
                 .map(|m| {
-                    let speaker = if m.from == "human" { "the user".to_string() } else if m.from == "orchestrator" { "orchestrator".to_string() } else { persona_of(&m.from).0 };
+                    let speaker = if m.from == "human" { "the user".to_string() } else if m.from == "orchestrator" { "orchestrator".to_string() } else { persona_of(&app, &m.from).0 };
                     format!("- **{}** ({}): {}", speaker, m.from, m.text)
                 })
                 .collect::<Vec<_>>().join("\n");
@@ -4166,18 +6197,32 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 }
                 save_runs(&store);
             }
-            let system = work_system(&arules, &aname, &atitle);
+            // a dev/UX asker may re-emit their FILES block with fixes applied
+            let rev_files = repo_path.is_some() && (d.from.starts_with("dev") || d.from.starts_with("ux"));
+            let goal_line = goal_ancestry_line(&app, &run_id, &d.from);
+            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
             let user = format!(
-                "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words). If you are still blocked you may end with another \"## ASK\" section.",
+                "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words — re-emit the full \"## FILES\" section too if your files changed). If you are still blocked you may end with another \"## ASK\" section.",
                 d.topic,
             );
-            let result = match amodel.as_deref() {
-                Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
-                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            let (harness, hcmd) = persona_harness(&app, &d.from);
+            let external = harness != "native";
+            let result = if external {
+                harness_step(&app, &run_id, &d.from, &harness, &hcmd, amodel.as_deref().unwrap_or(""), &system, &user).await
+            } else {
+                match amodel.as_deref() {
+                    Some(m) => llm_step(&app, &run_id, &d.from, "work", m, &system, &user, if rev_files { 6000 } else { 1400 }).await,
+                    None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+                }
             };
             match result {
-                Ok(output) if !output.is_empty() => {
-                    let clean = strip_ask(&output);
+                Ok(Some(output)) if !output.is_empty() => {
+                    let mut clean = strip_ask(&output);
+                    if external {
+                        mark_harness_step(&app, &run_id, &d.from, &harness);
+                    } else {
+                        apply_files_note(&app, repo_path.as_deref(), &d.from, &mut clean).await;
+                    }
                     deliver_and_close(&app, &run_id, &d.from, &clean, Some(meeting_round + 1)).await;
                     // The question as asked is answered either way; a still-blocked asker raises a NEW discussion.
                     match parse_ask(&output) {
@@ -4185,6 +6230,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                         None => {}
                     }
                 }
+                Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
                 // Revision failed — keep the round-1 deliverable, it is still valid work
                 _ => {
                     let mut store = app.store.lock().unwrap();
@@ -4207,8 +6253,8 @@ A teammate raised a blocking question that needs your expertise. Answer directly
         }
     }
 
-    // ---- Tail: after QA verifies — the dev opens a REAL pull request, deploys
-    // a REAL isolated staging stack, then the PO runs the acceptance demo ----
+    // ---- Tail: after QA verifies — the dev opens a REAL pull request, then
+    // the PO runs the acceptance demo ----
     let tail_gate = {
         let store = app.store.lock().unwrap();
         store.runs.iter().find(|r| r.id == run_id).map(|run| {
@@ -4217,27 +6263,38 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 && roles.iter().any(|(r, _, _)| r == "po")
         }).unwrap_or(false)
     };
-    let mut tail: Option<(PrOutcome, DeployOutcome, Option<Acceptance>)> = None;
+    let mut tail: Option<(PrOutcome, Option<Acceptance>)> = None;
     if tail_gate {
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        // first dev role owns both PR and deploy — one branch, one working tree
+        // first dev role owns the PR — one branch, one working tree
         let dev_role = roles.iter().find(|(r, _, _)| r.starts_with("dev")).map(|(r, _, _)| r.clone()).unwrap();
         append_tail_steps(&app, &run_id, &dev_role, "po").await;
-        let dev_persona = persona_of(&dev_role);
+        let dev_persona = persona_of(&app, &dev_role);
+        // Spending checkpoint before the tail: never commit/push for a run
+        // whose budget is already exhausted.
+        if !guard_budget(&app, &run_id).await { return; }
+        // run_pr_stage owns the review gate: it stages the exact diff, waits
+        // for the human's decision, then commits/pushes. Retries go through
+        // the same path, so there is no bypass.
         let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
-        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        let deploy = run_deploy_stage(&app, &run_id, &dev_role, &repo_url, &pr.branch).await;
-        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        let qa_persona = persona_of("qa");
-        let po_persona = persona_of("po");
+        if stop_requested(&app, &run_id) || !run_is_live(&app, &run_id) {
+            finish_run(&app, &run_id, "stopped");
+            return;
+        }
+        let qa_persona = persona_of(&app, "qa");
+        let po_persona = persona_of(&app, "po");
         let acceptance = run_demo_session(&app, &run_id, &task, &project_name, &dev_role,
-            &qa_persona, &dev_persona, &po_persona, &pr, &deploy).await;
-        tail = Some((pr, deploy, acceptance));
+            &qa_persona, &dev_persona, &po_persona, &pr).await;
+        if stop_requested(&app, &run_id) || !run_is_live(&app, &run_id) {
+            finish_run(&app, &run_id, "stopped");
+            return;
+        }
+        tail = Some((pr, acceptance));
     }
 
     // ---- PO closes the mission with one summary ----
     if roles.iter().any(|(r, _, _)| r == "po") {
-        let (pname, ptitle, prules, pmodel) = persona_of("po");
+        let (pname, _ptitle, prules, pmodel) = persona_of(&app, "po");
         let (deliverables, meetings) = {
             let store = app.store.lock().unwrap();
             let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
@@ -4252,9 +6309,9 @@ A teammate raised a blocking question that needs your expertise. Answer directly
 Write ONE tight summary (≤200 words) of what the team produced and what the meetings decided — decisions and outcomes only, same language as the mission."
         );
         let tail_line = match &tail {
-            Some((pr, deploy, acc)) => format!(
-                "\n\n## Real delivery\n- {}\n- {}\n\n## Acceptance verdict\n{}",
-                pr.describe(), deploy.describe(),
+            Some((pr, acc)) => format!(
+                "\n\n## Real delivery\n- {}\n\n## Acceptance verdict\n{}",
+                pr.describe(),
                 acc.as_ref().map(|a| format!("VERDICT: {} — {}", a.verdict.to_uppercase(), a.summary.chars().take(300).collect::<String>()))
                     .unwrap_or_else(|| "(the demo did not produce a verdict)".into())
             ),
@@ -4262,11 +6319,12 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
         };
         let user = format!("## Mission\n{task}\n\n## Deliverables\n{deliverables}\n\n## Meetings\n{meetings}{tail_line}\n\nWrite the mission summary.");
         let result = match pmodel.as_deref() {
-            Some(m) => llm_retry(&app, m, &system, &user, 500).await,
+            Some(m) => llm_step(&app, &run_id, "po", "", m, &system, &user, 500).await,
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
-        if let Ok(summary) = result {
-            if !summary.is_empty() {
+        match result {
+            Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
+            Ok(Some(summary)) if !summary.is_empty() => {
                 if let Some((cid, _)) = app.agent_container("po").await {
                     let _ = write_deliverable(&app, &cid, &run_id, "summary", &summary).await;
                 }
@@ -4276,23 +6334,26 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
                 }
                 save_runs(&store);
             }
+            _ => {}
         }
     }
 
     // ---- Close the run, then let the PO decide the next loop iteration ----
+    // finish_run is the single close gate: it refuses to overwrite a run that
+    // was already stopped/closed (budget stop or user Stop), and it closes any
+    // step left "working" so the UI never shows a zombie.
     let all_error = {
-        let mut store = app.store.lock().unwrap();
-        let all_error = match store.runs.iter_mut().find(|r| r.id == run_id) {
-            Some(run) => {
-                run.status = if run.steps.iter().all(|s| s.status == "error") { "error".into() } else { "done".into() };
-                run.phase = "done".into();
-                run.steps.iter().all(|s| s.status == "error")
-            }
+        let store = app.store.lock().unwrap();
+        match store.runs.iter().find(|r| r.id == run_id) {
+            Some(run) => run.steps.iter().all(|s| s.status == "error"),
             None => return,
-        };
-        save_runs(&store);
-        all_error
+        }
     };
+    finish_run(&app, &run_id, if all_error { "error" } else { "done" });
+    // Only a genuinely completed run may spawn the next loop iteration; a
+    // budget/stop-closed run leaves the chain ended.
+    let closed_status = app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).map(|r| r.status.clone());
+    if closed_status.as_deref() != Some("done") { return; }
 
     // Loop mode: the PO looks at the whole chain so far and either writes the
     // next iteration's task or declares the goal done.
@@ -4301,7 +6362,7 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
         store.runs.iter().find(|r| r.id == run_id).map(|r| (r.loop_mode, r.iteration)).unwrap_or((false, 1))
     };
     if loop_mode && !all_error && !stop_requested(&app, &run_id) && iteration < MAX_LOOP_ITERATIONS {
-        let (pname, _ptitle, prules, pmodel) = persona_of("po");
+        let (pname, _ptitle, prules, pmodel) = persona_of(&app, "po");
         if let Some(model) = pmodel {
             let (chain, acc_text) = {
                 let store = app.store.lock().unwrap();
@@ -4322,11 +6383,11 @@ The last iteration's acceptance verdict from the demo session is listed under 'A
 Reply with EITHER the concrete task for the next iteration (one sentence, same language as the goal, ≤60 words — build on what is already done, do not repeat it) OR exactly `DONE` when the goal is achieved and no further iteration adds value."
             );
             let user = format!("## Standing goal\n{task}\n\n## Iterations so far\n{chain}\n\n## Acceptance verdict\n{acc_text}\n\nDecide: the next iteration's task, or `DONE`.");
-            if let Ok(next) = app.llm_max(&model, &system, &user, 200).await {
+            if let Ok(Some(next)) = llm_step(&app, &run_id, "po", "", &model, &system, &user, 200).await {
                 let next = next.trim().trim_matches('`').to_string();
                 if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600 {
                     let next_task = next.lines().last().unwrap_or(&next).to_string();
-                    if let Ok(child) = spawn_run(&app, &project_id, &next_task, true, iteration + 1) {
+                    if let Ok(child) = spawn_run_with(&app, &project_id, &next_task, true, iteration + 1, "loop", None) {
                         let mut store = app.store.lock().unwrap();
                         if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
                             run.next_run_id = Some(child.id.clone());
@@ -4339,18 +6400,210 @@ Reply with EITHER the concrete task for the next iteration (one sentence, same l
     }
 }
 
+/// Re-run ONE step of a closed run in place — the per-item retry path
+/// (POST /runs/{id}/steps/{role}/{kind}/retry). Everything else the mission
+/// produced stays exactly as it is: teammates' done deliverables, meetings,
+/// tail outcomes. Only the failed step's own work is redone, against the
+/// CURRENT state (persona/model config, containers, repo).
+async fn retry_step_engine(app: App, run_id: String, role: String, kind: String) {
+    let (project_name, project_id, task) = {
+        let store = app.store.lock().unwrap();
+        match store.runs.iter().find(|r| r.id == run_id) {
+            Some(r) => (r.project_name.clone(), r.project_id.clone(), r.task.clone()),
+            None => return,
+        }
+    };
+    let repo_url = {
+        let store = app.store.lock().unwrap();
+        store.projects.iter().find(|p| p.id == project_id)
+            .or_else(|| store.projects.iter().find(|p| p.name == project_name))
+            .map(|p| p.repo_url.clone())
+            .unwrap_or_default()
+    };
+    let team: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .map(|r| r.steps.iter().filter(|s| s.kind == "work").map(|s| s.role.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    // Same shared-workspace rule as the relay: the repo rides the first running
+    // agent container; without one the step stays text-only.
+    let repo_path: Option<String> = if repo_url.is_empty() { None } else {
+        match ensure_team_repo(&app, &team, &repo_url).await {
+            Some(Ok(p)) => Some(p),
+            _ => None,
+        }
+    };
+    let repo_line = team_repo_line(&repo_path);
+    let (docs_section, docs_line) = {
+        let store = app.store.lock().unwrap();
+        prepare_project_docs(&store, &project_id)
+    };
+
+    match kind.as_str() {
+        // One teammate's relay deliverable, rebuilt with the same handoff the
+        // original relay pass gave them (done outputs of the steps before them).
+        "work" => {
+            let (pname, title, rules, model) = persona_of(&app, &role);
+            let mut handoff = String::new();
+            {
+                let store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
+                    for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
+                        if s.status == "done" && !s.output.is_empty() {
+                            let brief: String = strip_files(&s.output).chars().take(1400).collect();
+                            handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
+                        }
+                    }
+                }
+            }
+            {
+                // record the model this retry runs with (as the relay does)
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
+                    step.model = model.clone();
+                }
+                save_runs(&store);
+            }
+            let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
+            let goal_line = goal_ancestry_line(&app, &run_id, &role);
+            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &goal_line, &run_id);
+            let user = if handoff.is_empty() {
+                format!("## Task from the user\n{task}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
+            } else {
+                format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+            };
+            let cap = if ships_files { 6000 } else { 1400 };
+            let (harness, hcmd) = persona_harness(&app, &role);
+            let external = harness != "native";
+            let result = if external {
+                harness_step(&app, &run_id, &role, &harness, &hcmd, model.as_deref().unwrap_or(""), &system, &user).await
+            } else {
+                match model.as_deref() {
+                    Some(m) => llm_step(&app, &run_id, &role, "work", m, &system, &user, cap).await,
+                    None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+                }
+            };
+            let error_outcome = |msg: String| {
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
+                    step.status = "error".into();
+                    step.output = msg;
+                    step.finished_at = now_secs();
+                }
+                save_runs(&store);
+            };
+            match result {
+                Ok(Some(output)) if !output.is_empty() => {
+                    let mut clean = strip_ask(&output);
+                    if external {
+                        mark_harness_step(&app, &run_id, &role, &harness);
+                    } else {
+                        apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                    }
+                    deliver_and_close(&app, &run_id, &role, &clean, None).await;
+                }
+                Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
+                Ok(Some(_)) => error_outcome("Model returned an empty answer".into()),
+                Err(e) => error_outcome(e.1),
+            }
+        }
+        // The two tail stages are self-contained: re-running one redoes the
+        // real git/LLM work against the current workspace state.
+        "pr" => {
+            let dev = persona_of(&app, &role);
+            let _ = run_pr_stage(&app, &run_id, &role, &repo_url, &task, &project_name, &dev).await;
+        }
+        "demo" => {
+            // Rebuild the PR facts of record from the stored steps, then rerun
+            // the scripted demo session against them.
+            let (pr, dev_role) = {
+                let store = app.store.lock().unwrap();
+                let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
+                let dev_role = run.steps.iter().find(|s| s.kind == "pr" || (s.kind == "work" && s.role.starts_with("dev")))
+                    .map(|s| s.role.clone()).unwrap_or_default();
+                let pr_step = run.steps.iter().find(|s| s.kind == "pr");
+                let pr = PrOutcome {
+                    status: pr_step.map(|s| if s.status == "done" { "done".to_string() } else { s.status.clone() })
+                        .unwrap_or_else(|| "skipped".into()),
+                    url: pr_step.and_then(|s| extract_pr_url(&s.output)).unwrap_or_default(),
+                    branch: run_id.clone(),
+                    note: pr_step.filter(|s| s.status != "done").map(|s| one_line(&s.output, 160)).unwrap_or_default(),
+                };
+                (pr, dev_role)
+            };
+            if dev_role.is_empty() {
+                step_transition(&app, &run_id, "po", "demo", "error", "no dev role found in this run — cannot rerun the acceptance demo").await;
+            } else {
+                let qa = persona_of(&app, "qa");
+                let dev = persona_of(&app, &dev_role);
+                let po = persona_of(&app, "po");
+                let _ = run_demo_session(&app, &run_id, &task, &project_name, &dev_role, &qa, &dev, &po, &pr).await;
+            }
+        }
+        _ => {}
+    }
+
+    // Close the run again — same rule as the relay engine (all-error ⇒ error),
+    // and a Stop pressed while the retry was in flight wins.
+    let stopped = stop_requested(&app, &run_id);
+    let all_error = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .map(|r| r.steps.iter().all(|s| s.status == "error"))
+            .unwrap_or(false)
+    };
+    let final_status = if stopped { "stopped" } else if all_error { "error" } else { "done" };
+    finish_run(&app, &run_id, final_status);
+}
+
 /// Create a run for the project's current team, store it and start
 /// `execute_run` in the background. Shared by the API handler and the loop
 /// engine (each loop iteration spawns the next run this way). Returns the
 /// stored run — its `.id` is what links a loop chain via `next_run_id`.
 fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32) -> Result<Run, ApiError> {
+    spawn_run_with(app, project_id, task, loop_mode, iteration, "manual", None)
+}
+
+/// Same as spawn_run, with an explicit trigger (manual / scheduled / loop) and
+/// routine provenance. Scheduled runs snapshot the project goal + budget.
+fn spawn_run_with(
+    app: &App, project_id: &str, task: &str, loop_mode: bool, iteration: u32,
+    trigger: &str, routine_id: Option<&str>,
+) -> Result<Run, ApiError> {
     let run = {
         let mut store = app.store.lock().unwrap();
         let p = store.projects.iter().find(|p| p.id == project_id)
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")))?;
         let (project_name, agents) = (p.name.clone(), p.agents.clone());
+        let (goal, mut budget_usd) = (p.goal.clone(), p.budget_usd);
         if agents.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no team — add agents on the flow first"));
+        }
+        // One live mission per project: manual runs (double-click / API), loop
+        // children and routines all share one working tree + one tmux session,
+        // so concurrent runs would cross-contaminate each other's commits.
+        if store.runs.iter().any(|r| r.project_id == project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+        {
+            return Err(err(StatusCode::CONFLICT,
+                "A mission is already active on this project — wait for it to finish or stop it first"));
+        }
+        // A loop child may only spend what the chain has left.
+        if iteration > 1 {
+            if let Some(parent) = store.runs.iter()
+                .filter(|r| r.project_id == project_id)
+                .max_by_key(|r| r.iteration)
+            {
+                if let Some(b) = parent.budget_usd {
+                    let remaining = (b - parent.cost_usd).max(0.0);
+                    if remaining <= 0.0 {
+                        return Err(err(StatusCode::CONFLICT, "loop stopped: project budget exhausted"));
+                    }
+                    budget_usd = Some(remaining);
+                }
+            }
         }
         let personas = store.personas.clone();
         let steps = agents.iter()
@@ -4359,7 +6612,8 @@ fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration
                 kind: "work".into(),
                 status: "pending".into(), output: String::new(),
                 model: None, container: None, deliverable: None, rev: None,
-                started_at: 0, finished_at: 0,
+                started_at: 0, finished_at: 0, harness: None,
+                input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
             }))
             .collect::<Vec<_>>();
         if steps.is_empty() {
@@ -4383,6 +6637,17 @@ fn spawn_run(app: &App, project_id: &str, task: &str, loop_mode: bool, iteration
             iteration,
             stop_requested: false,
             next_run_id: None,
+            trigger: trigger.into(),
+            routine_id: routine_id.map(str::to_string),
+            goal,
+            budget_usd,
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_alerted: false,
+            review: None,
+            watchdog_note: None,
+            watchdog_at: 0,
         };
         store.runs.push(run.clone());
         save_runs(&store);
@@ -4405,13 +6670,165 @@ async fn run_project(State(app): State<App>, headers: axum::http::HeaderMap, Pat
     Ok(json_ok(serde_json::to_value(run).unwrap()))
 }
 
-async fn list_runs(State(app): State<App>) -> Json<Vec<Run>> {
-    let mut runs = app.store.lock().unwrap().runs.clone();
-    runs.reverse();
-    Json(runs)
+#[derive(Deserialize)]
+struct RoutineCreate {
+    name: String,
+    task: String,
+    cron: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    loop_mode: bool,
 }
 
-async fn get_run(State(app): State<App>, Path(run_id): Path<String>) -> ApiResult {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RoutineUpdate {
+    name: Option<String>,
+    task: Option<String>,
+    cron: Option<String>,
+    enabled: Option<bool>,
+    loop_mode: Option<bool>,
+}
+
+/// Next occurrence for a routine, using the same base as the scheduler.
+fn routine_next_run(r: &Routine) -> Option<u64> {
+    if !r.enabled { return None; }
+    next_run_at(&r.cron, if r.last_run_at > 0 { r.last_run_at } else { r.created_at.max(1) })
+}
+
+fn routine_json(r: &Routine) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
+    v["next_run_at"] = json!(routine_next_run(r));
+    v
+}
+
+async fn list_routines(State(app): State<App>, headers: axum::http::HeaderMap, Path(project_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    let list: Vec<Value> = store.routines.iter().filter(|r| r.project_id == project_id).map(routine_json).collect();
+    Ok(json_ok(json!(list)))
+}
+
+async fn create_routine(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(project_id): Path<String>,
+    Json(req): Json<RoutineCreate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let name = req.name.trim().to_string();
+    let task = req.task.trim().to_string();
+    let cron = req.cron.trim().to_string();
+    if name.is_empty() || task.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name and task are required"));
+    }
+    if cron_parse(&cron).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST,
+            "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
+    }
+    if next_run_at(&cron, now_secs()).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST,
+            "this cron never fires (e.g. day 31 in February) — check the day-of-month / month combination"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == project_id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
+    }
+    store.routine_counter += 1;
+    let routine = Routine {
+        id: format!("rt-{:03}", store.routine_counter),
+        project_id,
+        name,
+        task,
+        cron,
+        enabled: req.enabled,
+        loop_mode: req.loop_mode,
+        last_run_at: 0,
+        last_run_id: None,
+        last_result: String::new(),
+        created_at: now_secs(),
+    };
+    let out = routine_json(&routine);
+    store.routines.push(routine);
+    save_routines(&store);
+    Ok(json_ok(out))
+}
+
+async fn update_routine(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(rid): Path<String>,
+    Json(req): Json<RoutineUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let routine = store.routines.iter_mut().find(|r| r.id == rid)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")))?;
+    if let Some(cron) = req.cron.as_deref() {
+        let cron = cron.trim();
+        if cron_parse(cron).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST,
+                "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
+        }
+        if next_run_at(cron, now_secs()).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST,
+                "this cron never fires (e.g. day 31 in February) — check the day-of-month / month combination"));
+        }
+        routine.cron = cron.to_string();
+    }
+    if let Some(name) = req.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "name cannot be empty")); }
+        routine.name = name.to_string();
+    }
+    if let Some(task) = req.task.as_deref() {
+        let task = task.trim();
+        if task.is_empty() { return Err(err(StatusCode::BAD_REQUEST, "task cannot be empty")); }
+        routine.task = task.to_string();
+    }
+    if let Some(v) = req.enabled { routine.enabled = v; }
+    if let Some(v) = req.loop_mode { routine.loop_mode = v; }
+    let out = routine_json(routine);
+    save_routines(&store);
+    Ok(json_ok(out))
+}
+
+async fn delete_routine(State(app): State<App>, headers: axum::http::HeaderMap, Path(rid): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let before = store.routines.len();
+    store.routines.retain(|r| r.id != rid);
+    if store.routines.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")));
+    }
+    save_routines(&store);
+    Ok(json_ok(json!({ "ok": true })))
+}
+
+async fn run_routine(State(app): State<App>, headers: axum::http::HeaderMap, Path(rid): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let routine = {
+        let store = app.store.lock().unwrap();
+        store.routines.iter().find(|r| r.id == rid).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Routine '{rid}' not found")))?
+    };
+    let run = fire_routine(&app, &routine)?;
+    Ok(json_ok(serde_json::to_value(run).unwrap()))
+}
+
+async fn list_runs(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Run>>, ApiError> {
+    app.require_auth(&headers)?;
+    let mut runs = app.store.lock().unwrap().runs.clone();
+    runs.reverse();
+    Ok(Json(runs))
+}
+
+async fn get_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(run_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let run = app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).cloned();
     match run {
         Some(r) => Ok(json_ok(serde_json::to_value(r).unwrap())),
@@ -4445,7 +6862,8 @@ async fn reply_discussion(
     if disc.status == "resolved" {
         return Err(err(StatusCode::BAD_REQUEST, "This meeting is already resolved"));
     }
-    disc.messages.push(MeetingMessage { from: "human".into(), text, at: now_secs() });
+    let is_review = disc.kind == "review";
+    disc.messages.push(MeetingMessage { from: "human".into(), text: text.clone(), at: now_secs() });
     // Only the live need-human wait reacts to the message; otherwise it is kept as a record.
     if disc.status == "need_human" {
         disc.status = "answering".into();
@@ -4453,6 +6871,10 @@ async fn reply_discussion(
         if run.status == "waiting_human" {
             run.status = "running".into();
         }
+    }
+    // A chat reply on a review discussion may itself carry the decision.
+    if is_review {
+        apply_review_text(run, &text);
     }
     save_runs(&store);
     Ok(json_ok(json!({ "ok": true })))
@@ -4462,31 +6884,204 @@ async fn reply_discussion(
 async fn stop_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(run_id): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
-    let status = match store.runs.iter_mut().find(|r| r.id == run_id) {
+    let (status, stalled) = match store.runs.iter_mut().find(|r| r.id == run_id) {
         Some(run) => {
             if run.status != "running" && run.status != "waiting_human" {
                 return Err(err(StatusCode::BAD_REQUEST, format!("Run is already {}", run.status)));
             }
             run.stop_requested = true;
-            run.status.clone()
+            (run.status.clone(), run.watchdog_note.is_some())
         }
         None => return Err(err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found"))),
     };
     save_runs(&store);
+    drop(store);
+    // A waiting run and a watchdog-flagged run have no engine tick coming:
+    // close them here, otherwise Stop leaves them "running" forever and the
+    // project stays blocked by its one-live-run rule.
+    if status == "waiting_human" || stalled {
+        finish_run(&app, &run_id, "stopped");
+    }
     Ok(json_ok(json!({ "ok": true, "status": status })))
+}
+
+#[derive(Deserialize)]
+struct ReviewDecision {
+    decision: String,
+    #[serde(default)]
+    comment: String,
+}
+
+/// Explicit approve/reject action for the pending pre-push review.
+async fn decide_review(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(run_id): Path<String>,
+    Json(req): Json<ReviewDecision>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let decision = req.decision.trim().to_lowercase();
+    if decision != "approve" && decision != "reject" {
+        return Err(err(StatusCode::BAD_REQUEST, "decision must be 'approve' or 'reject'"));
+    }
+    let mut store = app.store.lock().unwrap();
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    let review = run.review.as_mut()
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "this run has no diff review"))?;
+    if review.status != "pending" {
+        return Err(err(StatusCode::BAD_REQUEST, format!("review is already {}", review.status)));
+    }
+    let approve = decision == "approve";
+    review.status = if approve { "approved".into() } else { "rejected".into() };
+    review.comment = req.comment.trim().to_string();
+    review.decided_at = now_secs();
+    let msg = if approve {
+        "APPROVE".to_string()
+    } else {
+        format!("REJECT: {}", review.comment)
+    };
+    if let Some(disc) = run.discussions.iter_mut().rev().find(|d| d.kind == "review" && d.status == "need_human") {
+        disc.messages.push(MeetingMessage { from: "human".into(), text: msg, at: now_secs() });
+        disc.status = "answering".into();
+        disc.answering = None;
+    }
+    if run.status == "waiting_human" {
+        run.status = "running".into();
+        run.phase = "working".into();
+    }
+    save_runs(&store);
+    Ok(json_ok(json!({ "ok": true, "status": if approve { "approved" } else { "rejected" } })))
+}
+
+/// Parse `APPROVE` / `REJECT: <comment>` sent as a chat reply into the review.
+fn apply_review_text(run: &mut Run, text: &str) {
+    let t = text.trim();
+    let upper = t.to_uppercase();
+    let (status, comment) = if upper.starts_with("APPROVE") {
+        ("approved", String::new())
+    } else if upper.starts_with("REJECT") {
+        ("rejected", t.chars().skip(6).collect::<String>()
+            .trim_start_matches([':', '-', ' ', ':', '：']).trim().to_string())
+    } else {
+        return;
+    };
+    if let Some(review) = run.review.as_mut() {
+        if review.status == "pending" {
+            review.status = status.into();
+            review.comment = comment;
+            review.decided_at = now_secs();
+        }
+    }
+}
+
+/// Raise the per-run budget after a budget pause. This is the ONLY way to
+/// resume a budget-blocked run — a plain chat reply deliberately does not
+/// change the limit. Appends a human message so `wait_for_human` resumes.
+#[derive(Deserialize)]
+struct BudgetUpdate {
+    budget_usd: f64,
+}
+
+async fn set_run_budget(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path(run_id): Path<String>,
+    Json(req): Json<BudgetUpdate>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    if !req.budget_usd.is_finite() || req.budget_usd <= 0.0 {
+        return Err(err(StatusCode::BAD_REQUEST, "budget_usd must be a positive number"));
+    }
+    if req.budget_usd <= run.cost_usd {
+        return Err(err(StatusCode::BAD_REQUEST, format!(
+            "budget ${:.4} must be above the ${:.4} already spent", req.budget_usd, run.cost_usd)));
+    }
+    run.budget_usd = Some(req.budget_usd);
+    run.cost_alerted = false;
+    if let Some(disc) = run.discussions.iter_mut().rev().find(|d| d.kind == "budget" && d.status != "resolved") {
+        disc.messages.push(MeetingMessage {
+            from: "human".into(),
+            text: format!("budget raised to ${:.2}", req.budget_usd),
+            at: now_secs(),
+        });
+        disc.status = "answering".into();
+        disc.answering = None;
+    }
+    if run.status == "waiting_human" {
+        run.status = "running".into();
+        run.phase = "working".into();
+    }
+    let out = run.clone();
+    save_runs(&store);
+    Ok(json_ok(json!(out)))
+}
+
+/// Per-item retry: re-run ONE failed/skipped/stopped step of a CLOSED run in place.
+/// Failures are per-step, so recovery is per-step too — the rest of the mission
+/// (every other step's output, the meetings, the tail outcomes) is kept as-is
+/// and no new run is created. The step flips to working, the run reopens as
+/// running, and `retry_step_engine` closes it again when the step lands.
+async fn retry_step(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path((run_id, role, kind)): Path<(String, String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    {
+        let run = store.runs.iter().find(|r| r.id == run_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+        if run.status == "running" || run.status == "waiting_human" {
+            return Err(err(StatusCode::BAD_REQUEST, format!("Run is still {} — wait for it to finish first", run.status)));
+        }
+        // Reopening this run must not collide with a newer live mission on the
+        // same project (same working tree + branch).
+        if store.runs.iter().any(|r| r.id != run_id && r.project_id == run.project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+        {
+            return Err(err(StatusCode::CONFLICT,
+                "A newer mission is active on this project — wait for it to finish before retrying this step"));
+        }
+    }
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    let step = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Step '{role}/{kind}' not found in run '{run_id}'")))?;
+    if step.status != "error" && step.status != "skipped" && step.status != "stopped" {
+        return Err(err(StatusCode::BAD_REQUEST, format!("Step '{role}/{kind}' is '{}' — only failed, skipped or stopped steps can be retried", step.status)));
+    }
+    step.status = "working".into();
+    step.output = String::new();
+    step.started_at = now_secs();
+    step.finished_at = 0;
+    run.status = "running".into();
+    run.phase = "working".into();
+    // an old Stop flag must not kill the retry the moment it starts
+    run.stop_requested = false;
+    let out = run.clone();
+    save_runs(&store);
+    drop(store);
+    let bg = app.clone();
+    tokio::spawn(async move { retry_step_engine(bg, run_id, role, kind).await });
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
 /// What one agent is doing right now + everything it has done, across all runs —
 /// powers the agent detail dialog on the flow chart. History survives restarts
 /// because runs are persisted to /data/runs.json.
-async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> ApiResult {
+async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let runs = app.store.lock().unwrap().runs.clone();
 
     // Live state: the newest run that is still in flight (running or paused on a human).
     let mut current: Option<Value> = None;
     for run in runs.iter().filter(|r| r.status == "running" || r.status == "waiting_human") {
         if !run.steps.iter().any(|s| s.role == role) { continue; }
-        // a tail stage in flight (pr/deploy/demo) is the more specific live step
+        // a tail stage in flight (pr/demo) is the more specific live step
         let step = run.steps.iter().find(|s| s.role == role && s.status == "working")
             .or_else(|| run.steps.iter().find(|s| s.role == role && s.kind == "work"))
             .or_else(|| run.steps.iter().find(|s| s.role == role))
@@ -4502,9 +7097,7 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
             let d = run.discussions.iter().find(|d| d.status == "need_human" && (d.from == role || d.to.iter().any(|t| t == &role)));
             ("waiting_human".to_string(), "ทีมรอคำตอบจากคุณอยู่".to_string(), d.map(|d| d.topic.clone()))
         } else if step.status == "working" && step.kind == "pr" {
-            ("working".to_string(), "กำลังเปิด Pull Request จริงใน container".to_string(), None)
-        } else if step.status == "working" && step.kind == "deploy" {
-            ("working".to_string(), "กำลัง deploy staging จริง (docker compose)".to_string(), None)
+            ("working".to_string(), "กำลังเปิด Pull Request จริง".to_string(), None)
         } else if step.status == "working" && step.kind == "demo" {
             ("working".to_string(), "กำลัง demo ตรวจรับหน้างานกับ PO".to_string(), None)
         } else if step.status == "working" {
@@ -4531,7 +7124,7 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
         break;
     }
 
-    // History: EVERY step this agent owns in every run (work + pr/deploy/demo), newest first.
+    // History: EVERY step this agent owns in every run (work + pr/demo), newest first.
     let mut history: Vec<Value> = runs.iter()
         .filter(|r| r.steps.iter().any(|s| s.role == role))
         .flat_map(|r| {
@@ -4570,9 +7163,38 @@ async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> Api
 // Admin auth — one password gates console access to all containers
 // ---------------------------------------------------------------------------
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 32 random bytes from the OS → 64 hex chars. Falls back to hashing a few
+/// process/high-resolution values only if /dev/urandom is unreadable.
+fn random_hex(bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !ok {
+        let seed = format!("{:?}:{}:{}", std::time::SystemTime::now(), std::process::id(), bytes);
+        let mut out = String::new();
+        while out.len() < bytes * 2 {
+            out.push_str(&sha256_hex(&format!("{seed}:{}", out.len())));
+        }
+        return out.chars().take(bytes * 2).collect();
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 async fn verify_admin(State(app): State<App>, Json(req): Json<AuthVerify>) -> Json<Value> {
     let hash = app.store.lock().unwrap().config.admin_password_hash.clone();
-    Json(json!({ "ok": !hash.is_empty() && sha256_hex(&req.password) == hash }))
+    let attempt = sha256_hex(&req.password);
+    Json(json!({ "ok": !hash.is_empty() && constant_time_eq(attempt.as_bytes(), hash.as_bytes()) }))
 }
 
 // ---------------------------------------------------------------------------
@@ -4595,14 +7217,12 @@ async fn login(State(app): State<App>, Json(req): Json<LoginRequest>) -> ApiResu
     }
     let user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let pass = std::env::var("ADMIN_PASSWORD").unwrap_or_default();
-    if req.username != user || req.password != pass {
+    let user_ok = constant_time_eq(req.username.as_bytes(), user.as_bytes());
+    let pass_ok = constant_time_eq(req.password.as_bytes(), pass.as_bytes());
+    if !(user_ok & pass_ok) {
         return Err(err(StatusCode::UNAUTHORIZED, "Invalid username or password"));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let token = sha256_hex(&format!("{}:{}:{nanos}", req.username, req.password));
+    let token = random_hex(32);
     app.store.lock().unwrap().sessions.insert(token.clone(), req.username.clone());
     Ok(json_ok(json!({ "ok": true, "token": token, "user": req.username })))
 }
@@ -4611,14 +7231,6 @@ async fn logout(State(app): State<App>, Json(req): Json<AuthVerify>) -> Json<Val
     let mut store = app.store.lock().unwrap();
     store.sessions.remove(&req.password); // password field carries the token here
     Json(json!({ "ok": true }))
-}
-
-async fn vnc_secret(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
-    // The VNC password equals ADMIN_PASSWORD (.env) so there is ONE secret.
-    // Only handed out to logged-in sessions — the web UI uses it to auto-auth noVNC.
-    app.require_auth(&headers)?;
-    let password = std::env::var("ADMIN_PASSWORD").unwrap_or_default();
-    Ok(json_ok(json!({ "password": password })))
 }
 
 async fn me(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
@@ -4659,92 +7271,179 @@ fn busy_roles(store: &Store) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Background loop: every IDLE_SWEEP_INTERVAL_SECS, stop managed running
-/// containers that have been idle longer than config.idle_timeout_secs and
-/// are not needed by any live run. Pausing = docker stop + registry entry —
-/// the RAM release is the point (docker pause would keep it allocated).
-/// A stop that races an incoming activity is benign by design: the next
-/// `agent_container` / `ensure_running` call revives the container (~2s).
+/// Background loop: every IDLE_SWEEP_INTERVAL_SECS, kill the tmux sessions of
+/// agents that have been idle longer than config.idle_timeout_secs and are
+/// not needed by any live run. An idle shell costs nothing, but the sweep
+/// still kills stray long-running processes left in an agent's windows and
+/// keeps the paused/running state machine (and the UI) meaningful. Pausing =
+/// kill session + registry entry. A kill that races an incoming activity is
+/// benign by design: the next `agent_container` / `ensure_running` call
+/// recreates the session instantly.
 async fn idle_sweeper(app: App) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(IDLE_SWEEP_INTERVAL_SECS));
     loop {
         tick.tick().await;
-        let Some(docker) = app.docker.as_ref().cloned() else { continue };
         let (enabled, idle_after) = {
             let store = app.store.lock().unwrap();
             (store.config.auto_pause_enabled, store.config.idle_timeout_secs)
         };
         if !enabled || idle_after == 0 { continue; }
 
-        let (busy, registered) = {
+        let busy = {
             let store = app.store.lock().unwrap();
-            (busy_roles(&store), store.paused.keys().cloned().collect::<std::collections::HashSet<String>>())
+            busy_roles(&store)
         };
 
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-        filters.insert("status".to_string(), vec!["running".to_string()]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        let Ok(list) = docker.list_containers(Some(opts)).await else { continue };
+        let sessions: Vec<String> = hostexec::list_sessions().await
+            .into_iter().filter(|s| s.starts_with("agent-")).collect();
 
-        // Reconcile: a registry entry whose container is running again (someone
+        // Reconcile: a registry entry whose session is alive again (someone
         // raced the sweeper with a start/resume) is stale — drop it.
         {
             let mut store = app.store.lock().unwrap();
             let mut changed = false;
-            for c in &list {
-                let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-                if store.paused.remove(&name).is_some() { changed = true; }
+            for name in &sessions {
+                if store.paused.remove(name).is_some() { changed = true; }
             }
             if changed { save_paused(&store); }
         }
 
         let now = now_secs();
-        for c in list {
-            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-            let id = c.id.clone().unwrap_or_default();
-            if name.is_empty() || registered.contains(&name) { continue; }
-            let role = c.labels.as_ref().and_then(|l| l.get("role").cloned()).unwrap_or_default();
-            if !role.is_empty() && busy.contains(&role) { continue; }
+        for name in sessions {
+            let role = hostexec::role_of(&name).to_string();
+            if busy.contains(&role) { continue; }
             // First sighting starts the clock (persisted into the store, not
-            // just the snapshot) — a fresh container gets one full idle
-            // window before it is a candidate.
+            // just the snapshot) — a fresh session gets one full idle window
+            // before it is a candidate.
             let last = {
                 let mut store = app.store.lock().unwrap();
                 *store.last_activity.entry(name.clone()).or_insert(now)
             };
             if now.saturating_sub(last) < idle_after { continue; }
-            match docker.stop_container(&id, None::<StopContainerOptions>).await {
-                Ok(()) => {
-                    app.mark_paused(&name, true);
-                    println!("auto-paused idle container '{name}' (idle {}s, role '{role}')", now - last);
-                }
-                Err(e) => eprintln!("auto-pause of '{name}' failed: {e}"),
+            if hostexec::kill_session(&name).await {
+                app.mark_paused(&name, true);
+                println!("auto-paused idle agent '{name}' (idle {}s, role '{role}')", now - last);
             }
+        }
+    }
+}
+
+/// Advisory run watchdog (Paperclip-style heartbeat check, without the kill):
+/// a `running` run that has produced no step/discussion activity for a long
+/// time is probably wedged — a hung provider call, a lost goroutine, a machine
+/// asleep. We do NOT change its status (that would fight the engine's own
+/// state machine); we flag it so the UI can tell the user to look or stop it.
+/// The flag clears itself as soon as fresh activity lands.
+fn watchdog_stall_secs() -> u64 {
+    std::env::var("AAP_WATCHDOG_STALL_SECS").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 60)
+        .unwrap_or(45 * 60)
+}
+
+/// Newest timestamp anywhere in a run — step start/finish, chat message,
+/// discussion open, or run creation. The watchdog treats this as the run's
+/// heartbeat; anything newer means the engine is still moving.
+fn run_last_heartbeat(run: &Run) -> u64 {
+    let mut last = run.created_at;
+    for s in &run.steps { last = last.max(s.started_at).max(s.finished_at); }
+    for d in &run.discussions {
+        last = last.max(d.created_at);
+        for m in &d.messages { last = last.max(m.at); }
+    }
+    last
+}
+
+async fn run_watchdog(app: App) {
+    let stall = watchdog_stall_secs();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let now = now_secs();
+        let mut changed = false;
+        {
+            let mut store = app.store.lock().unwrap();
+            for run in store.runs.iter_mut() {
+                let last = run_last_heartbeat(run);
+                if run.status != "running" {
+                    // Closed runs keep no warning; a reopened one starts clean.
+                    if run.watchdog_note.is_some() || run.watchdog_at != 0 {
+                        run.watchdog_note = None;
+                        run.watchdog_at = 0;
+                        changed = true;
+                    }
+                    continue;
+                }
+                let idle = now.saturating_sub(last);
+                if idle >= stall && run.watchdog_at < last.max(1) {
+                    let working: Vec<&str> = run.steps.iter()
+                        .filter(|s| s.status == "working")
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    let who = if working.is_empty() { "ทั้งทีม".to_string() } else { working.join(", ") };
+                    run.watchdog_note = Some(format!(
+                        "ไม่มีความคืบหน้ามา {} นาที — {} อาจค้างอยู่ (provider ไม่ตอบ / เครื่อง sleep / process หาย) \
+                         ตรวจสอบ terminal ของ agent หรือกดหยุด run แล้วลองใหม่",
+                        idle / 60, who,
+                    ));
+                    run.watchdog_at = now;
+                    changed = true;
+                } else if run.watchdog_at != 0 && last > run.watchdog_at {
+                    // heartbeats are flowing again — withdraw the warning
+                    run.watchdog_note = None;
+                    run.watchdog_at = 0;
+                    changed = true;
+                }
+            }
+            if changed { save_runs(&store); }
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let docker = Docker::connect_with_local_defaults().ok();
-    if docker.is_none() {
-        eprintln!("Docker client init failed — running without container management");
+    // Agents run on THIS machine — no Docker client, no per-agent containers,
+    // no container-based deploy stage. Docker plays no part in the platform.
+    let _ = hostexec::tmux_available(); // warn early when tmux is missing
+    hostexec::sweep_tmp(); // command files from a previous process are garbage
+    harden_data_dir(); // 0700 data dir / 0600 stores, even after an upgrade
+    let ws = hostexec::workspace_dir();
+    if let Err(e) = std::fs::create_dir_all(&ws) {
+        eprintln!("warning: workspace {} unusable: {e} — set AAP_WORKSPACE", ws.display());
     }
 
     let app_state = App {
-        docker,
         store: {
             let mut store = Store::default();
-            load_runs(&mut store); // work history survives restarts (/data/runs.json)
-            load_paused(&mut store); // paused-registry survives restarts (/data/paused.json)
+            load_personas(&mut store); // personas survive restarts (personas.json)
+            load_config(&mut store);   // provider config + pricing (config.json, 0600)
+            load_skills(&mut store);   // skills + test bench (skills.json)
+            load_tasks(&mut store);    // board tasks (tasks.json)
+            load_projects(&mut store); // projects survive restarts (projects.json) — BEFORE load_runs, whose counter salvage scans store.projects
+            load_runs(&mut store); // work history survives restarts (runs.json)
+            load_docs(&mut store); // document space + comments survive restarts (docs.json)
+            load_routines(&mut store); // scheduled routines (routines.json)
+            load_paused(&mut store); // paused-registry survives restarts (paused.json)
+            load_agents(&mut store); // agent registry survives restarts (agents.json)
+            // tmux sessions outlive this process — adopt any live ones
+            for s in hostexec::list_sessions().await {
+                if s.starts_with("agent-") && store.agents.insert(s) {
+                    save_agents(&store);
+                }
+            }
             Arc::new(Mutex::new(store))
         },
         seq: Arc::new(AtomicUsize::new(1)),
     };
 
-    // Idle sweeper — auto-pause containers idle past the configured window.
+    println!("host execution — workspace {} (AAP_WORKSPACE overrides)", ws.display());
+
+    // Idle sweeper — auto-pause agents idle past the configured window.
     tokio::spawn(idle_sweeper(app_state.clone()));
+    // Routine scheduler — fires enabled cron schedules every 30 s.
+    tokio::spawn(routine_scheduler(app_state.clone()));
+    // Run watchdog — flags runs that stopped producing any heartbeat.
+    tokio::spawn(run_watchdog(app_state.clone()));
 
     let cors = tower_http::cors::CorsLayer::permissive();
 
@@ -4758,7 +7457,6 @@ async fn main() {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
-        .route("/vnc/secret", get(vnc_secret))
         .route("/containers", get(list_containers).post(create_container))
         .route("/containers/{ident}", delete(delete_container))
         .route("/containers/{ident}/{action}", post(container_action))
@@ -4778,6 +7476,7 @@ async fn main() {
         .route("/containers/{ident}/connectors/figma/connect-token", post(figma_connect_token))
         .route("/containers/{ident}/connectors/figma/disconnect", post(figma_disconnect))
         .route("/agents", get(list_agents).post(create_persona))
+        .route("/agents/harnesses", get(list_harnesses))
         .route("/agents/{role}", put(update_persona).delete(delete_persona))
         .route("/agents/{role}/start", post(start_agent))
         .route("/agents/{role}/activity", get(agent_activity))
@@ -4785,19 +7484,188 @@ async fn main() {
         .route("/tasks/{task_id}", delete(delete_task))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).put(update_project).delete(delete_project))
+        .route("/projects/{id}/docs", get(list_docs).post(create_doc))
+        .route("/projects/{id}/docs/upload",
+               post(upload_doc).layer(axum::extract::DefaultBodyLimit::max(DOC_UPLOAD_MAX_BYTES + 65536)))
+        .route("/projects/{id}/docs/{doc_id}", get(get_doc).put(update_doc).delete(delete_doc))
+        .route("/projects/{id}/docs/{doc_id}/comments",
+               get(list_doc_comments).post(create_doc_comment))
+        .route("/projects/{id}/docs/{doc_id}/comments/{comment_id}",
+               put(update_doc_comment).delete(delete_doc_comment))
         .route("/projects/{id}/run", post(run_project))
+        .route("/projects/{id}/routines", get(list_routines).post(create_routine))
+        .route("/routines/{rid}", put(update_routine).delete(delete_routine))
+        .route("/routines/{rid}/run", post(run_routine))
         .route("/runs", get(list_runs))
         .route("/runs/{run_id}", get(get_run))
         .route("/runs/{run_id}/stop", post(stop_run))
+        .route("/runs/{run_id}/budget", post(set_run_budget))
+        .route("/runs/{run_id}/review", post(decide_review))
+        .route("/runs/{run_id}/steps/{role}/{kind}/retry", post(retry_step))
         .route("/runs/{run_id}/discussions/{disc_id}/reply", post(reply_discussion))
         .route("/config", get(get_config).put(update_config))
         .route("/skills", get(list_skills).post(create_skill))
         .route("/skills/{skill_id}", put(update_skill).delete(delete_skill))
+        .route("/skills/{skill_id}/tests", put(set_skill_tests))
+        .route("/skills/{skill_id}/tests/run", post(run_skill_tests))
+        .route("/skills/{skill_id}/restore/{version}", post(restore_skill))
         .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({ "detail": "Not Found" }))) })
         .layer(cors)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.expect("bind :8000");
-    println!("{SERVICE_NAME} listening on :8000");
+    // Loopback unless auth is on (or the operator explicitly widens the bind):
+    // every endpoint controls real processes on this Mac, so a LAN-reachable
+    // server with login disabled would hand anyone the host.
+    let bind = std::env::var("AAP_BIND").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        if auth_enabled() { "0.0.0.0:8000".into() } else { "127.0.0.1:8000".into() }
+    });
+    if !auth_enabled() {
+        println!("auth disabled (no ADMIN_PASSWORD) — listening on {bind}; set AAP_BIND to expose it");
+    }
+    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| panic!("bind {bind}: {e}"));
+    println!("{SERVICE_NAME} listening on {bind}");
     axum::serve(listener, router).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> u64 {
+        Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap().timestamp() as u64
+    }
+
+    fn test_run(status: &str) -> Run {
+        Run {
+            id: "r-test".into(),
+            project_id: "p-test".into(),
+            project_name: "Test".into(),
+            task: "task".into(),
+            status: status.into(),
+            steps: Vec::new(),
+            phase: "work".into(),
+            round: 1,
+            discussions: Vec::new(),
+            summary: None,
+            acceptance: None,
+            created_at: 1,
+            loop_mode: false,
+            iteration: 1,
+            stop_requested: false,
+            next_run_id: None,
+            trigger: "manual".into(),
+            routine_id: None,
+            goal: String::new(),
+            budget_usd: None,
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_alerted: false,
+            review: None,
+            watchdog_note: None,
+            watchdog_at: 0,
+        }
+    }
+
+    #[test]
+    fn watchdog_heartbeat_uses_newest_signal() {
+        let mut run = test_run("running");
+        run.created_at = 100;
+        run.steps.push(RunStep {
+            role: "dev".into(), name: "Dev".into(), title: "Dev".into(), kind: "work".into(),
+            status: "working".into(), output: String::new(), model: None, container: None,
+            deliverable: None, rev: None, started_at: 200, finished_at: 0, harness: None,
+            input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
+        });
+        run.discussions.push(Discussion {
+            id: "d-001".into(), kind: String::new(), from: "dev".into(), to: vec!["qa".into()],
+            topic: "?".into(), status: "open".into(), answering: None,
+            messages: vec![MeetingMessage { from: "qa".into(), text: "answer".into(), at: 300 }],
+            round: 1, created_at: 150,
+        });
+        assert_eq!(run_last_heartbeat(&run), 300);
+        // A closed run's creation time is the floor, never 0.
+        let empty = test_run("done");
+        assert_eq!(run_last_heartbeat(&empty), empty.created_at);
+    }
+
+    #[test]
+    fn cron_field_parsing() {
+        assert_eq!(parse_cron_field("*", 0, 5), Some(vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(parse_cron_field("1,15", 0, 59), Some(vec![1, 15]));
+        assert_eq!(parse_cron_field("9-11", 0, 23), Some(vec![9, 10, 11]));
+        assert_eq!(parse_cron_field("*/20", 0, 59), Some(vec![0, 20, 40]));
+        assert_eq!(parse_cron_field("10-20/5", 0, 59), Some(vec![10, 15, 20]));
+        // out of range / malformed
+        assert_eq!(parse_cron_field("60", 0, 59), None);
+        assert_eq!(parse_cron_field("5-1", 0, 59), None);
+        assert_eq!(parse_cron_field("*/0", 0, 59), None);
+        assert_eq!(parse_cron_field("x", 0, 59), None);
+    }
+
+    #[test]
+    fn cron_expression_needs_five_fields() {
+        assert!(cron_parse("0 9 * * 1-5").is_some());
+        assert!(cron_parse("0 9 * *").is_none());
+        assert!(cron_parse("0 9 * * *  *").is_none());
+        // dow 7 is normalized to Sunday = 0
+        let spec = cron_parse("0 0 * * 7").unwrap();
+        assert_eq!(spec.dows, vec![0]);
+    }
+
+    #[test]
+    fn next_run_is_strictly_after_now() {
+        // Monday 2026-01-05 08:30 local → weekdays 09:00 is the same day.
+        let after = at(2026, 1, 5, 8, 30);
+        assert_eq!(next_run_at("0 9 * * 1-5", after), Some(at(2026, 1, 5, 9, 0)));
+        // Exactly on the occurrence → the NEXT one, not now.
+        let nine = at(2026, 1, 5, 9, 0);
+        assert_eq!(next_run_at("0 9 * * *", nine), Some(at(2026, 1, 6, 9, 0)));
+        // Saturday → Monday for a weekdays-only routine.
+        let sat = at(2026, 1, 10, 12, 0);
+        assert_eq!(next_run_at("0 9 * * 1-5", sat), Some(at(2026, 1, 12, 9, 0)));
+    }
+
+    #[test]
+    fn usage_cost_prices_per_million_tokens() {
+        let usage = LlmUsage { input_tokens: 1_000_000, output_tokens: 500_000 };
+        assert!((usage_cost(usage, 3.0, 15.0) - 10.5).abs() < 1e-9);
+        assert_eq!(usage_cost(LlmUsage { input_tokens: 0, output_tokens: 0 }, 3.0, 15.0), 0.0);
+    }
+
+    #[test]
+    fn harness_templates_and_binary_validation() {
+        let claude = harness_template("claude", "").unwrap();
+        assert!(claude.contains("{prompt_file}"));
+        assert_eq!(harness_binary(&claude), "claude");
+        // a custom template always wins
+        let custom = harness_template("custom", "aider --file {prompt_file}").unwrap();
+        assert_eq!(harness_binary(&custom), "aider");
+        assert!(harness_template("nope", "").is_none());
+        assert!(valid_binary_name("claude"));
+        assert!(!valid_binary_name("claude; rm -rf /"));
+        assert!(!valid_binary_name(""));
+    }
+
+    #[test]
+    fn review_text_approve_and_reject() {
+        let mut run = test_run("waiting_human");
+        run.review = Some(RunReview {
+            status: "pending".into(), diff: String::new(), files: Vec::new(),
+            comment: String::new(), requested_at: 1, decided_at: 0,
+        });
+        apply_review_text(&mut run, "APPROVE");
+        assert_eq!(run.review.as_ref().unwrap().status, "approved");
+
+        run.review.as_mut().unwrap().status = "pending".into();
+        apply_review_text(&mut run, "REJECT: missing empty state");
+        let rv = run.review.as_ref().unwrap();
+        assert_eq!(rv.status, "rejected");
+        assert_eq!(rv.comment, "missing empty state");
+
+        // a normal chat line is not a decision
+        run.review.as_mut().unwrap().status = "pending".into();
+        apply_review_text(&mut run, "looks fine to me");
+        assert_eq!(run.review.as_ref().unwrap().status, "pending");
+    }
 }

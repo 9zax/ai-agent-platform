@@ -42,7 +42,7 @@ function HistoryEntry({ h }) {
   const [open, setOpen] = useState(false)
   const dur = fmtDur(h.started_at, h.finished_at)
   return (
-    <div className="rounded-xl border bg-[#0d1420]" data-testid="history-entry">
+    <div className="min-w-0 rounded-xl border bg-[#0d1420]" data-testid="history-entry">
       <button className="flex w-full items-start gap-3 px-3.5 py-2.5 text-left" onClick={() => setOpen(o => !o)}>
         <StatusIcon status={h.status} />
         <div className="min-w-0 flex-1">
@@ -66,7 +66,7 @@ function HistoryEntry({ h }) {
       {open && (
         <div className="border-t px-3.5 py-2.5">
           <div
-            className="max-h-[280px] overflow-auto text-[12px] [&_code]:rounded [&_code]:bg-secondary [&_code]:px-1 [&_h1]:mb-2 [&_h1]:text-[14px] [&_h1]:font-bold [&_h2]:mb-1.5 [&_h2]:mt-3 [&_h2]:text-[13px] [&_h2]:font-bold [&_h3]:mt-2 [&_h3]:text-[12px] [&_h3]:font-semibold [&_li]:list-disc [&_ol]:list-decimal [&_p]:mb-2 [&_pre]:my-2 [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:bg-black/40 [&_pre]:p-2.5 [&_ul]:list-disc [&_ul]:pl-5"
+            className="max-h-[280px] overflow-auto break-words text-[12px] [&_code]:rounded [&_code]:bg-secondary [&_code]:px-1 [&_h1]:mb-2 [&_h1]:text-[14px] [&_h1]:font-bold [&_h2]:mb-1.5 [&_h2]:mt-3 [&_h2]:text-[13px] [&_h2]:font-bold [&_h3]:mt-2 [&_h3]:text-[12px] [&_h3]:font-semibold [&_li]:list-disc [&_ol]:list-decimal [&_p]:mb-2 [&_pre]:my-2 [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:bg-black/40 [&_pre]:p-2.5 [&_ul]:list-disc [&_ul]:pl-5"
             dangerouslySetInnerHTML={{ __html: marked.parse(h.output_excerpt || '_ไม่มีเนื้อหา_') }}
           />
           {h.output_excerpt?.length >= 300 && (
@@ -102,7 +102,7 @@ export function AgentDetail({ agent, open, onOpenChange, onSaved }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl" data-testid="agent-detail">
-        <DialogHeader>
+        <DialogHeader className="min-w-0">
           <div className="flex items-center gap-3">
             <Avatar className="h-11 w-11 border">
               <AvatarFallback className="text-[14px] font-bold">{initials(agent.name)}</AvatarFallback>
@@ -126,7 +126,10 @@ export function AgentDetail({ agent, open, onOpenChange, onSaved }) {
           </div>
         </DialogHeader>
 
-        <Tabs value={tab} onValueChange={setTab}>
+        {/* min-w-0 — the Tabs div is a grid item of DialogContent; without it a
+            wide history entry (long nowrap task) stretches the grid track and
+            the whole panel blows past the dialog edge */}
+        <Tabs value={tab} onValueChange={setTab} className="min-w-0">
           <TabsList className="w-full">
             <TabsTrigger value="live" className="flex-1 gap-1.5" data-testid="detail-tab-live"><Activity className="h-3.5 w-3.5" /> กำลังทำอะไรอยู่</TabsTrigger>
             <TabsTrigger value="history" className="flex-1 gap-1.5" data-testid="detail-tab-history"><History className="h-3.5 w-3.5" /> ประวัติการทำงาน</TabsTrigger>
@@ -146,14 +149,14 @@ export function AgentDetail({ agent, open, onOpenChange, onSaved }) {
                 <div className="mt-1 text-[12px] text-muted-foreground/75">{live.detail}</div>
                 <div className="mt-3 rounded-lg bg-secondary/60 p-3">
                   <div className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground/60">งานที่ทีมกำลังทำ</div>
-                  <div className="mt-1 whitespace-pre-wrap text-[12.5px] leading-relaxed">{live.task}</div>
+                  <div className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed">{live.task}</div>
                 </div>
                 {live.topic && (
                   <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
                     <MessageCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
                     <div className="min-w-0">
                       <div className="text-[10.5px] font-semibold uppercase tracking-wider text-amber-400/80">กระทู้ที่เกี่ยวข้อง</div>
-                      <div className="mt-0.5 whitespace-pre-wrap text-[12px] leading-relaxed text-amber-100/85">{live.topic}</div>
+                      <div className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-amber-100/85">{live.topic}</div>
                     </div>
                   </div>
                 )}
@@ -174,7 +177,7 @@ export function AgentDetail({ agent, open, onOpenChange, onSaved }) {
             {!activity ? (
               <div className="py-8 text-center text-[12.5px] text-muted-foreground/60">กำลังโหลด…</div>
             ) : activity.history?.length ? (
-              <div className="flex max-h-[420px] flex-col gap-2 overflow-auto pr-1">
+              <div className="flex max-h-[420px] flex-col gap-2 overflow-auto pr-1" data-testid="history-entries">
                 {activity.history.map((h, i) => <HistoryEntry key={`${h.run_id}-${i}`} h={h} />)}
               </div>
             ) : (

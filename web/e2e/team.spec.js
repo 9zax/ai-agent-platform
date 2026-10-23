@@ -40,7 +40,7 @@ test.describe('AI Team', () => {
     await page.goto('/team')
     await page.evaluate(async url => {
       const token = localStorage.getItem('aap_token') || ''
-      const res = await fetch(`${url}/agents`)
+      const res = await fetch(`${url}/agents`, { headers: { 'x-session-token': token } })
       const po = (await res.json()).find(a => a.role === 'po')?.container?.name
       if (po) await fetch(`${url}/containers/${po}`, { method: 'DELETE', headers: { 'x-session-token': token } })
     }, API)
