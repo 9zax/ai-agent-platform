@@ -3,13 +3,13 @@ import { cn } from '@/lib/utils'
 
 const Table = React.forwardRef(({ className, ...props }, ref) => (
   <div className="relative w-full overflow-auto">
-    <table ref={ref} className={cn('w-full caption-bottom text-sm', className)} {...props} />
+    <table ref={ref} className={cn('w-full caption-bottom text-[12.5px]', className)} {...props} />
   </div>
 ))
 Table.displayName = 'Table'
 
 const TableHeader = React.forwardRef(({ className, ...props }, ref) => (
-  <thead ref={ref} className={cn('[&_tr]:border-b', className)} {...props} />
+  <thead ref={ref} className={cn('bg-white/[0.015] [&_tr]:border-b [&_tr]:border-white/[0.06]', className)} {...props} />
 ))
 TableHeader.displayName = 'TableHeader'
 
@@ -21,7 +21,7 @@ TableBody.displayName = 'TableBody'
 const TableRow = React.forwardRef(({ className, ...props }, ref) => (
   <tr
     ref={ref}
-    className={cn('border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted', className)}
+    className={cn('border-b border-white/[0.045] transition-colors hover:bg-white/[0.03] data-[state=selected]:bg-muted', className)}
     {...props}
   />
 ))
@@ -31,7 +31,7 @@ const TableHead = React.forwardRef(({ className, ...props }, ref) => (
   <th
     ref={ref}
     className={cn(
-      'h-10 px-4 text-left align-middle text-[11px] font-semibold uppercase tracking-wider text-muted-foreground',
+      'h-10 px-4 text-left align-middle text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55',
       className
     )}
     {...props}
@@ -40,7 +40,7 @@ const TableHead = React.forwardRef(({ className, ...props }, ref) => (
 TableHead.displayName = 'TableHead'
 
 const TableCell = React.forwardRef(({ className, ...props }, ref) => (
-  <td ref={ref} className={cn('p-4 align-middle', className)} {...props} />
+  <td ref={ref} className={cn('px-4 py-3.5 align-middle text-[12.5px]', className)} {...props} />
 ))
 TableCell.displayName = 'TableCell'
 

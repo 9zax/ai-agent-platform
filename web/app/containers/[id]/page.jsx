@@ -14,6 +14,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
+import PageHeader from '@/components/page-header'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -47,7 +48,7 @@ function fmtBytes(bytes) {
 function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, connectLabel, connectDisabled, connectTitle, onConnect, onDisconnect }) {
   const state = conn?.state
   return (
-    <div className="rounded-[10px] border bg-[#0d1420] p-3.5" data-testid={`connector-card-${ctype}`}>
+    <div className="rounded-xl border border-white/[0.07] bg-black/20 p-3.5" data-testid={`connector-card-${ctype}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5">
           <Icon className="h-[18px] w-[18px] text-foreground" />
@@ -265,53 +266,60 @@ export default function ContainerDetail() {
 
   return (
     <>
-      <div className="flex items-center justify-between px-7 pb-1 pt-5">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-gradient-to-br from-primary to-blue-500 text-white">
+      <PageHeader
+        className="pb-5"
+        leading={(
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-blue-500 text-white shadow-[0_10px_30px_-12px_rgba(139,92,246,0.7)]">
             <Bot className="h-5 w-5" />
           </div>
-          <div>
-            <h1 className="flex items-center gap-3 text-[21px] font-bold tracking-tight">
-              {id}
-              <Badge variant={status} className="gap-1.5" data-testid="status-badge">
-                <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                {status === 'stopped' ? 'Stopped' : status.charAt(0).toUpperCase() + status.slice(1)}
-              </Badge>
-            </h1>
-            <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-              Agent console — commands run on this machine (tmux session), not in a container
-              {status === 'paused' && stats?.paused_since
-                ? <span className="ml-2 text-cyan-400/80">{stats.auto_paused ? 'auto-' : ''}paused {Math.max(0, Math.round((Date.now() / 1000 - stats.paused_since) / 60))} min ago</span>
-                : null}
+        )}
+        title={(
+          <span className="flex flex-wrap items-center gap-2.5">
+            {id}
+            <Badge variant={status} className="gap-1.5" data-testid="status-badge">
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              {status === 'stopped' ? 'Stopped' : status.charAt(0).toUpperCase() + status.slice(1)}
+            </Badge>
+          </span>
+        )}
+        subtitle={(
+          <>
+            Agent console — commands run on this machine (tmux session), not in a container
+            {status === 'paused' && stats?.paused_since
+              ? <span className="ml-2 text-cyan-400/80">{stats.auto_paused ? 'auto-' : ''}paused {Math.max(0, Math.round((Date.now() / 1000 - stats.paused_since) / 60))} min ago</span>
+              : null}
+          </>
+        )}
+        actions={(
+          <>
+            {error && <div className="mr-1 max-w-[280px] truncate rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-1.5 text-[12px] text-red-300" title={error}>{error}</div>}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Button size="sm" variant="outline" disabled={busy !== ''} onClick={() => containerAction('start')}><Play className="h-3.5 w-3.5" /> {busy === 'start' ? 'Starting…' : 'Start'}</Button>
+              <Button size="sm" variant="outline" disabled={busy !== ''} onClick={() => containerAction('pause')}><PauseCircle className="h-3.5 w-3.5" /> {busy === 'pause' ? 'Pausing…' : 'Pause'}</Button>
+              <Button size="sm" variant="outline" disabled={busy !== ''} onClick={() => containerAction('resume')}><PlayCircle className="h-3.5 w-3.5" /> {busy === 'resume' ? 'Resuming…' : 'Resume'}</Button>
+              <Button size="sm" variant="outline" disabled={busy !== ''} onClick={() => containerAction('stop')}><Square className="h-3.5 w-3.5" /> {busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
+              <Button size="sm" variant="outline" disabled={busy !== ''} onClick={() => containerAction('restart')}><RotateCw className="h-3.5 w-3.5" /> {busy === 'restart' ? 'Restarting…' : 'Restart'}</Button>
             </div>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {error && <div className="mr-2 max-w-[280px] truncate rounded-md bg-red-500/15 px-3 py-1.5 text-[12px] text-red-400" title={error}>{error}</div>}
-          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('start')}><Play className="h-3.5 w-3.5" /> {busy === 'start' ? 'Starting…' : 'Start'}</Button>
-          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('pause')}><PauseCircle className="h-3.5 w-3.5" /> {busy === 'pause' ? 'Pausing…' : 'Pause'}</Button>
-          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('resume')}><PlayCircle className="h-3.5 w-3.5" /> {busy === 'resume' ? 'Resuming…' : 'Resume'}</Button>
-          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('stop')}><Square className="h-3.5 w-3.5" /> {busy === 'stop' ? 'Stopping…' : 'Stop'}</Button>
-          <Button variant="outline" disabled={busy !== ''} onClick={() => containerAction('restart')}><RotateCw className="h-3.5 w-3.5" /> {busy === 'restart' ? 'Restarting…' : 'Restart'}</Button>
-          <Button variant="outline" onClick={() => { setTab('console'); setTimeout(() => cmdBoxRef.current?.focus(), 100) }}>
-            <Terminal className="h-3.5 w-3.5" /> Terminal
-          </Button>
-          <Button variant="outline" disabled={busy !== ''} className="border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-400" onClick={deleteContainer}>
-            <Trash2 className="h-3.5 w-3.5" /> {busy === 'delete' ? 'Deleting…' : 'Delete'}
-          </Button>
-        </div>
-      </div>
+            <Button size="sm" variant="ghost" onClick={() => { setTab('console'); setTimeout(() => cmdBoxRef.current?.focus(), 100) }}>
+              <Terminal className="h-3.5 w-3.5" /> Terminal
+            </Button>
+            <Button size="sm" variant="ghost" disabled={busy !== ''} className="text-red-400 hover:bg-red-500/10 hover:text-red-300" onClick={deleteContainer}>
+              <Trash2 className="h-3.5 w-3.5" /> {busy === 'delete' ? 'Deleting…' : 'Delete'}
+            </Button>
+          </>
+        )}
+      />
 
-      <div className="grid items-start gap-4 px-7 py-5 [grid-template-columns:minmax(0,1fr)_340px] max-[1100px]:[grid-template-columns:1fr]">
+      <div className="page-body grid items-start gap-4 [grid-template-columns:minmax(0,1fr)_360px] max-[1100px]:[grid-template-columns:1fr]">
         <Card>
           <Tabs value={tab} onValueChange={setTab} className="w-full">
-            <div className="border-b px-4">
-              <TabsList className="h-auto w-full justify-start gap-1 rounded-none border-b border-transparent bg-transparent p-0">
+            <div className="border-b border-white/[0.06] px-3">
+              <TabsList className="h-auto w-full justify-start gap-1 rounded-none bg-transparent p-0">
                 {['console', 'files'].map(t => (
                   <TabsTrigger
                     key={t}
                     value={t}
-                    className="rounded-none border-b-2 border-transparent px-3.5 py-3 text-[13px] font-semibold capitalize data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none"
+                    className="rounded-none border-b-2 border-transparent px-3.5 py-3 text-[13px] font-semibold capitalize text-muted-foreground transition-colors hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-white data-[state=active]:shadow-none"
                   >
                     {t}
                   </TabsTrigger>
@@ -356,7 +364,10 @@ export default function ContainerDetail() {
 
         <div>
           <Card className="p-4">
-            <div className="mb-3.5 text-[13.5px] font-bold">AI Agent Control</div>
+            <div className="mb-3.5 flex items-center gap-2">
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/[0.09] text-primary ring-1 ring-inset ring-primary/15"><Bot className="h-3.5 w-3.5" /></span>
+              <span className="text-[13px] font-semibold text-white">AI Agent Control</span>
+            </div>
             {[
               ['Model', agentModel || '—', ''],
               ['Container', status === 'running' ? 'Ready' : status, status === 'running' ? 'text-emerald-400' : ''],
@@ -368,8 +379,8 @@ export default function ContainerDetail() {
             ))}
 
             <div className="mb-2.5 mt-4 flex items-center justify-between">
-              <div className="text-[12.5px] font-bold">Command Center</div>
-              <div className="flex rounded-md border bg-[#0d1420] p-0.5 text-[11px] font-semibold" data-testid="mode-toggle">
+              <div className="text-[12.5px] font-semibold text-white">Command Center</div>
+              <div className="flex rounded-lg border border-white/[0.07] bg-black/20 p-0.5 text-[11px] font-semibold" data-testid="mode-toggle">
                 <button
                   className={`rounded px-2.5 py-1 transition-colors ${mode === 'ai' ? 'bg-primary text-white' : 'text-muted-foreground'}`}
                   onClick={() => setMode('ai')}
@@ -442,14 +453,17 @@ export default function ContainerDetail() {
               </div>
             )}
 
-            <div className="mb-2.5 mt-4 text-[12.5px] font-bold">Current Task</div>
-            <div className="rounded-[10px] border bg-[#0d1420] p-3 text-[12px] text-muted-foreground/70">
+            <div className="mb-2.5 mt-4 text-[12.5px] font-semibold text-white">Current Task</div>
+            <div className="rounded-xl border border-dashed border-white/[0.08] bg-black/10 p-3.5 text-[12px] leading-relaxed text-muted-foreground/60">
               No active task — assign one from the Board or send a command above.
             </div>
           </Card>
 
           <Card className="mt-4 p-4">
-            <div className="mb-3.5 text-[13.5px] font-bold">Connectors</div>
+            <div className="mb-3.5 flex items-center gap-2">
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/[0.09] text-primary ring-1 ring-inset ring-primary/15"><Plug className="h-3.5 w-3.5" /></span>
+              <span className="text-[13px] font-semibold text-white">Connectors</span>
+            </div>
             {connectors === null ? (
               <div className="py-2 text-[12.5px] text-muted-foreground/70">Loading connectors…</div>
             ) : (
@@ -502,10 +516,13 @@ export default function ContainerDetail() {
           </Card>
 
           <Card className="mt-4 p-4">
-            <div className="mb-3.5 text-[13.5px] font-bold">Available Skills</div>
+            <div className="mb-3.5 flex items-center gap-2">
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/[0.09] text-primary ring-1 ring-inset ring-primary/15"><Lightbulb className="h-3.5 w-3.5" /></span>
+              <span className="text-[13px] font-semibold text-white">Available Skills</span>
+            </div>
             <div className="grid grid-cols-2 gap-2.5">
               {SKILLS.map(({ icon: Icon, label }) => (
-                <div key={label} data-testid="skill" className="flex items-center gap-2.5 rounded-[9px] border bg-[#0d1420] px-3 py-2.5 text-[12px] font-semibold">
+                <div key={label} data-testid="skill" className="flex items-center gap-2.5 rounded-lg border border-white/[0.07] bg-black/20 px-3 py-2.5 text-[12px] font-medium text-foreground/85 transition-colors hover:border-white/[0.12] hover:bg-white/[0.03]">
                   <Icon className="h-[15px] w-[15px] text-primary" /> {label}
                 </div>
               ))}

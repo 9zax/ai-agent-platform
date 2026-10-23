@@ -2,12 +2,14 @@
 
 import { authFetch } from '@/lib/auth'
 import { useEffect, useState } from 'react'
-import { Check, Plus, X, Trash2 } from 'lucide-react'
+import { Check, Plus, X, Trash2, Wrench } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
+import PageHeader from '@/components/page-header'
+import { cn } from '@/lib/utils'
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
@@ -71,46 +73,71 @@ export default function SkillsPage() {
 
   return (
     <>
-      <div className="flex items-center justify-between px-7 pb-1 pt-5">
-        <div>
-          <h1 className="text-[21px] font-bold tracking-tight">Skills</h1>
-          <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">Capabilities available to AI agent containers — เพิ่ม/ลบ/เปิด-ปิดได้จากที่นี่</div>
-        </div>
-        <Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> Add Skill</Button>
-      </div>
+      <PageHeader
+        icon={Wrench}
+        title="Skills"
+        subtitle="Capabilities available to AI agent containers — เพิ่ม/ลบ/เปิด-ปิดได้จากที่นี่"
+        actions={<Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> Add Skill</Button>}
+      />
 
-      <div className="grid gap-3.5 px-7 py-5 [grid-template-columns:repeat(auto-fit,minmax(280px,1fr))]">
-        {skills === null && <div className="text-muted-foreground/70">Loading skills…</div>}
-        {skills?.length === 0 && <div className="text-muted-foreground/70">No skills yet — add your first one.</div>}
-        {skills?.map(s => (
-          <Card key={s.id} className="flex flex-col gap-3 p-4" data-testid="skill-card">
-            <div className="flex items-start justify-between gap-3">
-              <div className="text-[14px] font-bold">{s.name}</div>
-              <Badge variant={s.enabled ? 'green' : 'gray'} data-testid="skill-status">
-                {s.enabled ? 'Enabled' : 'Disabled'}
-              </Badge>
-            </div>
-            <div className="text-[12.5px] leading-relaxed text-muted-foreground/80">{s.description || '—'}</div>
-            <div className="mt-auto flex items-center justify-between">
-              <code className="rounded bg-secondary px-2 py-0.5 font-mono text-[11px] text-muted-foreground">{s.id}</code>
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" data-testid="skill-toggle" onClick={() => toggle(s)}>
-                  {s.enabled ? <X className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
-                  {s.enabled ? 'Disable' : 'Enable'}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-400"
-                  data-testid={`skill-delete-${s.id}`}
-                  onClick={() => remove(s)}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </Button>
+      <div className="page-body">
+        <div className="grid gap-3.5 [grid-template-columns:repeat(auto-fit,minmax(290px,1fr))]">
+          {skills === null && [0, 1, 2].map(i => (
+            <Card key={i} className="h-[170px] p-4">
+              <div className="skeleton h-4 w-1/2" />
+              <div className="skeleton mt-4 h-3 w-4/5" />
+              <div className="skeleton mt-2 h-3 w-3/5" />
+            </Card>
+          ))}
+          {skills?.length === 0 && (
+            <Card className="col-span-full flex flex-col items-center gap-3 border-dashed bg-card/40 p-10 text-center">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/[0.07] bg-white/[0.03]">
+                <Wrench className="h-5 w-5 text-muted-foreground/40" />
               </div>
-            </div>
-          </Card>
-        ))}
+              <div>
+                <div className="text-[14px] font-semibold text-white">No skills yet</div>
+                <div className="mt-1 text-[12.5px] text-muted-foreground">Add your first capability for the AI team.</div>
+              </div>
+              <Button size="sm" onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> Add Skill</Button>
+            </Card>
+          )}
+          {skills?.map(s => (
+            <Card key={s.id} className="group flex flex-col gap-3 p-4 transition-all duration-200 hover:-translate-y-0.5 hover:border-white/[0.1] hover:shadow-lift" data-testid="skill-card">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <span className={cn('flex h-8 w-8 items-center justify-center rounded-lg ring-1 ring-inset',
+                    s.enabled ? 'bg-primary/[0.1] text-primary ring-primary/15' : 'bg-white/[0.04] text-muted-foreground/50 ring-white/[0.06]')}>
+                    <Wrench className="h-3.5 w-3.5" />
+                  </span>
+                  <div className="text-[13.5px] font-semibold text-white">{s.name}</div>
+                </div>
+                <Badge variant={s.enabled ? 'green' : 'gray'} data-testid="skill-status">
+                  {s.enabled ? 'Enabled' : 'Disabled'}
+                </Badge>
+              </div>
+              <div className="line-clamp-2 min-h-[36px] text-[12px] leading-relaxed text-muted-foreground/75">{s.description || '—'}</div>
+              <div className="mt-auto flex items-center justify-between border-t border-white/[0.05] pt-3">
+                <code className="rounded-md bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/60 ring-1 ring-inset ring-white/[0.05]">{s.id}</code>
+                <div className="flex gap-1.5">
+                  <Button variant="outline" size="sm" data-testid="skill-toggle" onClick={() => toggle(s)}>
+                    {s.enabled ? <X className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
+                    {s.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="w-8 px-0 text-muted-foreground/50 hover:bg-red-500/10 hover:text-red-400"
+                    data-testid={`skill-delete-${s.id}`}
+                    onClick={() => remove(s)}
+                    aria-label="Delete skill"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>

@@ -45,26 +45,27 @@ export default function AuthGate({ children }) {
 
   if (state === 'checking') {
     return (
-      <div className="flex min-h-screen items-center justify-center gap-2 text-muted-foreground/70">
-        <Loader2 className="h-4 w-4 animate-spin" /> <span className="text-sm">กำลังตรวจสอบสิทธิ์…</span>
+      <div className="flex min-h-screen items-center justify-center gap-2.5 text-muted-foreground/70">
+        <Loader2 className="h-4 w-4 animate-spin text-primary" /> <span className="text-[13px]">กำลังตรวจสอบสิทธิ์…</span>
       </div>
     )
   }
 
   if (state === 'locked') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#070b13] px-6" data-testid="auth-locked">
-        <div className="flex w-full max-w-sm flex-col items-center gap-4 rounded-2xl border border-amber-500/20 bg-[#0d1420] p-8 text-center shadow-[0_0_40px_rgba(245,158,11,.06)]">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-amber-500/15">
-            <Bot className="h-6 w-6 text-amber-400" />
+      <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-6" data-testid="auth-locked">
+        <div className="pointer-events-none absolute left-1/2 top-[-16rem] h-[32rem] w-[32rem] -translate-x-1/2 rounded-full bg-primary/[0.12] blur-[120px]" />
+        <div className="relative flex w-full max-w-sm flex-col items-center gap-5 rounded-2xl border border-white/[0.08] bg-card/80 p-8 text-center shadow-pop">
+          <div className="relative flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-400 via-primary to-indigo-600 text-white shadow-[0_12px_32px_-12px_rgba(139,92,246,0.8)]">
+            <Bot className="h-6 w-6" />
           </div>
           <div>
-            <div className="text-[16px] font-bold">AI Agent Platform</div>
-            <div className="mt-1 text-[12.5px] leading-relaxed text-muted-foreground/80">
+            <div className="text-[17px] font-semibold tracking-[-0.02em] text-white">AI Agent Platform</div>
+            <div className="mt-1.5 text-[12.5px] leading-relaxed text-muted-foreground">
               โหมดป้องกัน — ยังไม่ได้เข้าสู่ระบบ ข้อมูลและการทำงานทั้งหมดถูกล็อกไว้จนกว่าจะ sign in
             </div>
           </div>
-          <Button asChild className="gap-1.5" data-testid="auth-locked-signin">
+          <Button asChild className="w-full gap-1.5" data-testid="auth-locked-signin">
             <Link href="/login"><Lock className="h-3.5 w-3.5" /> เข้าสู่ระบบ</Link>
           </Button>
         </div>

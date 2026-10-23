@@ -17,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { AgentDetail } from '@/components/agent-detail'
 import { ProjectDocs } from '@/components/project-docs'
+import PageHeader from '@/components/page-header'
 import { fmtClock, stepKey } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
@@ -647,34 +648,40 @@ export default function ProjectFlow() {
 
   return (
     <>
-      <div className="flex flex-wrap items-center justify-between gap-3 px-7 pb-1 pt-5">
-        <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" onClick={() => router.push('/projects')}><ArrowLeft /></Button>
-          <div>
-            <h1 className="text-[21px] font-bold tracking-tight">{project.name}</h1>
-            <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-              {project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
-            </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2.5">
-          {error && <span className="text-[12px] text-red-400">{error}</span>}
-          {saved && <span className="flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="flow-saved">Saved <Check className="h-3.5 w-3.5" /></span>}
-          <Button onClick={save} disabled={saving} data-testid="flow-save">
-            <Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save Team'}
+      <PageHeader
+        leading={
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-9 w-9 shrink-0 text-muted-foreground hover:text-white"
+            onClick={() => router.push('/projects')}
+            aria-label="Back to projects"
+          >
+            <ArrowLeft className="h-4 w-4" />
           </Button>
-        </div>
-      </div>
+        }
+        title={project.name}
+        subtitle={project.description || 'Team workspace — สั่งงานทีม AI แล้วดูทุกคนทำงานต่อกัน'}
+        actions={
+          <>
+            {error && <span className="text-[12px] text-red-400">{error}</span>}
+            {saved && <span className="flex items-center gap-1 text-[12.5px] font-medium text-emerald-400" data-testid="flow-saved">Saved <Check className="h-3.5 w-3.5" /></span>}
+            <Button onClick={save} disabled={saving} data-testid="flow-save">
+              <Save className="h-4 w-4" /> {saving ? 'Saving…' : 'Save Team'}
+            </Button>
+          </>
+        }
+      />
 
-      <div className="px-7 py-5">
+      <div className="page-body">
         <Tabs defaultValue="mission" className="w-full">
-          <TabsList className="mb-5 h-auto w-full justify-start gap-1 rounded-none border-b border-transparent bg-transparent p-0">
+          <TabsList className="mb-6 h-auto w-full justify-start gap-1 rounded-none border-b border-white/[0.06] bg-transparent p-0">
             {[['mission', 'Mission Control'], ['docs', 'Docs']].map(([v, label]) => (
               <TabsTrigger
                 key={v}
                 value={v}
                 data-testid={`tab-${v}`}
-                className="rounded-none border-b-2 border-transparent px-3.5 py-3 text-[13px] font-semibold data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none"
+                className="rounded-none border-b-2 border-transparent px-3.5 pb-3 pt-1 text-[12.5px] font-semibold text-muted-foreground/70 hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-white data-[state=active]:shadow-none"
               >
                 {label}
               </TabsTrigger>
@@ -683,19 +690,27 @@ export default function ProjectFlow() {
 
           <TabsContent value="mission" className="mt-0">
         {/* Mission control — dispatch one task through the whole team */}
-        <Card className="mb-5 p-4" data-testid="mission-control">
-          <form onSubmit={dispatch} className="flex flex-col gap-3">
-            <div className="flex items-center justify-between">
-              <div className="text-[14.5px] font-bold">สั่งงานทีม AI</div>
-              <div className="text-[11.5px] text-muted-foreground/70">
-                {nodes.length} agents รับงานตามลำดับและเขียนงานลง container ของตัวเอง — ถ้าใครติดขัด/มีคำถาม จะเปิด meeting ถามกลับแล้วแก้งานต่อ
+        <Card className="mb-5 p-5" data-testid="mission-control">
+          <form onSubmit={dispatch} className="flex flex-col gap-3.5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/[0.09] text-primary ring-1 ring-inset ring-primary/15">
+                  <Send className="h-4 w-4" />
+                </span>
+                <div>
+                  <div className="text-[13.5px] font-semibold text-white">สั่งงานทีม AI</div>
+                  <div className="text-[11.5px] text-muted-foreground/60">{nodes.length} agents รับงานตามลำดับและเขียนงานลง container ของตัวเอง</div>
+                </div>
+              </div>
+              <div className="max-w-md text-[11.5px] leading-relaxed text-muted-foreground/60">
+                ถ้าใครติดขัด/มีคำถาม จะเปิด meeting ถามกลับแล้วแก้งานต่อ
               </div>
             </div>
             <div className="flex items-center gap-2.5">
-              <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground/60" />
+              <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground/50" />
               <input
                 data-testid="project-repo"
-                className="h-8 w-full max-w-xl rounded-md border bg-background px-2.5 text-[12.5px] outline-none focus:ring-1 focus:ring-ring"
+                className="h-9 w-full max-w-xl rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
                 placeholder="Git repo (https://github.com/owner/repo) — ทีมจะ clone ลง /workspace ของ container ก่อนทำงานทุกครั้ง"
                 value={repoUrl}
                 onChange={e => { setRepoUrl(e.target.value); setSaved(false) }}
@@ -704,7 +719,7 @@ export default function ProjectFlow() {
                 <span className="shrink-0 text-[11px] text-amber-400">กด Save Team เพื่อบันทึก repo</span>
               )}
             </div>
-            <div className="flex gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row">
               <Textarea
                 data-testid="task-input"
                 placeholder="เช่น: Redesign หน้า Dashboard ใหม่ ทำ UX/UI เป็น design tokens + layout ใหม่..."
@@ -730,7 +745,7 @@ export default function ProjectFlow() {
                 </label>
               </div>
             </div>
-            {runError && <div className="rounded-md bg-red-500/15 px-3 py-2 text-[12.5px] text-red-400">{runError}</div>}
+            {runError && <div className="rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-300">{runError}</div>}
           </form>
 
           {run && (

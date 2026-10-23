@@ -37,6 +37,15 @@ test.describe('Human inbox', () => {
     await page.getByTestId('inbox-button').click()
     const panel = page.getByTestId('inbox-panel')
     await expect(panel).toBeVisible()
+    // The sidebar's scroll container clips overflowing children, and Playwright
+    // still calls a clipped element "visible" — assert the panel is actually
+    // hit-testable where it is drawn (this caught the dropdown rendering
+    // invisible behind the sidebar).
+    expect(await panel.evaluate(el => {
+      const r = el.getBoundingClientRect()
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+      return el.contains(hit)
+    })).toBe(true)
     const item = panel.getByTestId('inbox-item')
     await expect(item).toContainText('Inbox Mock Project')
     await expect(item).toContainText('ต้องการเวอร์ชันภาษาไทยหรืออังกฤษ?')
