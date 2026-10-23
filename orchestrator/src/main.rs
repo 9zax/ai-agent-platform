@@ -142,9 +142,14 @@ fn seed_personas() -> Vec<Persona> {
     // flash workhorse for builders/testers (BA, UX, Dev, QA), and the cheapest
     // tier for Chom's applied pattern work (tokens/visual system built on
     // Sept's flows): glm-4.5-air ↔ gemini-3.5-flash-lite.
+    //
+    // Team-wide working agreement appended to every persona (like the TDD norm,
+    // it applies to the whole team): a demo must carry evidence — a screenshot
+    // or short video of the actual result. Text-only reports don't count.
+    let demo_rule = " Whenever you present or hand off finished work, attach a screenshot or a short video of the actual result — a text-only report is not a demo.";
     let mk = |role: &str, name: &str, title: &str, years: &str, expertise: &str, rules: &str, glm: &str, gemini: &str| Persona {
         role: role.into(), name: name.into(), title: title.into(), years: years.into(),
-        expertise: expertise.into(), rules_md: rules.into(),
+        expertise: expertise.into(), rules_md: format!("{rules}{demo_rule}"),
         model_overrides: BTreeMap::from([
             (PROVIDERS[0].id.to_string(), glm.to_string()),
             ("gemini".to_string(), gemini.to_string()),
