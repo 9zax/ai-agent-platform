@@ -8,21 +8,23 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { marked } from 'marked'
-import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, Rocket, MonitorPlay, RotateCcw } from 'lucide-react'
+import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, MonitorPlay, RotateCcw } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Textarea } from '@/components/ui/textarea'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { AgentDetail } from '@/components/agent-detail'
+import { ProjectDocs } from '@/components/project-docs'
 import { fmtClock, stepKey } from '@/lib/utils'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 // Tail-stage steps (after QA verifies): icon + label chip shown next to the title.
+// (deploy/staging removed with docker — the tail is now PR → demo)
 const STEP_KIND_META = {
   pr: { icon: GitPullRequest, label: 'Pull Request', cls: 'bg-sky-500/10 text-sky-300' },
-  deploy: { icon: Rocket, label: 'Deploy staging', cls: 'bg-orange-500/10 text-orange-300' },
   demo: { icon: MonitorPlay, label: 'Acceptance demo', cls: 'bg-violet-500/10 text-violet-300' },
 }
 
@@ -234,7 +236,7 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
           ? <MonitorPlay className="h-3.5 w-3.5 shrink-0 text-violet-300" />
           : <MessageCircle className={`h-3.5 w-3.5 shrink-0 ${d.status === 'need_human' ? 'text-rose-400' : 'text-amber-400'}`} />}
         <span className={`text-[12.5px] font-semibold ${isDemo ? 'text-violet-200' : 'text-amber-200'}`}>
-          {isDemo ? 'Acceptance Demo — QA แสดงหลักฐาน · Dev ส่งมอบ PR/Deploy · PO ตรวจรับ' : `${asker} ถาม → ${addressees}`}
+          {isDemo ? 'Acceptance Demo — QA แสดงหลักฐาน · Dev ส่งมอบ PR · PO ตรวจรับ' : `${asker} ถาม → ${addressees}`}
         </span>
         <Badge variant={d.status === 'resolved' ? 'running' : d.status === 'need_human' ? 'dead' : 'purple'} className="text-[9.5px]">
           {d.status === 'resolved' ? (isDemo ? 'ตรวจรับเสร็จ' : 'resolved') : d.status === 'need_human' ? '⏸ รอคุณตอบ' : d.status === 'answering' ? (isDemo ? 'กำลัง demo' : 'กำลังคุยกัน') : 'รอเปิดประชุม'}
@@ -274,7 +276,7 @@ function initials(name) {
   return (name || '?').split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase()
 }
 
-// Chip for a tail-stage step kind (pr/deploy/demo) next to the step title.
+// Chip for a tail-stage step kind (pr/demo) next to the step title.
 function StepKindBadge({ kind }) {
   const meta = STEP_KIND_META[kind]
   if (!meta) return null
@@ -548,7 +550,7 @@ export default function ProjectFlow() {
   // the early returns above, so no hooks here) ----
   const live = run?.status === 'running' || run?.status === 'waiting_human'
   // Role → that agent's WORK step only, so chat names/canvas rings never get
-  // shadowed by the same agent's tail steps (pr/deploy/demo).
+  // shadowed by the same agent's tail steps (pr/demo).
   const stepByRole = Object.fromEntries((run?.steps || []).filter(s => (s.kind || 'work') === 'work').map(s => [s.role, s]))
   const activeMeetings = (run?.discussions || []).filter(d => d.status !== 'resolved')
   // Agents paused on a need-human meeting
@@ -665,6 +667,21 @@ export default function ProjectFlow() {
       </div>
 
       <div className="px-7 py-5">
+        <Tabs defaultValue="mission" className="w-full">
+          <TabsList className="mb-5 h-auto w-full justify-start gap-1 rounded-none border-b border-transparent bg-transparent p-0">
+            {[['mission', 'Mission Control'], ['docs', 'Docs']].map(([v, label]) => (
+              <TabsTrigger
+                key={v}
+                value={v}
+                data-testid={`tab-${v}`}
+                className="rounded-none border-b-2 border-transparent px-3.5 py-3 text-[13px] font-semibold data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none"
+              >
+                {label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+
+          <TabsContent value="mission" className="mt-0">
         {/* Mission control — dispatch one task through the whole team */}
         <Card className="mb-5 p-4" data-testid="mission-control">
           <form onSubmit={dispatch} className="flex flex-col gap-3">
@@ -949,6 +966,12 @@ export default function ProjectFlow() {
         <div className="mt-2 text-[11.5px] text-muted-foreground/60" data-testid="flow-edit-hint">
           กดที่การ์ด agent เพื่อดูว่ากำลังทำอะไรอยู่ + ประวัติการทำงานทั้งหมด และแก้ไข persona/โมเดลประจำตัวได้ (เส้นเชื่อม = ใครคุยกับใคร)
         </div>
+          </TabsContent>
+
+          <TabsContent value="docs" className="mt-0">
+            <ProjectDocs projectId={id} />
+          </TabsContent>
+        </Tabs>
       </div>
 
       <AgentDetail agent={detailAgent} open={detailOpen} onOpenChange={setDetailOpen} onSaved={refreshPersonas} />

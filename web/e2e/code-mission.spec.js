@@ -7,7 +7,7 @@ const API = 'http://localhost:8000'
 // the PR commits everything (git add -A). This spec proves a REAL run produces
 // a PR whose diff contains actual code/design files — not just missions/*.md.
 //
-// Opt-in (real LLM + Docker + a PUBLIC throwaway repo):
+// Opt-in (real LLM + a PUBLIC throwaway repo):
 //   E2E_CODE_MISSION=1 E2E_TEST_REPO=https://github.com/<you>/throwaway
 // (optional E2E_DEV_IMAGE to pin the agent image, default = platform default)
 test.describe('Design + Code mission', () => {
@@ -60,7 +60,7 @@ test.describe('Design + Code mission', () => {
       }, { api: API, projectId: pid })
       expect(runId).toBeTruthy()
 
-      // The run finishes (relay + FILES apply + PR + deploy + demo are real)
+      // The run finishes (relay + FILES apply + PR + demo are real)
       await expect.poll(async () => {
         return await page.evaluate(async ({ api, rid }) => {
           return (await (await fetch(`${api}/runs/${rid}`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()).status

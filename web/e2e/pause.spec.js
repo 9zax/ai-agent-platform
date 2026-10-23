@@ -1,7 +1,7 @@
 const { test, expect } = require('@playwright/test')
 
-// Pause / resume — platform pause = docker stop + registry entry, resume revives.
-// Runs against real Docker via the orchestrator (:8000), same as features.spec.js.
+// Pause / resume — platform pause = kill the tmux session + registry entry; resume revives.
+// Runs against real host agents via the orchestrator (:8000), same as features.spec.js.
 test.describe('Pause / resume containers', () => {
   let containerName
 

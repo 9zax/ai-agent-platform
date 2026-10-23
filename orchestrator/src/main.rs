@@ -1,37 +1,21 @@
-use std::collections::{BTreeMap, HashMap};
+mod hostexec;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Multipart, Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions,
-};
-use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
-use bollard::query_parameters::{
-    InspectContainerOptions, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    RestartContainerOptions, StartContainerOptions, StatsOptionsBuilder, StopContainerOptions,
-};
-use bollard::Docker;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 const SERVICE_NAME: &str = "AI Agent Platform Orchestrator";
-const MANAGED_LABEL: &str = "managed-by";
-const MANAGED_VALUE: &str = "ai-agent-platform";
-const AGENT_NETWORK: &str = "ai-agent-platform_agent-net";
-/// Shared workspace volume mounted at /workspace in every agent container the
-/// platform creates — one cloned repo working tree shared by the whole team,
-/// like a single Linux box the agents all work on. Named to match the compose
-/// volume so `agent-example` sees the same tree.
-const WORKSPACE_VOLUME: &str = "ai-agent-platform-workspace";
 /// GitHub connector device flow runs against GitHub CLI's public OAuth app —
 /// per-container login via browser, tokens never stored by the platform.
 const GH_DEVICE_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
@@ -41,6 +25,12 @@ const GH_DEVICE_SCOPE: &str = "repo read:org gist workflow";
 const CONNECTOR_CACHE_TTL: u64 = 10;
 /// How often the idle sweeper evaluates auto-pause candidates.
 const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
+/// Per-doc and total char budgets when project documents are injected into
+/// relay prompts (same truncation style as the 1400-char handoff).
+const DOC_INJECT_MAX_CHARS: usize = 4000;
+const DOCS_INJECT_MAX_CHARS: usize = 16000;
+/// Hard cap for one uploaded document file (enforced by the route's body limit too).
+const DOC_UPLOAD_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Default tool belt — every agent's Linux box gets these, and every prompt
@@ -48,10 +38,10 @@ const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
 // never guesses capabilities the box doesn't have.
 // ---------------------------------------------------------------------------
 
-/// (probe command, hint for the model) — probed in the container and rendered
-/// into the system prompt. Heavy runtimes (node, python, browser) are
-/// probed-only: only agent-base ships them; ad-hoc installs would be too slow
-/// and unreliable to attempt mid-command.
+/// (probe command, hint for the model) — probed on the HOST and rendered into
+/// the system prompt. The platform never installs anything on the user's
+/// machine; the manifest simply reports what is really there so the model
+/// never invents capabilities the machine doesn't have.
 const PROBED_TOOLS: &[(&str, &str)] = &[
     ("git", "clone/commit/diff"),
     ("gh", "GitHub CLI — issues, PRs, releases (e.g. gh issue create --title ... --body ...)"),
@@ -62,25 +52,12 @@ const PROBED_TOOLS: &[(&str, &str)] = &[
     ("pip3", "install Python packages"),
     ("node", "Node.js runtime"),
     ("npm", "JS packages / npx one-off tools"),
-    ("chromium", "real browser — VISIBLE on this machine's VNC screen (the user watches you work): chromium --no-sandbox --no-first-run --disable-dev-shm-usage <url> opens a window on DISPLAY=:1; quick screenshot without a window: chromium --headless --no-sandbox --screenshot=/workspace/shot.png --window-size=1280,800 <url>"),
+    ("open", "macOS launcher — open <url> opens the user's real browser window (visible on their screen); open <file> reveals files in Finder"),
     ("rg", "ripgrep — fast code search"),
     ("zip", "create zip archives"),
     ("unzip", "extract zip archives"),
     ("rsync", "file sync / bulk copy"),
     ("ssh", "SSH client — git over ssh, remote commands"),
-    ("docker", "docker CLI — talks to the HOST daemon via the mounted /var/run/docker.sock (docker compose …)"),
-];
-
-/// Core tools installed on demand when a bare/foreign image lacks them
-/// (apt package, apk package). Small and fast so the first AI command on a
-/// fresh box bootstraps itself. Best-effort: failures stay silent and the
-/// probe simply reports what the box really has.
-const INSTALLABLE_TOOLS: &[(&str, &str)] = &[
-    ("git", "git"),
-    ("gh", "github-cli"),
-    ("curl", "curl"),
-    ("jq", "jq"),
-    ("ca-certificates", "ca-certificates"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -258,8 +235,8 @@ struct Project {
     name: String,
     #[serde(default)]
     description: String,
-    /// git remote every agent container clones into /workspace before working
-    /// (empty = no repo; agents then work on bare /workspace files)
+    /// git remote cloned into the shared workspace before working
+    /// (empty = no repo; agents then work on bare workspace files)
     #[serde(default)]
     repo_url: String,
     /// persona roles in this project's team
@@ -291,6 +268,62 @@ struct ProjectUpdate {
     #[serde(default)] agents: Option<Vec<String>>,
     #[serde(default)] links: Option<Vec<ProjectLink>>,
     #[serde(default)] positions: Option<HashMap<String, Position>>,
+}
+
+// ---------------------------------------------------------------------------
+// Project docs — the per-project document space (PO / BA / SA / General).
+// Markdown docs live inline in docs.json (editable + injectable into prompts);
+// uploaded binaries live on disk under <data>/docs-files/<doc_id>/.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DocFile {
+    /// original filename, sanitized to a bare file name
+    name: String,
+    content_type: String,
+    size: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProjectDoc {
+    /// "d-NNN" (global doc_counter — meetings reuse the prefix inside runs, different namespace)
+    id: String,
+    project_id: String,
+    /// free-text folder; the UI quick-picks PO / BA / SA / General
+    folder: String,
+    title: String,
+    /// markdown body — empty for uploaded binary documents
+    #[serde(default)]
+    content_md: String,
+    /// uploaded binary payload (None for markdown docs)
+    #[serde(default)]
+    file: Option<DocFile>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Deserialize)]
+struct DocCreate {
+    title: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    content_md: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DocUpdate {
+    #[serde(default)] title: Option<String>,
+    #[serde(default)] folder: Option<String>,
+    #[serde(default)] content_md: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DocQuery {
+    /// "?raw=1" → stream the bytes instead of JSON
+    #[serde(default)]
+    raw: Option<String>,
 }
 
 #[derive(Clone)]
@@ -338,7 +371,7 @@ struct RunStep {
     role: String,
     name: String,
     title: String,
-    /// which pipeline stage this step belongs to: work (relay deliverable) | pr | deploy | demo
+    /// which pipeline stage this step belongs to: work (relay deliverable) | pr | demo
     #[serde(default = "default_step_kind")]
     kind: String,
     /// pending | working | done | error | skipped
@@ -475,7 +508,7 @@ struct CachedConnectorStatus {
 }
 
 /// A container this platform stopped itself (manual Pause or the idle sweeper).
-/// Docker labels are immutable after creation, so this app-side registry —
+/// Docker labels are gone with host execution; this app-side registry —
 /// persisted to /data/paused.json — is the source of truth for "paused"
 /// (as opposed to a container the user stopped directly).
 #[derive(Clone, Serialize, Deserialize)]
@@ -491,6 +524,8 @@ struct Store {
     tasks: Vec<Task>,
     skills: Vec<Skill>,
     projects: Vec<Project>,
+    /// per-project document space (persisted, /data/docs.json)
+    docs: Vec<ProjectDoc>,
     runs: Vec<Run>,
     config: AiConfig,
     /// login sessions: token → username (web UI auth, ADMIN_USER/ADMIN_PASSWORD from env)
@@ -502,10 +537,15 @@ struct Store {
     connector_cache: HashMap<String, CachedConnectorStatus>,
     /// container name → platform-paused info (persisted, /data/paused.json)
     paused: HashMap<String, PausedInfo>,
-    /// container name → unix secs of last real activity (in-memory only)
+    /// agent name → unix secs of last real activity (in-memory only)
     last_activity: HashMap<String, u64>,
+    /// every agent ever started on this machine (persisted, /data/agents.json)
+    /// — tmux sessions are ephemeral, this registry is what keeps stopped
+    /// agents visible (with a Start button) on the dashboard
+    agents: BTreeSet<String>,
     task_counter: usize,
     project_counter: usize,
+    doc_counter: usize,
     run_counter: usize,
 }
 
@@ -523,6 +563,7 @@ impl Default for Store {
                 Skill { id: "image-analysis".into(), name: "Image Analysis".into(), description: "Inspect and describe images".into(), enabled: false },
             ],
             projects: vec![seed_project()],
+            docs: Vec::new(),
             runs: Vec::new(),
             config: AiConfig::default(),
             sessions: HashMap::new(),
@@ -531,8 +572,10 @@ impl Default for Store {
             connector_cache: HashMap::new(),
             paused: HashMap::new(),
             last_activity: HashMap::new(),
+            agents: BTreeSet::new(),
             task_counter: 0,
             project_counter: 1,
+            doc_counter: 0,
             run_counter: 0,
         }
     }
@@ -540,7 +583,6 @@ impl Default for Store {
 
 #[derive(Clone)]
 struct App {
-    docker: Option<Docker>,
     store: Arc<Mutex<Store>>,
     seq: Arc<AtomicUsize>,
 }
@@ -564,6 +606,7 @@ fn err(status: StatusCode, detail: impl Into<String>) -> ApiError {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // image/command accepted for API compatibility, ignored on host
 struct ContainerCreate {
     name: String,
     role: String,
@@ -665,74 +708,59 @@ struct SkillUpdate {
 // ---------------------------------------------------------------------------
 
 impl App {
-    fn docker(&self) -> Result<&Docker, ApiError> {
-        self.docker.as_ref().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "Docker not available"))
-    }
-
-    async fn inspect(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        self.docker()?
-            .inspect_container(ident, None::<InspectContainerOptions>)
-            .await
-            .map_err(|e| match e {
-                bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } =>
-                    err(StatusCode::NOT_FOUND, format!("Container '{ident}' not found")),
-                other => err(StatusCode::BAD_REQUEST, other.to_string()),
-            })
-    }
-
-    async fn inspect_managed(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        let c = self.inspect(ident).await?;
-        let managed = c.config.as_ref()
-            .and_then(|cfg| cfg.labels.as_ref())
-            .and_then(|l| l.get(MANAGED_LABEL))
-            .map(|v| v == MANAGED_VALUE)
-            .unwrap_or(false);
-        if !managed {
-            let name = c.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-            return Err(err(StatusCode::FORBIDDEN, format!("Container '{name}' is not managed by this platform")));
+    /// Derived agent state: running (live tmux session) / paused (registry
+    /// entry, session killed) / exited (registered but not alive).
+    async fn agent_state(&self, name: &str) -> String {
+        if hostexec::session_alive(name).await {
+            return "running".into();
         }
-        Ok(c)
+        if self.store.lock().unwrap().paused.contains_key(name) {
+            return "paused".into();
+        }
+        "exited".into()
     }
 
-    fn status_of(c: &bollard::models::ContainerInspectResponse) -> String {
-        c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_else(|| "unknown".into())
+    /// Resolve an endpoint ident to an agent this platform knows: registered
+    /// in agents.json or currently alive as a session. 404 otherwise.
+    async fn resolve_agent(&self, ident: &str) -> Result<String, ApiError> {
+        if self.store.lock().unwrap().agents.contains(ident)
+            || hostexec::session_alive(ident).await
+        {
+            return Ok(ident.to_string());
+        }
+        Err(err(StatusCode::NOT_FOUND, format!("Agent '{ident}' not found")))
     }
 
-    /// Find this platform's container for a persona role → (id, name).
-    /// Running first; otherwise a PLATFORM-paused one is revived on the spot
-    /// (the idle sweeper may have stopped it hours ago). User-stopped
-    /// containers stay invisible — runs keep their degrade-to-text semantics.
+    /// Remember an agent (persisted) and mark it active.
+    fn register_agent(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        if store.agents.insert(name.to_string()) {
+            save_agents(&store);
+        }
+    }
+
+    fn unregister_agent(&self, name: &str) {
+        let mut store = self.store.lock().unwrap();
+        if store.agents.remove(name) {
+            save_agents(&store);
+        }
+    }
+
+    /// Find this platform's agent for a persona role → (name, name). The
+    /// session is ensured on the spot (agents start on demand — the tmux
+    /// equivalent of a container being there), and a PLATFORM-paused agent is
+    /// transparently revived (the idle sweeper may have killed the session
+    /// hours ago). None only when the machine itself can't host commands
+    /// (workspace unwritable) — runs keep their degrade-to-text semantics.
     async fn agent_container(&self, role: &str) -> Option<(String, String)> {
-        let docker = self.docker.as_ref()?.clone();
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![
-            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
-            format!("role={role}"),
-        ]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        let list = docker.list_containers(Some(opts)).await.ok()?;
-        let mut exited: Option<(String, String)> = None;
-        for c in list {
-            let pair = (
-                c.id.clone().unwrap_or_default(),
-                c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            );
-            match c.state.as_ref().map(|s| s.to_string()).unwrap_or_default() {
-                s if s == "running" => {
-                    self.touch_activity(&pair.1);
-                    return Some(pair);
-                }
-                s if s == "exited" && exited.is_none() => exited = Some(pair),
-                _ => {}
-            }
+        let name = hostexec::session_name(role);
+        if let Err(e) = hostexec::ensure_session(&name).await {
+            eprintln!("agent session '{name}' unavailable: {e}");
+            return None;
         }
-        if let Some((id, name)) = exited {
-            let paused = self.store.lock().unwrap().paused.contains_key(&name);
-            if paused && self.resume_paused(&id, &name).await {
-                return Some((id, name));
-            }
-        }
-        None
+        self.clear_paused(&name);
+        self.touch_activity(&name);
+        Some((name.clone(), name))
     }
 
     fn mark_paused(&self, name: &str, auto: bool) {
@@ -754,103 +782,46 @@ impl App {
         self.store.lock().unwrap().last_activity.insert(name.to_string(), now_secs());
     }
 
-    /// Start a platform-paused container back and clear its registry entry.
-    /// Idempotent: docker 304 (already started) counts as success.
-    async fn resume_paused(&self, id: &str, name: &str) -> bool {
-        let Some(docker) = self.docker.as_ref() else { return false };
-        match docker.start_container(id, None::<StartContainerOptions>).await {
-            Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
-            Err(e) => {
-                eprintln!("resume of paused container '{name}' failed: {e}");
-                return false;
-            }
-        }
-        for _ in 0..10 {
-            if let Ok(c) = self.inspect(id).await {
-                if App::status_of(&c) == "running" {
-                    self.clear_paused(name);
-                    return true;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-        false
-    }
-
     /// Guard for ident-based endpoints (exec / agent command / terminal):
-    /// running → pass through; platform-paused → transparently revive;
+    /// alive → pass through; platform-paused → transparently revive;
     /// anything else → clear error telling the user what to press.
-    async fn ensure_running(&self, ident: &str) -> Result<bollard::models::ContainerInspectResponse, ApiError> {
-        let managed = self.inspect_managed(ident).await?;
-        let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-        let status = App::status_of(&managed);
+    async fn ensure_running(&self, ident: &str) -> Result<String, ApiError> {
+        let name = self.resolve_agent(ident).await?;
+        let status = self.agent_state(&name).await;
         if status == "running" {
             self.touch_activity(&name);
-            return Ok(managed);
+            return Ok(name);
         }
-        if status == "exited" && self.store.lock().unwrap().paused.contains_key(&name) {
-            let id = managed.id.clone().unwrap_or_default();
-            if self.resume_paused(&id, &name).await {
-                return self.inspect(&id).await;
-            }
-            return Err(err(StatusCode::CONFLICT, "Container is resuming — try again in a moment"));
+        if status == "paused" {
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            self.clear_paused(&name);
+            return Ok(name);
         }
-        Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status}) — press Start or Resume")))
+        Err(err(StatusCode::BAD_REQUEST, format!("Agent is not running (status: {status}) — press Start or Resume")))
     }
 
-    async fn exec_in(&self, container_id: &str, command: &str) -> Result<(i64, String), ApiError> {
-        self.exec_in_env(container_id, command, Vec::new()).await
+    async fn exec_in(&self, agent: &str, command: &str) -> Result<(i64, String), ApiError> {
+        self.exec_in_env(agent, command, Vec::new()).await
     }
 
     /// exec_in with extra environment variables — the only safe way to pass
-    /// secrets (tokens, git identity) into a container: they never appear in
-    /// the command string (visible via ps) nor in `docker inspect`.
-    ///
-    /// DISPLAY=:1 is appended to every exec: agent-base runs Xvnc on :1, but
-    /// `docker exec` does NOT inherit the env of the running start.sh —
-    /// without this any GUI app an agent/user launches dies with
-    /// "cannot open display". With it, browser windows land on the VNC
-    /// desktop where the user can watch the agent work. A caller-supplied
-    /// DISPLAY (appended later) still wins; headless boxes ignore it.
-    async fn exec_in_env(&self, container_id: &str, command: &str, mut env: Vec<String>) -> Result<(i64, String), ApiError> {
-        env.push("DISPLAY=:1".to_string());
-        let exec = self.docker()?
-            .create_exec(container_id, CreateExecOptions::<String> {
-                cmd: Some(vec!["sh".into(), "-c".into(), command.into()]),
-                env: Some(env),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            })
+    /// secrets (tokens, git identity) into an agent's command: they ride the
+    /// 0600 script file (or the headless process env), never the command
+    /// string, `ps` output or logs.
+    async fn exec_in_env(&self, agent: &str, command: &str, env: Vec<String>) -> Result<(i64, String), ApiError> {
+        hostexec::run(agent, command, &env)
             .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-        let mut bytes: Vec<u8> = Vec::new();
-        let started = self.docker()?
-            .start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: false, ..Default::default() }))
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        if let StartExecResults::Attached { mut output, .. } = started {
-            while let Some(Ok(frame)) = output.next().await {
-                bytes.extend_from_slice(&frame.into_bytes());
-            }
-        }
-        let exit_code = self.docker()?
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-            .exit_code
-            .unwrap_or(-1);
-        Ok((exit_code, String::from_utf8_lossy(&bytes).into_owned()))
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, e))
     }
 
-    /// Make sure the project repo is checked out in the agent's container at
-    /// /workspace/<repo-name> — the "bot on a Linux box" rule: every command
-    /// runs inside the container, the repo is cloned once before any work, and
-    /// all file changes go through this working tree only. Idempotent: an
+    /// Make sure the project repo is checked out in the shared workspace at
+    /// <workspace>/<repo-name> — the "bot on this machine" rule: every command
+    /// runs on the host, the repo is cloned once before any work, and all
+    /// file changes go through this working tree only. Idempotent: an
     /// existing clone is left untouched (it may hold the agent's work in
     /// progress). Returns the working-tree path.
-    async fn ensure_repo(&self, container_id: &str, repo_url: &str) -> Result<String, ApiError> {
+    async fn ensure_repo(&self, agent: &str, repo_url: &str) -> Result<String, ApiError> {
         let repo_url = repo_url.trim().trim_end_matches(".git");
         if repo_url.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no repo URL configured"));
@@ -860,14 +831,15 @@ impl App {
             return Err(err(StatusCode::BAD_REQUEST, format!("Invalid repo URL: {repo_url:?}")));
         }
         let dir = repo_dir_name(repo_url);
-        let path = format!("/workspace/{dir}");
+        let ws = hostexec::workspace_str();
+        let path = format!("{ws}/{dir}");
         // private repos: the configured platform token rides the clone URL for
         // the INITIAL clone only (x-access-token is what GitHub PATs
         // authenticate as over HTTPS) — read access, never a per-machine
         // identity. The token never appears in error text — errors quote the
         // clean URL — and the origin URL is normalized back to the clean form
         // right after, so later fetch/push authenticate as the machine's own
-        // connector login (gh credential helper), not as the platform token.
+        // gh credential helper, not as the platform token.
         let git_token = self.store.lock().unwrap().config.git_token.trim().to_string();
         let clone_url = if !git_token.is_empty() && repo_url.starts_with("https://") {
             if !git_token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
@@ -878,58 +850,42 @@ impl App {
             repo_url.to_string()
         };
         let script = format!(
-            "command -v git >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1 || {{ apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git >/dev/null 2>&1; }}; \
-             command -v git >/dev/null 2>&1 || {{ echo 'git is not available in this image — use the agent-base image'; exit 3; }}; \
-             mkdir -p /workspace; \
+            "command -v git >/dev/null 2>&1 || {{ echo 'git is not installed on this machine'; exit 3; }}; \
              if [ ! -d '{path}/.git' ]; then git clone --depth 1 '{clone_url}' '{path}' || exit 4; else echo 'repo already cloned at {path}'; fi; \
              origin=$(git -C '{path}' remote get-url origin 2>/dev/null || true); \
              case \"$origin\" in *x-access-token:*) git -C '{path}' remote set-url origin '{repo_url}' >/dev/null 2>&1 || true;; esac"
         );
-        let (code, out) = self.exec_in(container_id, &script).await?;
+        let (code, out) = self.exec_in(agent, &script).await?;
         match code {
             0 => Ok(path),
-            3 => Err(err(StatusCode::BAD_GATEWAY, "git is not available in the container image — start this agent on the agent-base image (it ships git + gh)")),
+            3 => Err(err(StatusCode::BAD_GATEWAY, "git is not installed on this machine — brew install git")),
             _ => Err(err(StatusCode::BAD_GATEWAY, format!("cloning {repo_url} into {path} failed (exit {code}): {out}"))),
         }
     }
 
-    /// Make sure the default tool belt works in this container (the "every
-    /// Linux box has the same defaults" rule): install the small core set when
-    /// missing (apk/apt, best-effort) and set a git identity so commits never
-    /// fail. GitHub auth is deliberately NOT touched here — per-machine rule:
-    /// the platform PAT is clone-only (see ensure_repo) and a box gets its
-    /// GitHub identity solely from its own connector login (browser device
-    /// flow primary, pasted token backup). Any legacy `x-access-token`
-    /// insteadOf rewrite from the old shared-PAT era is stripped so push/pull
-    /// go through that machine's own gh credential helper. Best-effort and
-    /// silent — the manifest probe right after reports what the box really has.
-    async fn ensure_tools(&self, container_id: &str) {
-        let apt = INSTALLABLE_TOOLS.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(" ");
-        let apk = INSTALLABLE_TOOLS.iter().map(|(_, a)| *a).collect::<Vec<_>>().join(" ");
-        let script = format!(
-            "missing=0; for c in git gh curl jq; do command -v \"$c\" >/dev/null 2>&1 || missing=1; done; \
-             if [ \"$missing\" = 1 ]; then \
-                 command -v apk >/dev/null 2>&1 && apk add --no-cache {apk} >/dev/null 2>&1; \
-                 command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq {apt} >/dev/null 2>&1; \
-             fi; \
-             command -v git >/dev/null 2>&1 && {{ git config --global --get-regexp '^url\\..*\\.insteadof$' 2>/dev/null | while IFS=' ' read -r k _v; do case \"$k\" in *x-access-token*) git config --global --unset-all \"$k\" >/dev/null 2>&1 || true;; esac; done; true; }}; \
-             command -v git >/dev/null 2>&1 && {{ git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
-                 git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }}; \
-             if [ -S /var/run/docker.sock ] && ! command -v docker >/dev/null 2>&1; then \
-                 command -v apk >/dev/null 2>&1 && apk add --no-cache docker-cli docker-cli-compose >/dev/null 2>&1; \
-                 command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq docker.io >/dev/null 2>&1; \
-             fi; \
-             exit 0"
-        );
-        let _ = self.exec_in(container_id, &script).await;
+    /// Host-machine hygiene before an agent works (the platform never
+    /// INSTALLS anything on the user's machine — the manifest probe right
+    /// after reports what is really there): strip any legacy
+    /// `x-access-token` insteadOf rewrite from the old shared-PAT era so
+    /// push/pull go through the machine's own gh credential helper, and set a
+    /// git identity ONLY when the user has none (their real config wins —
+    /// commits carry the user's identity, per the one-machine-one-identity
+    /// rule). Best-effort and silent.
+    async fn ensure_tools(&self, agent: &str) {
+        let script =
+            "command -v git >/dev/null 2>&1 && { git config --global --get-regexp '^url\\..*\\.insteadof$' 2>/dev/null | while IFS=' ' read -r k _v; do case \"$k\" in *x-access-token*) git config --global --unset-all \"$k\" >/dev/null 2>&1 || true;; esac; done; true; }; \
+             command -v git >/dev/null 2>&1 && { git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
+                 git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }; \
+             exit 0";
+        let _ = self.exec_in(agent, script).await;
     }
 
-    /// Probe what is really installed in the container (one exec: presence +
+    /// Probe what is really installed on the machine (one exec: presence +
     /// version for every probed tool, plus gh's auth state) and render the
     /// tool-belt section for the system prompt: verified tools with versions,
     /// and — just as important — the probed tools that are MISSING, so the
-    /// model never invents capabilities the box doesn't have.
-    async fn tools_manifest(&self, container_id: &str) -> Option<String> {
+    /// model never invents capabilities the machine doesn't have.
+    async fn tools_manifest(&self, agent: &str) -> Option<String> {
         let probes = PROBED_TOOLS.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(" ");
         let script = format!(
             "for c in {probes}; do \
@@ -939,7 +895,7 @@ impl App {
              done; \
              command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo 'gh_auth|1' || echo 'gh_auth|'"
         );
-        let (code, out) = self.exec_in(container_id, &script).await.ok()?;
+        let (code, out) = self.exec_in(agent, &script).await.ok()?;
         if code != 0 { return None; }
         let (mut have, mut missing, mut gh_authed) = (Vec::new(), Vec::new(), false);
         for line in out.lines() {
@@ -955,7 +911,7 @@ impl App {
         }
         if have.is_empty() { return None; }
         let mut md = String::from(
-            "\n\n## Your Linux box — tools verified as INSTALLED (use these; for anything else check `command -v <tool>` first)\n",
+            "\n\n## Your machine (macOS host) — tools verified as INSTALLED (use these; for anything else check `command -v <tool>` first)\n",
         );
         for (name, version, hint) in &have {
             let note = if name == "gh" && gh_authed {
@@ -965,7 +921,7 @@ impl App {
         }
         if !missing.is_empty() {
             let list = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
-            md.push_str(&format!("\nNOT installed on this box — do NOT use or assume them: {list}\n"));
+            md.push_str(&format!("\nNOT installed on this machine — do NOT use or assume them: {list}\n"));
         }
         if !gh_authed && have.iter().any(|(n, _, _)| n == "gh") {
             md.push_str("\nGitHub auth: no token registered — public repos and local work are fine; private repos will fail until one is set in Settings → Git Access.\n");
@@ -1118,8 +1074,8 @@ fn json_ok(v: Value) -> Response {
     Json(v).into_response()
 }
 
-async fn health(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "status": "healthy", "docker": app.docker.is_some() }))
+async fn health(State(_app): State<App>) -> Json<Value> {
+    Json(json!({ "status": "healthy", "mode": "host", "tmux": hostexec::tmux_available() }))
 }
 
 async fn list_providers() -> Json<Value> {
@@ -1232,20 +1188,21 @@ struct ListQuery {
     all: bool,
 }
 
-async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap, Query(q): Query<ListQuery>) -> ApiResult {
+/// GET /containers — synthetic rows for host agents: the persisted registry
+/// (every agent ever started) plus any live agent-* session not yet known.
+/// `?all=true` is accepted and ignored (there is only one machine).
+async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q): Query<ListQuery>) -> ApiResult {
     app.require_auth(&headers)?;
-    // Default: only containers managed by this platform. ?all=true returns everything on the host.
-    let mut builder = ListContainersOptionsBuilder::new().all(true);
-    if !q.all {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-        builder = builder.filters(&filters);
+    let mut names: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.agents.iter().cloned().collect()
+    };
+    for s in hostexec::list_sessions().await {
+        if s.starts_with("agent-") && !names.contains(&s) {
+            names.push(s);
+        }
     }
-    let opts = builder.build();
-    let list = app.docker()?
-        .list_containers(Some(opts))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    names.sort();
 
     let (paused, last_activity) = {
         let store = app.store.lock().unwrap();
@@ -1254,24 +1211,26 @@ async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap,
     let now = now_secs();
 
     let mut rows = Vec::new();
-    for c in list {
-        let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-        // exited + registered = platform-paused (manual or idle sweeper)
-        let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into());
+    for name in names {
+        let role = hostexec::role_of(&name).to_string();
+        let alive = hostexec::session_alive(&name).await;
+        // not alive + registered in paused.json = platform-paused (manual or idle sweeper)
+        let paused_info = if alive { None } else { paused.get(&name) };
+        let status = match paused_info {
+            Some(_) => "paused",
+            None if alive => "running",
+            None => "exited",
+        };
         let mut row = json!({
-            "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
+            "id": name,
             "name": name,
-            "status": &status,
-            "image": c.image.clone().unwrap_or_else(|| "unknown".into()),
-            "labels": c.labels.clone().unwrap_or_default(),
+            "status": status,
+            "image": "host",
+            "labels": { "role": role },
         });
-        if status == "exited" {
-            if let Some(p) = paused.get(&name) {
-                status = "paused".into();
-                row["status"] = json!("paused");
-                row["paused_since"] = json!(p.since);
-                row["auto_paused"] = json!(p.auto);
-            }
+        if let Some(p) = paused_info {
+            row["paused_since"] = json!(p.since);
+            row["auto_paused"] = json!(p.auto);
         }
         if status == "running" {
             let last = last_activity.get(&name).copied().unwrap_or(now);
@@ -1282,121 +1241,73 @@ async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap,
     Ok(json_ok(Value::Array(rows)))
 }
 
+/// POST /containers — start a host agent: register it and ensure its tmux
+/// session. Image/command fields are accepted and ignored (the "box" is this
+/// machine with its real tools).
 async fn create_container(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ContainerCreate>) -> ApiResult {
     app.require_auth(&headers)?;
-    let image = req.image.unwrap_or_else(|| app.store.lock().unwrap().config.default_image.clone());
-    let mut labels = HashMap::new();
-    labels.insert("role".to_string(), req.role.clone());
-    labels.insert(MANAGED_LABEL.to_string(), MANAGED_VALUE.to_string());
-
-    let cmd = req.command.clone().or_else(|| {
-        if image.starts_with("alpine") {
-            Some(vec!["sh".to_string(), "-c".to_string(), "sleep infinity".to_string()])
-        } else {
-            None
-        }
-    });
-
-    let config = Config {
-        image: Some(image),
-        labels: Some(labels),
-        env: Some(vec![format!("ROLE={}", req.role)]),
-        cmd,
-        host_config: Some(bollard::models::HostConfig {
-            network_mode: Some(AGENT_NETWORK.to_string()),
-            // docker.sock: the deploy stage runs `docker compose up` from inside
-            // an agent container against the HOST daemon (accepted risk: single-
-            // user platform, the orchestrator already holds the full socket).
-            binds: Some(vec![
-                format!("{WORKSPACE_VOLUME}:/workspace"),
-                "/var/run/docker.sock:/var/run/docker.sock".to_string(),
-            ]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let docker = app.docker()?;
-    let created = docker.create_container(Some(CreateContainerOptions { name: req.name.clone(), platform: None }), config)
+    let name = req.name.trim().to_string();
+    if name.is_empty() || req.role.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name and role are required"));
+    }
+    hostexec::ensure_session(&name)
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    docker.start_container(&created.id, None::<StartContainerOptions>)
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    app.touch_activity(&req.name);
-    let inspect = app.inspect(&created.id).await?;
-
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    app.register_agent(&name);
+    app.touch_activity(&name);
     Ok(json_ok(json!({
-        "id": created.id.chars().take(12).collect::<String>(),
-        "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "status": App::status_of(&inspect),
+        "id": name,
+        "name": name,
+        "status": "running",
     })))
 }
 
+/// POST /containers/{ident}/{action} — lifecycle on tmux semantics:
+/// start/resume = ensure the session; stop = kill it (user stop); pause =
+/// kill it AND register as platform-paused; restart = kill + ensure.
 async fn container_action(State(app): State<App>, headers: axum::http::HeaderMap, Path((ident, action)): Path<(String, String)>) -> ApiResult {
     app.require_auth(&headers)?;
-    let docker = app.docker()?;
-    let managed = app.inspect_managed(&ident).await?;
-    let id = managed.id.clone().unwrap_or_default();
-    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    let result: Result<(), bollard::errors::Error> = match action.as_str() {
-        "start" => {
-            let r = docker.start_container(&id, None::<StartContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+    let name = app.resolve_agent(&ident).await?;
+    let action_status = |s: &str| json!({ "id": name, "name": name, "status": s });
+    match action.as_str() {
+        "start" | "resume" => {
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("running")))
         }
+        // A user stop must never keep rendering as platform-paused.
         "stop" => {
-            // A user stop must never keep rendering as platform-paused.
-            let r = docker.stop_container(&id, None::<StopContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+            hostexec::kill_session(&name).await;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("exited")))
         }
         "restart" => {
-            let r = docker.restart_container(&id, None::<RestartContainerOptions>).await;
-            if r.is_ok() { app.clear_paused(&name); }
-            r
+            hostexec::kill_session(&name).await;
+            hostexec::ensure_session(&name).await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+            app.clear_paused(&name);
+            Ok(json_ok(action_status("running")))
         }
+        // Platform pause = kill the session + a registry entry so the UI can
+        // tell it apart from a user stop (and the sweeper's transparent
+        // revive still applies).
         "pause" => {
-            // Platform pause = real docker stop (frees RAM on the host) + a
-            // registry entry so the UI can tell it apart from a user stop.
-            return match docker.stop_container(&id, None::<StopContainerOptions>).await {
-                Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {
-                    app.mark_paused(&name, false);
-                    Ok(json_ok(json!({
-                        "id": id.chars().take(12).collect::<String>(),
-                        "name": name,
-                        "status": "paused",
-                    })))
-                }
-                Err(e) => Err(err(StatusCode::BAD_REQUEST, e.to_string())),
-            };
+            hostexec::kill_session(&name).await;
+            app.mark_paused(&name, false);
+            Ok(json_ok(action_status("paused")))
         }
-        "resume" => {
-            if !app.resume_paused(&id, &name).await {
-                return Err(err(StatusCode::BAD_REQUEST, "could not resume container"));
-            }
-            Ok(())
-        }
-        other => return Err(err(StatusCode::NOT_FOUND, format!("Unknown action '{other}'"))),
-    };
-    result.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let inspect = app.inspect(&id).await?;
-    Ok(json_ok(json!({
-        "id": id.chars().take(12).collect::<String>(),
-        "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "status": App::status_of(&inspect),
-    })))
+        other => Err(err(StatusCode::NOT_FOUND, format!("Unknown action '{other}'"))),
+    }
 }
 
+/// DELETE /containers/{ident} — kill the session and unregister the agent.
+/// The shared workspace is NEVER touched: deliverables and the cloned repo
+/// outlive every agent.
 async fn delete_container(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let id = managed.id.clone().unwrap_or_default();
-    let name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    app.docker()?
-        .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = app.resolve_agent(&ident).await?;
+    hostexec::kill_session(&name).await;
     {
         let mut store = app.store.lock().unwrap();
         if store.paused.remove(&name).is_some() {
@@ -1404,18 +1315,22 @@ async fn delete_container(State(app): State<App>, headers: axum::http::HeaderMap
         }
         store.last_activity.remove(&name);
     }
+    app.unregister_agent(&name);
     Ok(json_ok(json!({ "id": ident, "status": "deleted" })))
 }
 
 async fn exec_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.ensure_running(&ident).await?;
-    let (exit_code, output) = app.exec_in(managed.id.as_deref().unwrap_or_default(), &req.command).await?;
+    let name = app.ensure_running(&ident).await?;
+    let (exit_code, output) = app.exec_in(&name, &req.command).await?;
     Ok(json_ok(json!({ "exit_code": exit_code, "output": output })))
 }
 
 // ---------------------------------------------------------------------------
-// Interactive terminal — WebSocket ↔ Docker exec TTY bridge
+// Interactive terminal — WebSocket ↔ host PTY, attached to the agent's tmux
+// session through a private grouped session (windows are shared with the
+// base session, so web terminals — several at once — and the user's own
+// `tmux attach` all watch the same agent without fighting over it)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1438,104 +1353,114 @@ async fn terminal_ws(
             return (StatusCode::UNAUTHORIZED, "Login required").into_response();
         }
     }
-    let managed = match app.ensure_running(&ident).await {
-        Ok(m) => m,
+    let agent = match app.ensure_running(&ident).await {
+        Ok(n) => n,
         Err(e) => return e.into_response(),
     };
-    let container_id = managed.id.unwrap_or_default();
-    let container_name = managed.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
     let initial = (params.cols.unwrap_or(80), params.rows.unwrap_or(24));
-    ws.on_upgrade(move |socket| terminal_session(app, socket, container_id, container_name, initial))
+    ws.on_upgrade(move |socket| terminal_session(app, socket, agent, initial))
 }
 
-/// Pick the best interactive shell available inside the container.
-async fn pick_shell(app: &App, container_id: &str) -> &'static str {
-    if let Ok((_, out)) = app.exec_in(container_id, "command -v bash").await {
-        if out.trim().contains("bash") {
-            return "/bin/bash";
-        }
-    }
-    "/bin/sh"
-}
+/// Bridge a browser terminal to a real PTY running the tmux attach. Binary
+/// frames carry terminal bytes both ways; text frames are control messages
+/// (`{"resize":{"cols":n,"rows":r}}`). Every browser frame counts as agent
+/// activity so the idle sweeper leaves live sessions alone.
+async fn terminal_session(app: App, mut socket: WebSocket, agent: String, (cols, rows): (u16, u16)) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
 
-/// Bridge a browser terminal to a real PTY-backed shell via `docker exec`.
-/// Binary frames carry terminal bytes both ways; text frames are control
-/// messages (`{"resize":{"cols":n,"rows":r}}`). Every browser frame counts
-/// as container activity so the idle sweeper leaves live sessions alone.
-async fn terminal_session(app: App, socket: WebSocket, container_id: String, container_name: String, (cols, rows): (u16, u16)) {
-    let mut socket = socket;
-    let docker = match app.docker() {
-        Ok(d) => d.clone(),
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }) {
+        Ok(p) => p,
         Err(e) => {
-            let _ = socket.send(Message::Text(format!("docker unavailable: {}\r\n", e.1).into())).await;
+            let _ = socket.send(Message::Text(format!("pty open failed: {e}\r\n").into())).await;
             return;
         }
     };
 
-    let shell = pick_shell(&app, &container_id).await;
-    let exec = match docker.create_exec(&container_id, CreateExecOptions::<&str> {
-        cmd: Some(vec![shell, "-l"]),
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        tty: Some(true),
-        // DISPLAY=:1 — GUI apps typed into the web terminal (e.g. chromium)
-        // open on the container's VNC desktop instead of dying displayless.
-        env: Some(vec!["TERM=xterm-256color", "DISPLAY=:1"]),
-        ..Default::default()
-    }).await {
-        Ok(e) => e,
+    let group = format!("aap-web-{}", app.seq.fetch_add(1, Ordering::SeqCst));
+    let mut cmd = if hostexec::tmux_available() {
+        if let Err(e) = hostexec::ensure_session(&agent).await {
+            let _ = socket.send(Message::Text(format!("agent session unavailable: {e}\r\n").into())).await;
+            return;
+        }
+        let mut cmd = CommandBuilder::new("tmux");
+        for a in hostexec::attach_argv(&agent, &group) {
+            cmd.arg(a);
+        }
+        cmd
+    } else {
+        // headless fallback — a plain shell in the shared workspace
+        let mut cmd = CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()));
+        cmd.cwd(hostexec::workspace_dir());
+        cmd
+    };
+    cmd.env("TERM", "xterm-256color");
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
         Err(e) => {
-            let _ = socket.send(Message::Text(format!("failed to start shell: {e}\r\n").into())).await;
+            let _ = socket.send(Message::Text(format!("failed to start attach: {e}\r\n").into())).await;
+            return;
+        }
+    };
+    drop(pair.slave);
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("pty reader failed: {e}\r\n").into())).await;
+            return;
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("pty writer failed: {e}\r\n").into())).await;
             return;
         }
     };
 
-    let (mut input, output) = match docker.start_exec(&exec.id, None).await {
-        Ok(StartExecResults::Attached { input, output }) => (input, output),
-        Ok(_) => {
-            let _ = socket.send(Message::Text("shell detached unexpectedly\r\n".into())).await;
-            return;
+    // PTY → browser: blocking reads on a plain thread, forwarded over a channel
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        Err(e) => {
-            let _ = socket.send(Message::Text(format!("failed to attach shell: {e}\r\n").into())).await;
-            return;
-        }
-    };
-
-    // Match the PTY to the browser terminal size before the first prompt renders
-    let _ = docker.resize_exec(&exec.id, ResizeExecOptions { width: cols, height: rows }).await;
-
+    });
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let exec_id = exec.id.clone();
-
-    // Container → browser
     let pump = tokio::spawn(async move {
-        let mut output = output;
-        while let Some(Ok(frame)) = output.next().await {
-            if ws_tx.send(Message::Binary(frame.into_bytes().into())).await.is_err() {
+        while let Some(chunk) = rx.recv().await {
+            if ws_tx.send(Message::Binary(chunk.into())).await.is_err() {
                 break;
             }
         }
-        // Shell exited — close the socket so the UI can offer reconnect
+        // attach exited — close the socket so the UI can offer reconnect
         let _ = ws_tx.send(Message::Close(None)).await;
     });
 
-    // Browser → container
+    // Browser → PTY
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Binary(data) => {
-                app.touch_activity(&container_name);
-                if input.write_all(&data).await.is_err() {
+                app.touch_activity(&agent);
+                if writer.write_all(&data).is_err() {
                     break;
                 }
-                let _ = input.flush().await;
+                let _ = writer.flush();
             }
             Message::Text(txt) => {
                 if let Some(sz) = serde_json::from_str::<Value>(txt.as_str()).ok().and_then(|v| v.get("resize").cloned()) {
                     let c = sz.get("cols").and_then(|x| x.as_u64()).unwrap_or(80) as u16;
                     let r = sz.get("rows").and_then(|x| x.as_u64()).unwrap_or(24) as u16;
-                    let _ = docker.resize_exec(&exec_id, ResizeExecOptions { width: c, height: r }).await;
+                    let _ = pair.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
                 }
             }
             Message::Close(_) => break,
@@ -1543,48 +1468,23 @@ async fn terminal_session(app: App, socket: WebSocket, container_id: String, con
         }
     }
     pump.abort();
-    let _ = input.shutdown().await;
+    let _ = child.kill();
+    hostexec::kill_session(&group).await;
 }
 
 // ---------------------------------------------------------------------------
 // Handlers — stats / inspect / files
 // ---------------------------------------------------------------------------
 
+/// GET /containers/{ident}/stats — host agents have no per-cgroup numbers;
+/// the honest equivalents: derived status (+paused overlay) and the shared
+/// workspace's real disk usage. cpu/mem/net are null and the UI renders "—".
 async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
-    let id = inspect.id.clone().unwrap_or_default();
-    let opts = StatsOptionsBuilder::new().stream(false).build();
-    let mut stream = app.docker()?.stats(&id, Some(opts));
-    let stats = stream.next().await
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "no stats"))?
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = app.resolve_agent(&ident).await?;
 
-    let zero = bollard::models::ContainerCpuStats::default();
-    let zero_usage = bollard::models::ContainerCpuUsage::default();
-    let cpu = stats.cpu_stats.as_ref().unwrap_or(&zero);
-    let pre = stats.precpu_stats.as_ref().unwrap_or(&zero);
-    let cpu_total = cpu.cpu_usage.as_ref().unwrap_or(&zero_usage).total_usage.unwrap_or(0) as f64;
-    let pre_total = pre.cpu_usage.as_ref().unwrap_or(&zero_usage).total_usage.unwrap_or(0) as f64;
-    let cpu_delta = cpu_total - pre_total;
-    let sys_delta = cpu.system_cpu_usage.unwrap_or(0) as f64 - pre.system_cpu_usage.unwrap_or(0) as f64;
-    let online = cpu.online_cpus
-        .map(|n| n as f64)
-        .or_else(|| cpu.cpu_usage.as_ref().unwrap_or(&zero_usage).percpu_usage.as_ref().map(|v| v.len() as f64))
-        .unwrap_or(1.0)
-        .max(1.0);
-    let cpu_percent = if sys_delta > 0.0 { (cpu_delta / sys_delta) * online * 100.0 } else { 0.0 };
-
-    let mem = stats.memory_stats.clone().unwrap_or_default();
-    let mem_used = mem.usage.unwrap_or(0);
-    let mem_limit = mem.limit.unwrap_or(0);
-    let (net_rx, net_tx) = stats.networks.as_ref()
-        .map(|nws| nws.values().fold((0u64, 0u64), |(rx, tx), n| (rx + n.rx_bytes.unwrap_or(0), tx + n.tx_bytes.unwrap_or(0))))
-        .unwrap_or((0, 0));
-
-    // Disk size of the container's root fs — `df` runs INSIDE so overlays/volumes
-    // report what the agent actually sees. Best-effort: null when exec fails (stopped).
-    let (disk_used, disk_total) = match app.exec_in(&id, "df -P / | tail -1").await {
+    let ws = hostexec::workspace_str();
+    let (disk_used, disk_total) = match app.exec_in(&name, &format!("df -P '{ws}' | tail -1")).await {
         Ok((0, out)) => {
             let f: Vec<&str> = out.split_whitespace().collect();
             match (f.get(1).and_then(|s| s.parse::<u64>().ok()), f.get(2).and_then(|s| s.parse::<u64>().ok())) {
@@ -1596,27 +1496,25 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
         _ => (Value::Null, Value::Null),
     };
 
-    // exited + registered = platform-paused; the detail page's stats poll
-    // uses this field to keep its status badge in sync (sweeper, auto-resume).
-    let name = inspect.name.clone().unwrap_or_default().trim_start_matches('/').to_string();
-    let mut status = App::status_of(&inspect);
+    // the detail page's stats poll uses this field to keep its status badge
+    // in sync (sweeper, transparent revive)
+    let status = app.agent_state(&name).await;
     let mut paused_since = Value::Null;
     let mut auto_paused = Value::Null;
-    if status == "exited" {
+    if status == "paused" {
         let store = app.store.lock().unwrap();
         if let Some(p) = store.paused.get(&name) {
-            status = "paused".into();
             paused_since = json!(p.since);
             auto_paused = json!(p.auto);
         }
     }
 
     Ok(json_ok(json!({
-        "cpu_percent": (cpu_percent * 100.0).round() / 100.0,
-        "mem_used": mem_used,
-        "mem_limit": mem_limit,
-        "net_rx": net_rx,
-        "net_tx": net_tx,
+        "cpu_percent": Value::Null,
+        "mem_used": Value::Null,
+        "mem_limit": Value::Null,
+        "net_rx": Value::Null,
+        "net_tx": Value::Null,
         "disk_used": disk_used,
         "disk_total": disk_total,
         "status": status,
@@ -1625,42 +1523,21 @@ async fn container_stats(State(app): State<App>, headers: axum::http::HeaderMap,
     })))
 }
 
+/// GET /containers/{ident}/inspect — minimal synthetic view of a host agent.
 async fn container_inspect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let c = app.inspect(&ident).await?;
-    let empty = HashMap::new();
-    let labels = c.config.as_ref().and_then(|cfg| cfg.labels.as_ref()).unwrap_or(&empty);
-    let networks = c.network_settings.as_ref().and_then(|ns| ns.networks.clone()).unwrap_or_default();
-
-    let nets: Vec<Value> = networks.iter().map(|(name, n)| {
-        let mut ips: Vec<String> = n.ipam_config.as_ref().into_iter()
-            .filter_map(|ipam| ipam.ipv4_address.clone().or_else(|| ipam.ipv6_address.clone()))
-            .collect();
-        if let Some(ip) = &n.ip_address { if !ip.is_empty() { ips.push(ip.clone()); } }
-        ips.retain(|s| !s.is_empty());
-        json!({
-            "name": name,
-            "ip": ips,
-            "aliases": n.aliases.clone().unwrap_or_default().into_iter().filter(|a| !a.is_empty()).collect::<Vec<_>>(),
-        })
-    }).collect();
-
-    let restart_policy = c.host_config.as_ref()
-        .and_then(|h| h.restart_policy.as_ref())
-        .and_then(|p| p.name.as_ref())
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "no".into());
-
+    let name = app.resolve_agent(&ident).await?;
+    let status = app.agent_state(&name).await;
     Ok(json_ok(json!({
-        "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
-        "name": c.name.clone().unwrap_or_default().trim_start_matches('/'),
-        "image": c.config.as_ref().and_then(|cfg| cfg.image.clone()).unwrap_or_default(),
-        "created": c.created.as_ref().map(|d| d.to_string()).unwrap_or_default(),
-        "state": c.state.as_ref().and_then(|s| s.status.as_ref()).map(|s| s.to_string()).unwrap_or_default(),
-        "started_at": c.state.as_ref().and_then(|s| s.started_at.as_ref()).map(|d| d.to_string()).unwrap_or_default(),
-        "restart_policy": restart_policy,
-        "labels": labels,
-        "networks": nets,
+        "id": name,
+        "name": name,
+        "image": "host",
+        "created": "",
+        "state": status,
+        "started_at": "",
+        "restart_policy": "no",
+        "labels": { "role": hostexec::role_of(&name) },
+        "networks": [],
     })))
 }
 
@@ -1670,17 +1547,17 @@ struct FilesQuery {
     path: String,
 }
 
-fn default_files_path() -> String { "/workspace".into() }
+fn default_files_path() -> String { hostexec::workspace_str() }
 
 async fn container_files(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Query(q): Query<FilesQuery>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
-    let status = App::status_of(&inspect);
+    let name = app.resolve_agent(&ident).await?;
+    let status = app.agent_state(&name).await;
     if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
+        return Err(err(StatusCode::BAD_REQUEST, format!("Agent is not running (status: {status})")));
     }
     let cmd = format!("ls -la {} 2>&1 || ls -la /", q.path);
-    let (_, output) = app.exec_in(inspect.id.as_deref().unwrap_or_default(), &cmd).await?;
+    let (_, output) = app.exec_in(&name, &cmd).await?;
     Ok(json_ok(json!({ "path": q.path, "output": output })))
 }
 
@@ -1736,13 +1613,9 @@ fn parse_gh_login(output: &str) -> Option<String> {
 /// Probe a container's GitHub connector state via exec, cached for
 /// CONNECTOR_CACHE_TTL so the UI's 5s polls don't exec every container
 /// constantly. States: connected (+login) / disconnected / unavailable
-/// (no gh binary in the image, or container not running).
-async fn github_connector_status(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> CachedConnectorStatus {
-    let container_id = inspect.id.clone().unwrap_or_default();
-    if App::status_of(inspect) != "running" {
-        return CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("container not running".into()), at: now_secs() };
-    }
-    let cache_key = format!("{container_id}:github");
+/// (no gh binary on the machine).
+async fn github_connector_status(app: &App, name: &str) -> CachedConnectorStatus {
+    let cache_key = format!("{name}:github");
     {
         let store = app.store.lock().unwrap();
         if let Some(c) = store.connector_cache.get(&cache_key) {
@@ -1754,12 +1627,12 @@ async fn github_connector_status(app: &App, inspect: &bollard::models::Container
     // One round trip: 127 = no gh binary; 0 = logged in (parse the account);
     // anything else = gh present but not logged in. Note: no GH_TOKEN-style env
     // must ever ride this exec — it would mask the stored credential.
-    let (code, output) = match app.exec_in(&container_id, "command -v gh >/dev/null 2>&1 || exit 127; gh auth status --hostname github.com").await {
+    let (code, output) = match app.exec_in(name, "command -v gh >/dev/null 2>&1 || exit 127; gh auth status --hostname github.com").await {
         Ok(r) => r,
         Err(_) => (127, String::new()),
     };
     let status = if code == 127 {
-        CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("no gh CLI in this image — use the agent-base image".into()), at: now_secs() }
+        CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("gh CLI not installed on this machine — brew install gh".into()), at: now_secs() }
     } else if code == 0 {
         CachedConnectorStatus { state: "connected".into(), login: parse_gh_login(&output), reason: None, at: now_secs() }
     } else {
@@ -1769,17 +1642,12 @@ async fn github_connector_status(app: &App, inspect: &bollard::models::Container
     status
 }
 
-/// Probe a container's Figma connector state. Figma has no CLI whose login we
-/// could ask about — the token file in the container's home IS the credential
-/// store, so the probe is a single file check (plus the handle written next to
-/// it at connect time). It works on any image, so "unavailable" here only
-/// means the container itself is not running.
-async fn figma_connector_status(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> CachedConnectorStatus {
-    let container_id = inspect.id.clone().unwrap_or_default();
-    if App::status_of(inspect) != "running" {
-        return CachedConnectorStatus { state: "unavailable".into(), login: None, reason: Some("container not running".into()), at: now_secs() };
-    }
-    let cache_key = format!("{container_id}:figma");
+/// Probe the machine's Figma connector state. Figma has no CLI whose login we
+/// could ask about — the token file in the user's home IS the credential
+/// store, so the probe is a single file check (plus the handle written next
+/// to it at connect time).
+async fn figma_connector_status(app: &App, name: &str) -> CachedConnectorStatus {
+    let cache_key = format!("{name}:figma");
     {
         let store = app.store.lock().unwrap();
         if let Some(c) = store.connector_cache.get(&cache_key) {
@@ -1789,9 +1657,9 @@ async fn figma_connector_status(app: &App, inspect: &bollard::models::ContainerI
         }
     }
     // 0 = token file present (stdout = saved handle); anything else = not
-    // connected. A docker/exec failure also lands in "disconnected" — the
-    // container is the source of truth and the next poll re-derives it.
-    let (code, output) = match app.exec_in(&container_id,
+    // connected. An exec failure also lands in "disconnected" — the machine
+    // is the source of truth and the next poll re-derives it.
+    let (code, output) = match app.exec_in(name,
         r#"[ -f "$HOME/.config/figma/token" ] || exit 1; cat "$HOME/.config/figma/user" 2>/dev/null"#,
     ).await {
         Ok(r) => r,
@@ -1816,13 +1684,12 @@ fn connector_json(ctype: &str, status: &CachedConnectorStatus) -> Value {
     })
 }
 
-/// Current GitHub connector state for one container. An active device flow
-/// wins over the probe so a refreshed dialog can resume with its user code.
-async fn github_state_json(app: &App, inspect: &bollard::models::ContainerInspectResponse) -> Value {
-    let container_id = inspect.id.clone().unwrap_or_default();
+/// Current GitHub connector state for one agent. An active device flow wins
+/// over the probe so a refreshed dialog can resume with its user code.
+async fn github_state_json(app: &App, name: &str) -> Value {
     let pending = {
         let store = app.store.lock().unwrap();
-        store.pending_device_flows.get(&container_id)
+        store.pending_device_flows.get(name)
             .filter(|f| f.expires_at > now_secs())
             .map(|f| json!({
                 "type": "github", "state": "pending", "login": null, "reason": null,
@@ -1831,59 +1698,47 @@ async fn github_state_json(app: &App, inspect: &bollard::models::ContainerInspec
     };
     match pending {
         Some(v) => v,
-        None => connector_json("github", &github_connector_status(app, inspect).await),
+        None => connector_json("github", &github_connector_status(app, name).await),
     }
 }
 
-/// GET /containers/{ident}/connectors — per-connector state for one container.
+/// GET /containers/{ident}/connectors — per-connector state for one agent.
 async fn container_connectors(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let inspect = app.inspect(&ident).await?;
+    let name = app.resolve_agent(&ident).await?;
     Ok(json_ok(json!([
-        github_state_json(&app, &inspect).await,
-        connector_json("figma", &figma_connector_status(&app, &inspect).await),
+        github_state_json(&app, &name).await,
+        connector_json("figma", &figma_connector_status(&app, &name).await),
     ])))
 }
 
-/// GET /connectors/status — every managed container × its connector states,
+/// GET /connectors/status — every registered agent × its connector states,
 /// for the connectors overview page.
 async fn connectors_status(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
     app.require_auth(&headers)?;
-    let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-    let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-    let list = app.docker()?
-        .list_containers(Some(opts))
-        .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut names: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.agents.iter().cloned().collect()
+    };
+    for s in hostexec::list_sessions().await {
+        if s.starts_with("agent-") && !names.contains(&s) {
+            names.push(s);
+        }
+    }
+    names.sort();
 
     let mut rows = Vec::new();
-    for c in list {
-        let id = c.id.clone().unwrap_or_default();
-        let state = c.state.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into());
-        let (github, figma) = if state != "running" {
-            (
-                json!({ "type": "github", "state": "unavailable", "login": null, "reason": "container not running" }),
-                json!({ "type": "figma", "state": "unavailable", "login": null, "reason": "container not running" }),
-            )
-        } else {
-            match app.inspect(&id).await {
-                Ok(inspect) => (
-                    github_state_json(&app, &inspect).await,
-                    connector_json("figma", &figma_connector_status(&app, &inspect).await),
-                ),
-                Err(_) => (
-                    json!({ "type": "github", "state": "unavailable", "login": null, "reason": "inspect failed" }),
-                    json!({ "type": "figma", "state": "unavailable", "login": null, "reason": "inspect failed" }),
-                ),
-            }
-        };
+    for name in names {
+        let (github, figma) = (
+            github_state_json(&app, &name).await,
+            connector_json("figma", &figma_connector_status(&app, &name).await),
+        );
         rows.push(json!({
-            "id": id.chars().take(12).collect::<String>(),
-            "name": c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default(),
-            "status": state,
-            "image": c.image.clone().unwrap_or_default(),
-            "role": c.labels.as_ref().and_then(|l| l.get("role").cloned()).unwrap_or_default(),
+            "id": name,
+            "name": name,
+            "status": app.agent_state(&name).await,
+            "image": "host",
+            "role": hostexec::role_of(&name),
             "connectors": [github, figma],
         }));
     }
@@ -1895,20 +1750,15 @@ async fn connectors_status(State(app): State<App>, headers: axum::http::HeaderMa
 /// once the user approves, is injected by the spawned poll task.
 async fn github_connect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
 
-    // gh binary present? (agent-base ships it; bare alpine does not)
-    let (gh_ok, _) = app.exec_in(&container_id, "command -v gh >/dev/null 2>&1").await?;
+    // gh binary present on this machine?
+    let (gh_ok, _) = app.exec_in(&name, "command -v gh >/dev/null 2>&1").await?;
     if gh_ok != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not found in this container — create it from the agent-base image to connect GitHub"));
+        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not installed on this machine — brew install gh to connect GitHub"));
     }
 
-    let (user_code, verification_url, expires_in) = start_github_device_flow(&app, &container_id).await?;
+    let (user_code, verification_url, expires_in) = start_github_device_flow(&app, &name).await?;
     Ok(json_ok(json!({ "user_code": user_code, "verification_url": verification_url, "expires_in": expires_in })))
 }
 
@@ -2104,27 +1954,23 @@ async fn poll_github_device_flow(app: App, container_id: String) {
 }
 
 /// POST /containers/{ident}/connectors/github/disconnect — remove gh
-/// credentials from the container (best-effort, from inside the box).
+/// credentials from this MACHINE (best-effort). One machine = one identity:
+/// this logs the whole team out, which is exactly the per-machine semantics.
 async fn github_disconnect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     // `gh auth logout` prompts for confirmation and aborts without a TTY —
     // pipe "y" AND remove the credential file directly so the logout is real
     // either way. Best-effort: the trailing `true` makes the exit code 0.
-    let (_, output) = app.exec_in(&container_id,
+    let (_, output) = app.exec_in(&name,
         r#"printf 'y\n' | gh auth logout --hostname github.com 2>/dev/null; rm -f "$HOME/.config/gh/hosts.yml"; git config --global --unset credential.https://github.com.helper 2>/dev/null; true"#
     ).await?;
     {
         let mut store = app.store.lock().unwrap();
         // also drop any in-flight device flow: approving its code after a
-        // disconnect must NOT silently re-login the container
-        store.pending_device_flows.remove(&container_id);
-        store.connector_cache.remove(format!("{container_id}:github").as_str());
+        // disconnect must NOT silently re-login the machine
+        store.pending_device_flows.remove(&name);
+        store.connector_cache.remove(format!("{name}:github").as_str());
     }
     Ok(json_ok(json!({ "type": "github", "state": "disconnected", "output": output })))
 }
@@ -2137,38 +1983,29 @@ async fn github_disconnect(State(app): State<App>, headers: axum::http::HeaderMa
 /// what git push needs.
 async fn github_connect_token(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, axum::Json(body): axum::Json<TokenAuthBody>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
-    let (gh_ok, _) = app.exec_in(&container_id, "command -v gh >/dev/null 2>&1").await?;
+    let name = app.resolve_agent(&ident).await?;
+    let (gh_ok, _) = app.exec_in(&name, "command -v gh >/dev/null 2>&1").await?;
     if gh_ok != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not found in this container — create it from the agent-base image to connect GitHub"));
+        return Err(err(StatusCode::BAD_REQUEST, "gh CLI not installed on this machine — brew install gh to connect GitHub"));
     }
     let token = body.token.trim();
     if token.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Token is required"));
     }
-    let login = inject_github_token(&app, &container_id, token).await?;
+    let login = inject_github_token(&app, &name, token).await?;
     Ok(json_ok(json!({ "type": "github", "state": "connected", "login": login })))
 }
 
 /// POST /containers/{ident}/connectors/figma/connect-token — Figma only has
 /// one auth method here: a personal access token (Figma account → Settings →
 /// Security → Personal access tokens). Validated against /v1/me, then written
-/// into the container as ~/.config/figma/token (+ FIGMA_TOKEN exported in the
-/// shell profiles) so any shell or agent in the box can call the REST API.
-/// The token rides the exec ENV — never the command string, Store, or logs.
+/// into the user's real ~/.config/figma/token (+ FIGMA_TOKEN exported in the
+/// shell profiles) so any shell or agent on the machine can call the REST
+/// API. The token rides the exec script env — never the command string,
+/// Store, or logs.
 async fn figma_connect_token(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, axum::Json(body): axum::Json<TokenAuthBody>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     let token = body.token.trim();
     if token.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Token is required"));
@@ -2194,12 +2031,12 @@ async fn figma_connect_token(State(app): State<App>, headers: axum::http::Header
     // Write token + handle into ~/.config/figma, and export FIGMA_TOKEN from
     // the token file in both shell profiles (idempotent — one line max).
     let script = r#"mkdir -p "$HOME/.config/figma" && printf %s "$FIGMA_AUTH_TOKEN" > "$HOME/.config/figma/token" && printf %s "$FIGMA_AUTH_USER" > "$HOME/.config/figma/user" && line='export FIGMA_TOKEN="$(cat "$HOME/.config/figma/token" 2>/dev/null)"' && { grep -q 'FIGMA_TOKEN' "$HOME/.profile" 2>/dev/null || echo "$line" >> "$HOME/.profile"; } && { grep -q 'FIGMA_TOKEN' "$HOME/.bashrc" 2>/dev/null || echo "$line" >> "$HOME/.bashrc"; }"#;
-    let (code, _) = app.exec_in_env(&container_id, script, vec![
+    let (code, _) = app.exec_in_env(&name, script, vec![
         format!("FIGMA_AUTH_TOKEN={token}"),
         format!("FIGMA_AUTH_USER={handle}"),
     ]).await?;
 
-    let cache_key = format!("{container_id}:figma");
+    let cache_key = format!("{name}:figma");
     let mut store = app.store.lock().unwrap();
     if code == 0 {
         store.connector_cache.insert(cache_key, CachedConnectorStatus {
@@ -2211,56 +2048,42 @@ async fn figma_connect_token(State(app): State<App>, headers: axum::http::Header
         Ok(json_ok(json!({ "type": "figma", "state": "connected", "login": handle })))
     } else {
         store.connector_cache.remove(cache_key.as_str());
-        Err(err(StatusCode::BAD_GATEWAY, "Failed to write the token into the container"))
+        Err(err(StatusCode::BAD_GATEWAY, "Failed to write the token onto this machine"))
     }
 }
 
 /// POST /containers/{ident}/connectors/figma/disconnect — remove the token
-/// files and the profile exports from the container (best-effort).
+/// files and the profile exports (best-effort). BSD sed needs the explicit
+/// empty backup suffix on macOS.
 async fn figma_disconnect(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
-    let (_, output) = app.exec_in(&container_id,
-        r#"rm -rf "$HOME/.config/figma"; sed -i '/FIGMA_TOKEN/d' "$HOME/.profile" "$HOME/.bashrc" 2>/dev/null; true"#
+    let name = app.resolve_agent(&ident).await?;
+    let (_, output) = app.exec_in(&name,
+        r#"rm -rf "$HOME/.config/figma"; sed -i '' '/FIGMA_TOKEN/d' "$HOME/.profile" "$HOME/.bashrc" 2>/dev/null; true"#
     ).await?;
-    app.store.lock().unwrap().connector_cache.remove(format!("{container_id}:figma").as_str());
+    app.store.lock().unwrap().connector_cache.remove(format!("{name}:figma").as_str());
     Ok(json_ok(json!({ "type": "figma", "state": "disconnected", "output": output })))
 }
 
 /// POST /containers/{ident}/connectors/github/open-browser — open the device
-/// verification URL in the container's own desktop browser (agent-base runs
-/// Xvnc on :1), so the login happens "on that machine" like the user wants.
+/// verification URL in the user's REAL browser (macOS `open`), so the login
+/// happens "on this machine" like the user wants.
 async fn github_open_browser(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.inspect_managed(&ident).await?;
-    let status = App::status_of(&managed);
-    if status != "running" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Container is not running (status: {status})")));
-    }
-    let container_id = managed.id.clone().unwrap_or_default();
+    let name = app.resolve_agent(&ident).await?;
     // URL comes from the stored pending flow — never from client input
     let url = {
         let store = app.store.lock().unwrap();
-        store.pending_device_flows.get(&container_id)
+        store.pending_device_flows.get(&name)
             .filter(|f| f.expires_at > now_secs())
             .map(|f| f.verification_url.clone())
     };
     let Some(url) = url else {
         return Err(err(StatusCode::BAD_REQUEST, "No active GitHub login flow — click Connect first"));
     };
-    // chromium as root needs --no-sandbox; launched detached (&) so the exec
-    // returns immediately instead of waiting for the browser to exit.
-    let script = format!(
-        r#"command -v chromium >/dev/null 2>&1 || exit 127; (chromium --no-sandbox --no-first-run --disable-dev-shm-usage '{url}' >/dev/null 2>&1 &)"#
-    );
-    let (code, _) = app.exec_in_env(&container_id, &script, vec!["DISPLAY=:1".to_string()]).await?;
+    let (code, _) = app.exec_in(&name, &format!("command -v open >/dev/null 2>&1 || exit 127; open '{url}'")).await?;
     if code != 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "No chromium browser in this container — open the URL on any browser instead"));
+        return Err(err(StatusCode::BAD_REQUEST, "could not open the browser on this machine — open the URL manually instead"));
     }
     Ok(json_ok(json!({ "opened": true, "url": url })))
 }
@@ -2271,15 +2094,12 @@ async fn github_open_browser(State(app): State<App>, headers: axum::http::Header
 
 async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, Path(ident): Path<String>, Json(req): Json<CommandRequest>) -> ApiResult {
     app.require_auth(&headers)?;
-    let managed = app.ensure_running(&ident).await?;
+    let agent = app.ensure_running(&ident).await?;
 
-    let role_label = managed.config.as_ref()
-        .and_then(|c| c.labels.as_ref())
-        .and_then(|l| l.get("role").cloned())
-        .unwrap_or_default();
+    let role_label = hostexec::role_of(&agent).to_string();
     let persona = app.store.lock().unwrap().personas.iter().find(|p| p.role == role_label).cloned();
     let base_prompt = persona.as_ref().map(|p| p.rules_md.clone())
-        .unwrap_or_else(|| "You are a capable autonomous Linux agent.".into());
+        .unwrap_or_else(|| "You are a capable autonomous agent working in the user's macOS shell.".into());
     let model = match app.model_for_persona(persona.as_ref()) {
         Some(m) => m,
         None => return Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
@@ -2293,19 +2113,18 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
         return Ok(json_ok(json!({ "mode": "consult", "role": role_label, "model": model, "reply": reply })));
     }
 
-    // Bot-on-a-Linux-box rule: every command runs inside this container, and
-    // the project repo is cloned into /workspace BEFORE any work — then all
-    // file/code work goes through that repo working tree only. First the
-    // default tool belt is ensured and probed, so the model is told what this
-    // box really has (and what it does NOT) instead of guessing.
-    let container_id = managed.id.clone().unwrap_or_default();
-    app.ensure_tools(&container_id).await;
-    let tools_md = app.tools_manifest(&container_id).await.unwrap_or_default();
+    // Bot-on-this-machine rule: every command runs on the host, and the
+    // project repo is cloned into the shared workspace BEFORE any work — then
+    // all file/code work goes through that repo working tree only. First the
+    // tool belt is probed, so the model is told what this machine really has
+    // (and what it does NOT) instead of guessing.
+    app.ensure_tools(&agent).await;
+    let tools_md = app.tools_manifest(&agent).await.unwrap_or_default();
     let repo_url = app.repo_for_role(&role_label);
     let (repo_path, repo_warning) = if repo_url.is_empty() {
         (None, None)
     } else {
-        match app.ensure_repo(&container_id, &repo_url).await {
+        match app.ensure_repo(&agent, &repo_url).await {
             Ok(path) => (Some(path), None),
             // one clone failure must not brick commands that don't touch the repo
             Err(e) => (None, Some(e.1)),
@@ -2314,12 +2133,20 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
 
     let repo_rules = match &repo_path {
         Some(p) => format!(
-            " The project repository is already cloned in this container at {p} — it is your working directory. Run ALL file and code work through that repo working tree ONLY (never clone, copy or recreate it elsewhere)."
+            " The project repository is already cloned on this machine at {p} — it is your working directory. Run ALL file and code work through that repo working tree ONLY (never clone, copy or recreate it elsewhere)."
         ),
         None => String::new(),
     };
+    // The project's document space, refreshed into the shared workspace — this
+    // mode runs real bash, so the agent can open those files itself on demand.
+    let docs_line = {
+        let store = app.store.lock().unwrap();
+        store.projects.iter().find(|p| p.agents.iter().any(|a| a == &role_label))
+            .map(|p| prepare_project_docs(&store, &p.id).1)
+            .unwrap_or_default()
+    };
     let system = format!(
-        "{base_prompt}\n\nYou are operating inside a Linux container (Ubuntu/Alpine, sh shell) as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe sh command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo). GUI apps you launch (browser, editors) open on this machine's VNC desktop (DISPLAY=:1) — the user watches them live in the VNC view, so prefer a visible browser window over headless whenever the point is to show or verify something.{tools_md}{repo_rules}"
+        "{base_prompt}\n\nYou are operating in the user's macOS shell (bash) on their Mac as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe bash command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo). Anything you launch with `open` (URLs, files) appears visibly on the user's screen.{tools_md}{repo_rules}{docs_line}"
     );
     let reply = app.llm(&model, &system, &req.command).await?;
     let command = reply.trim().trim_matches('`').lines().last().unwrap_or("").trim().to_string();
@@ -2331,7 +2158,7 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
         Some(p) => format!("cd '{p}' 2>/dev/null; {command}"),
         None => command.clone(),
     };
-    let (exit_code, output) = app.exec_in(&container_id, &exec_command).await?;
+    let (exit_code, output) = app.exec_in(&agent, &exec_command).await?;
     Ok(json_ok(json!({
         "mode": "execute", "role": role_label, "model": model, "reply": reply,
         "command": command, "exit_code": exit_code, "output": output,
@@ -2352,29 +2179,22 @@ async fn list_agents(State(app): State<App>, headers: axum::http::HeaderMap) -> 
         (store.personas.clone(), pid, dm)
     };
     let mut running: HashMap<String, Value> = HashMap::new();
-    if let Some(docker) = app.docker.as_ref() {
-        let paused = app.store.lock().unwrap().paused.clone();
-        let opts = ListContainersOptionsBuilder::new().all(true).build();
-        if let Ok(list) = docker.list_containers(Some(opts)).await {
-            for c in list {
-                let labels = c.labels.clone().unwrap_or_default();
-                if labels.get(MANAGED_LABEL).map(|v| v == MANAGED_VALUE).unwrap_or(false) {
-                    if let Some(role) = labels.get("role") {
-                        if personas.iter().any(|p| &p.role == role) {
-                            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-                            // exited + registered = platform-paused (manual or idle sweeper)
-                            let mut status = c.state.as_ref().map(|s| s.to_string()).unwrap_or_default();
-                            if status == "exited" && paused.contains_key(&name) {
-                                status = "paused".into();
-                            }
-                            running.insert(role.clone(), json!({
-                                "name": name,
-                                "status": status,
-                                "id": c.id.as_deref().map(|i| i.chars().take(12).collect::<String>()).unwrap_or_default(),
-                            }));
-                        }
-                    }
-                }
+    {
+        let registered: Vec<String> = app.store.lock().unwrap().agents.iter().cloned().collect();
+        let mut names = registered;
+        for s in hostexec::list_sessions().await {
+            if s.starts_with("agent-") && !names.contains(&s) {
+                names.push(s);
+            }
+        }
+        for name in names {
+            let role = hostexec::role_of(&name).to_string();
+            if personas.iter().any(|p| p.role == role) {
+                running.insert(role, json!({
+                    "name": name,
+                    "status": app.agent_state(&name).await,
+                    "id": name,
+                }));
             }
         }
     }
@@ -2448,38 +2268,16 @@ async fn start_agent(State(app): State<App>, headers: axum::http::HeaderMap, Pat
             return Err(err(StatusCode::NOT_FOUND, format!("Unknown role '{role}'. Available: {}", roles.join(", "))));
         }
     }
-    let name = body.map(|Json(b)| b.name).flatten().unwrap_or_else(|| format!("agent-{role}"));
-    // The container may already exist (stopped, or paused by the idle
-    // sweeper) — docker would 409 on re-creating the same name, so bring
-    // the existing one back up instead.
-    if let Some(docker) = app.docker.as_ref() {
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![
-            format!("{}={}", MANAGED_LABEL, MANAGED_VALUE),
-            format!("role={role}"),
-        ]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        if let Ok(list) = docker.list_containers(Some(opts)).await {
-            let existing = list.iter().find_map(|c| {
-                let cname = c.names.as_ref()?.first()?.trim_start_matches('/').to_string();
-                (cname == name).then(|| (c.id.clone().unwrap_or_default(), cname, c.state.as_ref().map(|s| s.to_string()).unwrap_or_default()))
-            });
-            if let Some((id, cname, state)) = existing {
-                if state != "running" {
-                    let _ = docker.start_container(&id, None::<StartContainerOptions>).await;
-                }
-                app.clear_paused(&cname);
-                let inspect = app.inspect(&id).await?;
-                return Ok(json_ok(json!({
-                    "id": id.chars().take(12).collect::<String>(),
-                    "name": inspect.name.clone().unwrap_or_default().trim_start_matches('/'),
-                    "status": App::status_of(&inspect),
-                })));
-            }
-        }
-    }
-    let req = ContainerCreate { name, role, image: None, command: None };
-    create_container(State(app), headers, Json(req)).await
+    let name = body.map(|Json(b)| b.name).flatten().unwrap_or_else(|| hostexec::session_name(&role));
+    // ensure the session (reviving a paused/stopped agent transparently),
+    // register it, done — idempotent, no 409-equivalent to dance around.
+    hostexec::ensure_session(&name)
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    app.register_agent(&name);
+    app.clear_paused(&name);
+    app.touch_activity(&name);
+    Ok(json_ok(json!({ "id": name, "name": name, "status": "running" })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2633,7 +2431,8 @@ async fn list_projects(State(app): State<App>, headers: axum::http::HeaderMap) -
     Ok(Json(app.store.lock().unwrap().projects.clone()))
 }
 
-async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) -> ApiResult {
+async fn create_project(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ProjectCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     store.project_counter += 1;
     let project = Project {
@@ -2646,6 +2445,7 @@ async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) 
         positions: HashMap::new(),
     };
     store.projects.push(project.clone());
+    save_projects(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(project).unwrap()))
 }
@@ -2658,7 +2458,8 @@ async fn get_project(State(app): State<App>, headers: axum::http::HeaderMap, Pat
     Ok(json_ok(serde_json::to_value(p).unwrap()))
 }
 
-async fn update_project(State(app): State<App>, Path(id): Path<String>, Json(req): Json<ProjectUpdate>) -> ApiResult {
+async fn update_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<ProjectUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     // Validate that every agent role exists as a persona (before mutable borrow)
     if let Some(agents) = &req.agents {
@@ -2678,11 +2479,13 @@ async fn update_project(State(app): State<App>, Path(id): Path<String>, Json(req
     if let Some(v) = req.links { p.links = v; }
     if let Some(v) = req.positions { p.positions = v; }
     let out = p.clone();
+    save_projects(&store);
     drop(store);
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_project(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+async fn delete_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.projects.len();
     store.projects.retain(|p| p.id != id);
@@ -2691,7 +2494,222 @@ async fn delete_project(State(app): State<App>, Path(id): Path<String>) -> ApiRe
     }
     // Runs of the deleted project are KEPT — they are the agents' work history
     // (agent detail shows them across projects, and /data/runs.json persists them).
+    // The document space is NOT: it dies with its project (rows, uploaded files
+    // and the materialized workspace copies all go).
+    let doc_ids: Vec<String> = store.docs.iter().filter(|d| d.project_id == id).map(|d| d.id.clone()).collect();
+    store.docs.retain(|d| d.project_id != id);
+    for did in &doc_ids {
+        let _ = std::fs::remove_dir_all(docs_files_dir().join(did));
+    }
+    let _ = std::fs::remove_dir_all(docs_workspace_dir(&id));
+    save_projects(&store);
+    save_docs(&store);
     Ok(json_ok(json!({ "deleted": id })))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers — project docs (the per-project document space)
+// ---------------------------------------------------------------------------
+
+/// docs of one project, sorted folder asc then newest-updated first
+fn project_docs_sorted(store: &Store, project_id: &str) -> Vec<ProjectDoc> {
+    let mut docs: Vec<ProjectDoc> = store.docs.iter().filter(|d| d.project_id == project_id).cloned().collect();
+    docs.sort_by(|a, b| a.folder.cmp(&b.folder).then(b.updated_at.cmp(&a.updated_at)));
+    docs
+}
+
+async fn list_docs(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let docs = {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+        project_docs_sorted(&store, &id)
+    };
+    Ok(json_ok(serde_json::to_value(&docs).unwrap()))
+}
+
+async fn create_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(req): Json<DocCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
+    if req.title.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Document title is required"));
+    }
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    store.doc_counter += 1;
+    let now = now_secs();
+    let doc = ProjectDoc {
+        id: format!("d-{:03}", store.doc_counter),
+        project_id: id,
+        folder: if req.folder.trim().is_empty() { "General".into() } else { req.folder.trim().to_string() },
+        title: req.title.trim().to_string(),
+        content_md: req.content_md,
+        file: None,
+        created_at: now,
+        updated_at: now,
+    };
+    store.docs.push(doc.clone());
+    save_docs(&store);
+    materialize_project_docs(&store, &doc.project_id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(doc).unwrap()))
+}
+
+async fn get_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>, Query(q): Query<DocQuery>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let doc = {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+        store.docs.iter().find(|d| d.id == doc_id && d.project_id == id).cloned()
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")))?
+    };
+    if q.raw.as_deref() != Some("1") {
+        return Ok(json_ok(serde_json::to_value(&doc).unwrap()));
+    }
+    // Raw download — auth is a header, so the web always blob-fetches this.
+    match &doc.file {
+        Some(f) => {
+            let path = docs_files_dir().join(&doc.id).join(&f.name);
+            let bytes = std::fs::read(&path)
+                .map_err(|_| err(StatusCode::NOT_FOUND, format!("File for document '{doc_id}' is missing on disk")))?;
+            Ok(Response::builder()
+                .header(header::CONTENT_TYPE, f.content_type.clone())
+                .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", safe_doc_name(&f.name)))
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(axum::body::Body::from(bytes))
+                .unwrap())
+        }
+        None => {
+            let body = doc.content_md.into_bytes();
+            Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
+                .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.md\"", safe_doc_name(&doc.title)))
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(axum::body::Body::from(body))
+                .unwrap())
+        }
+    }
+}
+
+async fn update_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>, Json(req): Json<DocUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    let doc = store.docs.iter_mut().find(|d| d.id == doc_id && d.project_id == id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")))?;
+    if let Some(v) = req.title { if !v.trim().is_empty() { doc.title = v.trim().to_string(); } }
+    if let Some(v) = req.folder { if !v.trim().is_empty() { doc.folder = v.trim().to_string(); } }
+    // Uploaded binaries are immutable — only the markdown body is editable.
+    if doc.file.is_none() {
+        if let Some(v) = req.content_md { doc.content_md = v; }
+    }
+    doc.updated_at = now_secs();
+    let out = doc.clone();
+    save_docs(&store);
+    materialize_project_docs(&store, &id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
+async fn delete_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path((id, doc_id)): Path<(String, String)>) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    if !store.projects.iter().any(|p| p.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+    }
+    let before = store.docs.len();
+    store.docs.retain(|d| !(d.id == doc_id && d.project_id == id));
+    if store.docs.len() == before {
+        return Err(err(StatusCode::NOT_FOUND, format!("Document '{doc_id}' not found")));
+    }
+    let _ = std::fs::remove_dir_all(docs_files_dir().join(&doc_id));
+    save_docs(&store);
+    materialize_project_docs(&store, &id);
+    drop(store);
+    Ok(json_ok(json!({ "deleted": doc_id })))
+}
+
+/// Multipart upload — `folder` (optional text field) + one `file` field.
+/// .md/.markdown/.txt land as editable markdown docs (AI-injectable content);
+/// everything else is stored as a binary attachment on disk.
+async fn upload_doc(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, mut multipart: Multipart) -> ApiResult {
+    app.require_auth(&headers)?;
+    {
+        let store = app.store.lock().unwrap();
+        if !store.projects.iter().any(|p| p.id == id) {
+            return Err(err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")));
+        }
+    }
+
+    let mut folder = String::new();
+    let mut file_field: Option<(String, String, Vec<u8>)> = None; // (name, content_type, bytes)
+    while let Some(field) = multipart.next_field().await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("Bad upload: {e}")))? {
+        match field.name().unwrap_or("") {
+            "folder" => {
+                folder = field.text().await.unwrap_or_default().trim().to_string();
+            }
+            _ => {
+                let Some(fname) = field.file_name().map(|s| s.to_string()) else { continue };
+                let ctype = field.content_type().unwrap_or("application/octet-stream").to_string();
+                let bytes = field.bytes().await
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("Could not read upload: {e}")))?;
+                if bytes.is_empty() {
+                    return Err(err(StatusCode::BAD_REQUEST, "Uploaded file is empty"));
+                }
+                if bytes.len() > DOC_UPLOAD_MAX_BYTES {
+                    return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "File too large (max 25 MB)"));
+                }
+                file_field = Some((fname, ctype, bytes.to_vec()));
+            }
+        }
+    }
+    let Some((fname, ctype, bytes)) = file_field else {
+        return Err(err(StatusCode::BAD_REQUEST, "No file in upload"));
+    };
+
+    let ext = std::path::Path::new(&fname).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_text = matches!(ext.as_str(), "md" | "markdown" | "txt");
+    let title = std::path::Path::new(&fname).file_stem().and_then(|s| s.to_str()).unwrap_or("document").to_string();
+
+    let mut store = app.store.lock().unwrap();
+    store.doc_counter += 1;
+    let now = now_secs();
+    let mut doc = ProjectDoc {
+        id: format!("d-{:03}", store.doc_counter),
+        project_id: id,
+        folder: if folder.is_empty() { "General".into() } else { folder },
+        title,
+        content_md: String::new(),
+        file: None,
+        created_at: now,
+        updated_at: now,
+    };
+    if is_text {
+        doc.content_md = String::from_utf8_lossy(&bytes).into_owned();
+    } else {
+        let safe = safe_doc_name(&fname);
+        let dir = docs_files_dir().join(&doc.id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the uploaded file"));
+        }
+        if std::fs::write(dir.join(&safe), &bytes).is_err() {
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the uploaded file"));
+        }
+        doc.file = Some(DocFile { name: safe, content_type: ctype, size: bytes.len() as u64 });
+    }
+    store.docs.push(doc.clone());
+    save_docs(&store);
+    materialize_project_docs(&store, &doc.project_id);
+    drop(store);
+    Ok(json_ok(serde_json::to_value(doc).unwrap()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2719,7 +2737,7 @@ fn now_secs() -> u64 {
 // (agent-data volume in compose; env DATA_DIR overrides, ./data as local fallback)
 // ---------------------------------------------------------------------------
 
-fn data_dir() -> std::path::PathBuf {
+pub(crate) fn data_dir() -> std::path::PathBuf {
     if let Ok(d) = std::env::var("DATA_DIR") {
         if !d.trim().is_empty() { return std::path::PathBuf::from(d); }
     }
@@ -2812,8 +2830,114 @@ fn load_runs(store: &mut Store) {
 }
 
 // ---------------------------------------------------------------------------
+// Projects persistence — /data/projects.json. Until now projects were seeded
+// fresh every boot; the document space made persistence mandatory (docs would
+// otherwise dangle on a restarted store), and the team builder benefits too.
+// ---------------------------------------------------------------------------
+
+fn projects_file() -> std::path::PathBuf {
+    data_dir().join("projects.json")
+}
+
+fn save_projects(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        projects: &'a [Project],
+        project_counter: usize,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { projects: &store.projects, project_counter: store.project_counter }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = projects_file();
+    let tmp = dir.join("projects.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist projects to {}", path.display());
+    }
+}
+
+/// Restore projects at boot. A missing/unreadable file keeps the seeded store
+/// (same behavior as before persistence existed). On success the seed project
+/// is replaced by what was persisted.
+fn load_projects(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        projects: Vec<Project>,
+        #[serde(default)]
+        project_counter: usize,
+    }
+    let Ok(raw) = std::fs::read_to_string(projects_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — keeping the seeded projects", projects_file().display());
+        return;
+    };
+    let max_id = parsed.projects.iter()
+        .filter_map(|p| p.id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.project_counter = store.project_counter.max(parsed.project_counter).max(max_id);
+    println!("restored {} project(s) from {}", parsed.projects.len(), projects_file().display());
+    store.projects = parsed.projects;
+}
+
+// ---------------------------------------------------------------------------
+// Docs persistence — the document space survives restarts as /data/docs.json
+// (markdown inline; uploaded binaries live under <data>/docs-files/<doc_id>/).
+// ---------------------------------------------------------------------------
+
+fn docs_file() -> std::path::PathBuf {
+    data_dir().join("docs.json")
+}
+
+fn docs_files_dir() -> std::path::PathBuf {
+    data_dir().join("docs-files")
+}
+
+fn save_docs(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        docs: &'a [ProjectDoc],
+        doc_counter: usize,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { docs: &store.docs, doc_counter: store.doc_counter }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = docs_file();
+    let tmp = dir.join("docs.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist docs to {}", path.display());
+    }
+}
+
+fn load_docs(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        docs: Vec<ProjectDoc>,
+        #[serde(default)]
+        doc_counter: usize,
+    }
+    let Ok(raw) = std::fs::read_to_string(docs_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — starting with an empty document space", docs_file().display());
+        return;
+    };
+    let max_id = parsed.docs.iter()
+        .filter_map(|d| d.id.strip_prefix("d-").and_then(|n| n.parse::<usize>().ok()))
+        .max().unwrap_or(0);
+    store.doc_counter = store.doc_counter.max(parsed.doc_counter).max(max_id);
+    println!("restored {} document(s) from {}", parsed.docs.len(), docs_file().display());
+    store.docs = parsed.docs;
+}
+
+// ---------------------------------------------------------------------------
 // Paused-container registry persistence — /data/paused.json, same atomic
-// tmp+rename write as the runs file. Docker labels can't record "paused",
+// tmp+rename write as the runs file. There is no container metadata to record "paused",
 // so this file is what keeps platform-paused containers distinguishable
 // from user-stopped ones across orchestrator restarts.
 // ---------------------------------------------------------------------------
@@ -2860,6 +2984,51 @@ fn load_paused(store: &mut Store) {
     store.paused = parsed.paused;
 }
 
+// ---------------------------------------------------------------------------
+// Agent registry persistence — /data/agents.json, same atomic tmp+rename
+// write as the other registries. tmux sessions are ephemeral; this file is
+// what keeps stopped agents visible (with a Start button) across restarts.
+// ---------------------------------------------------------------------------
+
+fn agents_file() -> std::path::PathBuf {
+    data_dir().join("agents.json")
+}
+
+fn save_agents(store: &Store) {
+    #[derive(Serialize)]
+    struct Persisted<'a> {
+        agents: &'a BTreeSet<String>,
+    }
+    let payload = match serde_json::to_string_pretty(&Persisted { agents: &store.agents }) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    let path = agents_file();
+    let tmp = dir.join("agents.json.tmp");
+    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
+        eprintln!("warning: could not persist agent registry to {}", path.display());
+    }
+}
+
+fn load_agents(store: &mut Store) {
+    #[derive(Deserialize)]
+    struct Persisted {
+        #[serde(default)]
+        agents: BTreeSet<String>,
+    }
+    let Ok(raw) = std::fs::read_to_string(agents_file()) else { return };
+    let Ok(parsed) = serde_json::from_str::<Persisted>(&raw) else {
+        eprintln!("warning: {} is unreadable — starting with an empty agent registry", agents_file().display());
+        return;
+    };
+    if !parsed.agents.is_empty() {
+        println!("restored {} agent(s) from {}", parsed.agents.len(), agents_file().display());
+    }
+    store.agents = parsed.agents;
+}
+
 /// Directory name for a cloned repo URL: last path segment, ".git" stripped,
 /// sanitized to safe filename chars ("repo" when nothing usable remains).
 fn repo_dir_name(repo_url: &str) -> String {
@@ -2871,24 +3040,25 @@ fn repo_dir_name(repo_url: &str) -> String {
     if cleaned.is_empty() { "repo".into() } else { cleaned }
 }
 
-/// Write a text deliverable into the agent's container workspace via a quoted heredoc.
-async fn write_deliverable(app: &App, container_id: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
+/// Write a text deliverable into the shared workspace via a quoted heredoc.
+async fn write_deliverable(app: &App, agent: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
     let clean = output.replace('\r', "");
-    let path = format!("/workspace/{run_id}-{role}.md");
+    let ws = hostexec::workspace_str();
+    let path = format!("{ws}/{run_id}-{role}.md");
     let script = format!(
-        "mkdir -p /workspace && cat > '{path}' << 'AAP_EOF_9Z'\n{clean}\nAAP_EOF_9Z\n",
+        "mkdir -p '{ws}' && cat > '{path}' << 'AAP_EOF_9Z'\n{clean}\nAAP_EOF_9Z\n",
     );
-    let (exit_code, out) = app.exec_in(container_id, &script).await?;
+    let (exit_code, out) = app.exec_in(agent, &script).await?;
     if exit_code != 0 {
         return Err(err(StatusCode::BAD_GATEWAY, format!("writing deliverable failed (exit {exit_code}): {out}")));
     }
     Ok(path)
 }
 
-/// Write FILES-block entries into the repo working tree inside the agent's
-/// container (mkdir -p + quoted heredoc — same pattern as write_deliverable;
+/// Write FILES-block entries into the repo working tree in the shared
+/// workspace (mkdir -p + quoted heredoc — same pattern as write_deliverable;
 /// paths were charset-guarded by parse_files). Returns how many files landed.
-async fn apply_files_to_repo(app: &App, container_id: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
+async fn apply_files_to_repo(app: &App, agent: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
     let mut applied = 0usize;
     for (path, content) in files {
         let dir = match path.rsplit_once('/').map(|(d, _)| d) {
@@ -2899,7 +3069,7 @@ async fn apply_files_to_repo(app: &App, container_id: &str, repo_path: &str, fil
             "mkdir -p '{repo_path}/{dir}' && cat > '{repo_path}/{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n",
             content.replace('\r', ""),
         );
-        let (code, out) = app.exec_in(container_id, &script).await.map_err(|e| e.1)?;
+        let (code, out) = app.exec_in(agent, &script).await.map_err(|e| e.1)?;
         if code != 0 {
             return Err(format!("writing {path} failed (exit {code}): {out}"));
         }
@@ -2944,12 +3114,6 @@ const HUMAN_TIMEOUT_SECS: u64 = 3600;
 /// Cap for the PR stage's in-mission GitHub device-flow wait (GitHub codes
 /// live ~900s; the wait ends with the earlier of the code's expiry and this).
 const DEVICE_AUTH_WAIT_CAP_SECS: u64 = 900;
-
-/// Host ports for the isolated staging compose project the deploy stage spins
-/// up — never the live 3000/8000, so a deploy can never restart the platform
-/// that is running the mission itself.
-const STAGING_WEB_PORT: &str = "13000";
-const STAGING_API_PORT: &str = "18000";
 
 /// Find a trailing "## ASK" block → (line index of the heading, addressed roles, question text).
 fn find_ask(output: &str) -> Option<(usize, Vec<String>, String)> {
@@ -3371,8 +3535,8 @@ async fn try_in_mission_github_auth(app: &App, run_id: &str, dev_role: &str, con
 }
 
 // ---------------------------------------------------------------------------
-// Tail stages — after QA verifies: a REAL pull request, a REAL isolated
-// staging deploy, then the PO acceptance demo session
+// Tail stages — after QA verifies: a REAL pull request, then the PO
+// acceptance demo session
 // ---------------------------------------------------------------------------
 
 /// What the PR stage actually achieved. `status` mirrors the step status
@@ -3390,21 +3554,8 @@ impl PrOutcome {
     }
 }
 
-/// Same for the staging deploy. `url` is the staging web URL when done.
-struct DeployOutcome { status: String, url: String, note: String }
-
-impl DeployOutcome {
-    fn describe(&self) -> String {
-        if self.status == "done" {
-            format!("Staging DEPLOYED: {} ({})", self.url, self.note)
-        } else {
-            format!("Staging deploy {}: {}", self.status, self.note)
-        }
-    }
-}
-
 /// Flip a tail step's status/output. Tail steps are found by role+kind — the
-/// same persona can own work/pr/deploy steps in one run.
+/// same persona can own work/pr/demo steps in one run.
 async fn step_transition(app: &App, run_id: &str, role: &str, kind: &str, status: &str, output: &str) {
     let mut store = app.store.lock().unwrap();
     if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
@@ -3418,7 +3569,7 @@ async fn step_transition(app: &App, run_id: &str, role: &str, kind: &str, status
     save_runs(&store);
 }
 
-/// Append the three tail steps (pr / deploy / demo) as pending, in execution order.
+/// Append the two tail steps (pr / demo) as pending, in execution order.
 async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &str) {
     let personas = app.store.lock().unwrap().personas.clone();
     let mut store = app.store.lock().unwrap();
@@ -3431,7 +3582,6 @@ async fn append_tail_steps(app: &App, run_id: &str, dev_role: &str, po_role: &st
             started_at: 0, finished_at: 0,
         };
         run.steps.push(mk(dev_role, "pr", "Open Pull Request"));
-        run.steps.push(mk(dev_role, "deploy", "Deploy Staging"));
         run.steps.push(mk(po_role, "demo", "Acceptance Demo"));
         save_runs(&store);
     }
@@ -3533,13 +3683,14 @@ async fn run_pr_stage(
     // missions/, PLUS any real code/design files the dev/UX agents applied
     // via their FILES blocks during the relay.
     let commit_msg = format!("mission {run_id}: team deliverables");
+    let ws = hostexec::workspace_str();
     let script = format!(
         "cd '{repo_path}' || exit 10; \
          git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
          git fetch --all --quiet >/dev/null 2>&1 || true; \
          git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
          mkdir -p 'missions/{run_id}'; \
-         cp /workspace/{run_id}-*.md 'missions/{run_id}/' 2>/dev/null || true; \
+         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
          git add -A; \
          git status --porcelain | head -30; \
          git commit -q -m '{commit_msg}' 2>/dev/null || echo NOTHING_TO_COMMIT; \
@@ -3548,7 +3699,7 @@ async fn run_pr_stage(
     let (code, out) = app.exec_in(&cid, &script).await
         .unwrap_or((-1, "exec failed".into()));
     if code == 10 {
-        let n = format!("repo path {repo_path} disappeared in the container");
+        let n = format!("repo path {repo_path} disappeared on this machine");
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -3559,7 +3710,7 @@ async fn run_pr_stage(
     }
     let committed = !out.contains("NOTHING_TO_COMMIT");
     if !committed {
-        let n = "nothing to commit — no deliverable files landed under /workspace and no code/design changes were applied to the repo this run (agents without containers write text-only deliverables; FILES blocks only apply for dev/UX roles with a repo)".to_string();
+        let n = "nothing to commit — no deliverable files landed in the shared workspace and no code/design changes were applied to the repo this run".to_string();
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -3595,7 +3746,7 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
         .unwrap_or((127, String::new()));
     if code != 0 {
         if code == 127 {
-            let n = "gh CLI not available in the dev container image — use the agent-base image to open PRs".to_string();
+            let n = "gh CLI not installed on this machine — brew install gh to open PRs".to_string();
             step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
             return skip(n);
         }
@@ -3653,89 +3804,6 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
     PrOutcome { status: "error".into(), url: String::new(), branch, note: n }
 }
 
-/// Real deploy: check out the mission branch and `docker compose up --build`
-/// an ISOLATED staging project (its own compose project name + remapped host
-/// ports) — the live stack running this mission is never touched.
-async fn run_deploy_stage(app: &App, run_id: &str, dev_role: &str, repo_url: &str, branch: &str) -> DeployOutcome {
-    let skip = |note: String| DeployOutcome { status: "skipped".into(), url: String::new(), note };
-    step_transition(app, run_id, dev_role, "deploy", "working", "").await;
-
-    let (cid, _cname) = match app.agent_container(dev_role).await {
-        Some(x) => x,
-        None => {
-            let n = format!("no running container for {dev_role} — start the agent first");
-            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-            return skip(n);
-        }
-    };
-    if repo_url.trim().is_empty() {
-        let n = "project has no git repo configured — nothing to deploy".to_string();
-        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-        return skip(n);
-    }
-    let repo_path = match app.ensure_repo(&cid, repo_url).await {
-        Ok(p) => p,
-        Err(e) => {
-            let n = format!("repo not available in the team workspace: {}", e.1);
-            step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-            return skip(n);
-        }
-    };
-    app.ensure_tools(&cid).await;
-
-    // One probe script with named outcomes — every gap is a skip, never a guess.
-    let probe = format!(
-        "cd '{repo_path}' || exit 10; \
-         git rev-parse --verify '{branch}' >/dev/null 2>&1 || {{ echo BRANCH_MISSING; exit 0; }}; \
-         [ -f docker-compose.yml ] || {{ echo NO_COMPOSE; exit 0; }}; \
-         [ -S /var/run/docker.sock ] || {{ echo NO_SOCKET; exit 0; }}; \
-         command -v docker >/dev/null 2>&1 || {{ echo NO_DOCKER_CLI; exit 0; }}; \
-         docker version >/dev/null 2>&1 || {{ echo NO_DAEMON; exit 0; }}; \
-         docker compose version >/dev/null 2>&1 || {{ echo NO_COMPOSE_PLUGIN; exit 0; }}; \
-         echo PROBE_OK"
-    );
-    let (code, out) = app.exec_in(&cid, &probe).await.unwrap_or((-1, "exec failed".into()));
-    let note = match (code, out.trim()) {
-        (10, _) => Some(format!("repo path {repo_path} disappeared in the container")),
-        (_, "BRANCH_MISSING") => Some(format!("no mission branch '{branch}' to deploy — the PR stage did not create it")),
-        (_, "NO_COMPOSE") => Some("repo has no docker-compose.yml at its root — nothing to stage".to_string()),
-        (_, "NO_SOCKET") => Some("no Docker socket mounted in the agent container — recreate the agent after upgrading the platform (docker.sock bind is not retroactive)".to_string()),
-        (_, "NO_DOCKER_CLI") => Some("docker CLI not available in the container and could not be installed".to_string()),
-        (_, "NO_DAEMON") => Some("docker CLI cannot reach the daemon through the mounted socket".to_string()),
-        (_, "NO_COMPOSE_PLUGIN") => Some("docker compose plugin not available in the container".to_string()),
-        _ => None,
-    };
-    if let Some(n) = note {
-        step_transition(app, run_id, dev_role, "deploy", "skipped", &n).await;
-        return skip(n);
-    }
-
-    // Staging compose file: sed-remapped FULL copy of the repo's compose file
-    // (a `-f` override would MERGE ports and collide with the live 3000/8000).
-    let dir = repo_dir_name(repo_url);
-    let staging_file = format!("/tmp/{dir}-staging-compose.yml");
-    let proj = format!("{dir}-staging");
-    let up = format!(
-        "cd '{repo_path}' && git checkout -q '{branch}' && \
-         sed -e 's/\"3000:3000\"/\"{STAGING_WEB_PORT}:3000\"/' -e 's/\"8000:8000\"/\"{STAGING_API_PORT}:8000\"/' docker-compose.yml > '{staging_file}' && \
-         docker compose -p '{proj}' --project-directory '{repo_path}' -f '{staging_file}' up --build -d 2>&1 | tail -25"
-    );
-    let (code, out) = app.exec_in(&cid, &up).await.unwrap_or((-1, "exec failed".into()));
-    let (_, ps_out) = app.exec_in(&cid, &format!("docker compose -p '{proj}' -f '{staging_file}' ps --status running --services 2>/dev/null")).await
-        .unwrap_or((-1, String::new()));
-    let services: Vec<&str> = ps_out.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-    if code == 0 && !services.is_empty() {
-        let url = format!("http://localhost:{STAGING_WEB_PORT}");
-        let note = format!("web :{STAGING_WEB_PORT} · api :{STAGING_API_PORT} · compose project `{proj}` · branch `{branch}` · running: {}", services.join(", "));
-        let report = format!("🚀 Staging deployed: {url}\n\n- API: http://localhost:{STAGING_API_PORT}\n- Isolated compose project `{proj}` from branch `{branch}` — the live stack was not touched\n- Running services: {}\n\n```\n{}\n```", services.join(", "), out.lines().take(25).collect::<Vec<_>>().join("\n"));
-        step_transition(app, run_id, dev_role, "deploy", "done", &report).await;
-        return DeployOutcome { status: "done".into(), url, note };
-    }
-    let n = format!("docker compose up failed (exit {code}): {}", one_line(&out, 400));
-    step_transition(app, run_id, dev_role, "deploy", "error", &n).await;
-    DeployOutcome { status: "error".into(), url: String::new(), note: n }
-}
-
 /// Push one message into a demo discussion (and clear the typing indicator).
 async fn demo_say(app: &App, run_id: &str, disc_id: &str, from: &str, text: &str) {
     let mut store = app.store.lock().unwrap();
@@ -3760,14 +3828,14 @@ async fn demo_answering(app: &App, run_id: &str, disc_id: &str, role: &str) {
 }
 
 /// The acceptance demo: a scripted meeting-kind discussion — QA presents the
-/// e2e evidence, the Dev presents the REAL PR/staging delivery, then the PO
-/// checks every acceptance criterion and issues the final VERDICT.
+/// e2e evidence, the Dev presents the REAL PR delivery, then the PO checks
+/// every acceptance criterion and issues the final VERDICT.
 async fn run_demo_session(
     app: &App, run_id: &str, task: &str, project_name: &str, dev_role: &str,
     qa: &(String, String, String, Option<String>),
     dev: &(String, String, String, Option<String>),
     po: &(String, String, String, Option<String>),
-    pr: &PrOutcome, deploy: &DeployOutcome,
+    pr: &PrOutcome,
 ) -> Option<Acceptance> {
     step_transition(app, run_id, "po", "demo", "working", "").await;
     {
@@ -3809,7 +3877,7 @@ async fn run_demo_session(
     };
 
     demo_say(app, run_id, &disc_id, "orchestrator",
-        "🎬 Demo รับมอบงาน — QA แสดงหลักฐานการทดสอบ, Dev ส่งมอบ PR/deploy จริง, แล้ว PO ตรวจนับ acceptance criteria ทีละข้อ").await;
+        "🎬 Demo รับมอบงาน — QA แสดงหลักฐานการทดสอบ, Dev ส่งมอบ PR จริง, แล้ว PO ตรวจนับ acceptance criteria ทีละข้อ").await;
 
     // QA presents the e2e evidence
     let (qname, _qt, qrules, qmodel) = qa;
@@ -3831,11 +3899,11 @@ Present concisely (≤180 words): what was verified, the concrete evidence from 
     demo_answering(app, run_id, &disc_id, dev_role).await;
     let dsys = format!(
         "{drules}\n\nYou are {dname} presenting the REAL delivery in the acceptance demo for the mission on '{project_name}'. \
-State what was shipped — branch, pull request, staging — using EXACTLY the facts given to you; never invent or alter URLs. ≤150 words, same language as the mission."
+State what was shipped — branch, pull request — using EXACTLY the facts given to you; never invent or alter URLs. ≤150 words, same language as the mission."
     );
     let duser = format!(
-        "## Mission\n{task}\n\n## Your real delivery (facts of record)\n- {}\n- {}\n\nPresent the delivery.",
-        pr.describe(), deploy.describe()
+        "## Mission\n{task}\n\n## Your real delivery (facts of record)\n- {}\n\nPresent the delivery.",
+        pr.describe()
     );
     let dev_msg = match dmodel.as_deref() {
         Some(m) => llm_retry(app, m, &dsys, &duser, 400).await
@@ -3845,7 +3913,7 @@ State what was shipped — branch, pull request, staging — using EXACTLY the f
     demo_say(app, run_id, &disc_id, dev_role, &dev_msg).await;
 
     // Machine-truth footer: exact URLs verbatim, regardless of LLM wording
-    let footer = format!("📦 delivery of record — PR: {} · Staging: {}", pr.describe(), deploy.describe());
+    let footer = format!("📦 delivery of record — PR: {}", pr.describe());
     demo_say(app, run_id, &disc_id, "orchestrator", &footer).await;
 
     // PO checks every acceptance criterion, then issues the verdict
@@ -3886,12 +3954,11 @@ Write the checks in the same language as the mission."
                 save_runs(&store);
             }
             let report = format!(
-                "{} Acceptance: {}\n\n{}\n\n---\n{}\n\n---\n{}",
+                "{} Acceptance: {}\n\n{}\n\n---\n{}",
                 if verdict == "pass" { "✅" } else { "❌" },
                 verdict.to_uppercase(),
                 summary,
-                pr.describe(),
-                deploy.describe()
+                pr.describe()
             );
             step_transition(app, run_id, "po", "demo", "done", &report).await;
             if let Some((cid, _)) = app.agent_container("po").await {
@@ -3980,10 +4047,10 @@ fn persona_of(app: &App, role: &str) -> (String, String, String, Option<String>)
     }
 }
 
-/// Clone/refresh the project repo into the shared /workspace volume through the
-/// FIRST running agent container. None = no agent container is running at all
-/// (the run proceeds text-only); Some(Err) = a container was there but the
-/// clone failed. Shared by the relay engine and single-step retry.
+/// Clone/refresh the project repo into the shared workspace directory through
+/// the FIRST agent's session. None = no agent could be started at all (the
+/// run proceeds text-only); Some(Err) = a session was there but the clone
+/// failed. Shared by the relay engine and single-step retry.
 async fn ensure_team_repo(app: &App, roles: &[String], repo_url: &str) -> Option<Result<String, ApiError>> {
     for role in roles {
         if let Some((cid, _)) = app.agent_container(role).await {
@@ -4001,18 +4068,141 @@ fn team_repo_line(repo_path: &Option<String>) -> String {
         .unwrap_or_default()
 }
 
+/// Where a project's documents are materialized for the agents, relative to
+/// the shared workspace root.
+fn docs_workspace_dir(project_id: &str) -> std::path::PathBuf {
+    hostexec::workspace_dir().join("project-docs").join(project_id)
+}
+
+/// Sanitize a title/filename into a safe single path component (no separators,
+/// quotes or control chars; bounded length; never empty).
+fn safe_doc_name(name: &str) -> String {
+    let cleaned: String = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '"' | '\'' | '`' | '\0'))
+        .take(80)
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() { "doc".into() } else { trimmed.to_string() }
+}
+
+/// Write every document of a project into the shared agent workspace:
+/// INDEX.md (grouped by folder) plus one file per doc (markdown inline,
+/// binaries copied from docs-files/). The directory is wiped first so deleted
+/// documents never linger as stale agent-visible files. Empty space → the
+/// directory is removed entirely. Best effort — a workspace hiccup must not
+/// fail the API call.
+fn materialize_project_docs(store: &Store, project_id: &str) -> Option<std::path::PathBuf> {
+    let docs = project_docs_sorted(store, project_id);
+    let dir = docs_workspace_dir(project_id);
+    if docs.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    if std::fs::remove_dir_all(&dir).is_err() && dir.exists() {
+        return None;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+
+    let project_name = store.projects.iter().find(|p| p.id == project_id).map(|p| p.name.clone()).unwrap_or_default();
+    let mut index = format!(
+        "# Project documents — {project_name} ({project_id})\n\n\
+         Materialized copies of the team's document space (requirements, specs, analysis).\n\
+         Markdown files carry the full content; binary files (PDF/docx/…) are stored as-is —\n\
+         relay teammates see them via the mission prompt only, an agent working in this\n\
+         workspace can open them directly.\n"
+    );
+    let mut written: Vec<(String, String, String)> = Vec::new(); // (folder, filename, title)
+    for doc in &docs {
+        let filename = match &doc.file {
+            Some(f) => format!("{}-{}", doc.id, safe_doc_name(&f.name)),
+            None => format!("{}-{}.md", doc.id, safe_doc_name(&doc.title)),
+        };
+        let path = dir.join(&filename);
+        let ok = match &doc.file {
+            Some(f) => std::fs::copy(docs_files_dir().join(&doc.id).join(&f.name), &path).is_ok(),
+            None => std::fs::write(&path, &doc.content_md).is_ok(),
+        };
+        if ok {
+            written.push((doc.folder.clone(), filename.clone(), doc.title.clone()));
+        }
+    }
+    let mut last_folder = String::new();
+    for (folder, filename, title) in &written {
+        if folder != &last_folder {
+            index.push_str(&format!("\n## {folder}\n"));
+            last_folder = folder.clone();
+        }
+        index.push_str(&format!("- `{filename}` — {title}\n"));
+    }
+    let _ = std::fs::write(dir.join("INDEX.md"), index);
+    Some(dir)
+}
+
+/// Materialize the project's documents and build the two prompt fragments:
+/// `(docs_section, docs_pointer_line)` — both empty when the space is empty.
+/// The section always carries the full index; markdown bodies follow until the
+/// total budget is spent (per-doc cap first, then the shared cap).
+fn prepare_project_docs(store: &Store, project_id: &str) -> (String, String) {
+    let docs = project_docs_sorted(store, project_id);
+    if docs.is_empty() {
+        return (String::new(), String::new());
+    }
+    let dir = materialize_project_docs(store, project_id);
+    let pointer = dir.as_deref().map(|d| format!(
+        " The team's document space (requirements/BA/SA specs) is materialized at {} — INDEX.md lists every document; consult them whenever your part touches the project's requirements or specs.",
+        d.display()
+    )).unwrap_or_default();
+
+    let mut section = format!(
+        "\n\n## Project documents\nThe team maintains a document space (PO/BA/SA and general documents). Read what is relevant to YOUR part before delivering.\n"
+    );
+    let mut last_folder = String::new();
+    for doc in &docs {
+        if doc.folder != last_folder {
+            section.push_str(&format!("\n### {}\n", doc.folder));
+            last_folder = doc.folder.clone();
+        }
+        match &doc.file {
+            Some(f) => section.push_str(&format!("- **{}** — uploaded file `{}` ({:.1} KB)\n", doc.title, f.name, f.size as f64 / 1024.0)),
+            None => section.push_str(&format!("- **{}**\n", doc.title)),
+        }
+    }
+    let mut budget = DOCS_INJECT_MAX_CHARS;
+    for doc in &docs {
+        if doc.file.is_some() || doc.content_md.trim().is_empty() { continue; }
+        if budget < 400 { break; }
+        section.push_str(&format!("\n#### {} — full content\n", doc.title));
+        let body: String = doc.content_md.chars().take(DOC_INJECT_MAX_CHARS).collect();
+        if doc.content_md.chars().count() > DOC_INJECT_MAX_CHARS {
+            section.push_str(&body);
+            section.push_str("\n[…truncated]\n");
+        } else {
+            section.push_str(&body);
+            section.push('\n');
+        }
+        budget = budget.saturating_sub(body.chars().count() + 64);
+    }
+    (section, pointer)
+}
+
 /// Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
 /// `files` = this teammate ships real repo artifacts (dev/UX with a repo) —
 /// their reply must end with a FILES block the orchestrator applies.
-fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, run_id: &str) -> String {
+fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, docs_line: &str, run_id: &str) -> String {
     let files_line = if files {
-        format!("\nYou work on the REAL repository (already checked out in your container). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
+        format!("\nYou work on the REAL repository (already checked out in the team workspace). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
     } else {
         String::new()
     };
     format!(
         "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request and deploys an isolated staging stack, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line} \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request with everything the team produced, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line}{docs_line} \
 Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
 Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
 Answer in the same language the task is written in. Keep it under ~450 words (the ## FILES section does not count toward the limit). \
@@ -4041,10 +4231,10 @@ async fn execute_run(app: App, run_id: String) {
         (run.project_name, run.project_id.clone(), run.task, run.steps.iter().map(|s| (s.role.clone(), s.name.clone(), s.title.clone())).collect::<Vec<_>>())
     };
 
-    // Bot-on-a-Linux-box rule, team edition: before the relay starts, the first
-    // running agent container clones the project repo into the shared
-    // /workspace volume — every teammate then works on that one real working
-    // tree, and all file changes go through the repo only.
+    // Bot-on-this-machine rule, team edition: before the relay starts, the
+    // first agent clones the project repo into the shared workspace — every
+    // teammate then works on that one real working tree, and all file changes
+    // go through the repo only.
     let repo_url = {
         let store = app.store.lock().unwrap();
         store.projects.iter().find(|p| p.id == project_id)
@@ -4065,6 +4255,13 @@ async fn execute_run(app: App, run_id: String) {
     };
     let repo_line = team_repo_line(&repo_path);
     let repo_note = repo_error.map(|e| format!("\n\n## Note from the orchestrator\nThe project repo could not be cloned into the team workspace ({e}) — deliver text deliverables only this run."));
+    // The project's document space, materialized into the workspace for this
+    // run — the section rides every relay prompt (budgeted), the pointer line
+    // sits in the system prompt.
+    let (docs_section, docs_line) = {
+        let store = app.store.lock().unwrap();
+        prepare_project_docs(&store, &project_id)
+    };
 
     // Register (or re-register) an ASK as a discussion; returns false when it targets no one.
     let raise_discussion = |from: &str, to: &[String], topic: &str, round: u32| -> bool {
@@ -4099,7 +4296,7 @@ async fn execute_run(app: App, run_id: String) {
             finish_run(&app, &run_id, "stopped");
             return;
         }
-        let (role, name, title) = (role.clone(), name.clone(), title.clone());
+        let (role, _name, title) = (role.clone(), name.clone(), title.clone());
         let (pname, _ptitle, rules, model) = persona_of(&app, &role);
 
         // step → working (records the model this step will run with, even if it later errors)
@@ -4132,12 +4329,12 @@ async fn execute_run(app: App, run_id: String) {
         // dev/UX teammates with a repo ship real files — their reply may carry a
         // FILES block, which needs a far larger completion budget than prose
         let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
-        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &run_id);
+        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &run_id);
         let first_note = repo_note.as_deref().unwrap_or("");
         let user = if handoff.is_empty() {
-            format!("## Task from the user\n{task}{first_note}\n\nYou are the first teammate to answer. Deliver your part.")
+            format!("## Task from the user\n{task}{first_note}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
         } else {
-            format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+            format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
         };
 
         let cap = if ships_files { 6000 } else { 1400 };
@@ -4323,7 +4520,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             }
             // a dev/UX asker may re-emit their FILES block with fixes applied
             let rev_files = repo_path.is_some() && (d.from.starts_with("dev") || d.from.starts_with("ux"));
-            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &run_id);
+            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &docs_line, &run_id);
             let user = format!(
                 "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words — re-emit the full \"## FILES\" section too if your files changed). If you are still blocked you may end with another \"## ASK\" section.",
                 d.topic,
@@ -4365,8 +4562,8 @@ A teammate raised a blocking question that needs your expertise. Answer directly
         }
     }
 
-    // ---- Tail: after QA verifies — the dev opens a REAL pull request, deploys
-    // a REAL isolated staging stack, then the PO runs the acceptance demo ----
+    // ---- Tail: after QA verifies — the dev opens a REAL pull request, then
+    // the PO runs the acceptance demo ----
     let tail_gate = {
         let store = app.store.lock().unwrap();
         store.runs.iter().find(|r| r.id == run_id).map(|run| {
@@ -4375,27 +4572,25 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 && roles.iter().any(|(r, _, _)| r == "po")
         }).unwrap_or(false)
     };
-    let mut tail: Option<(PrOutcome, DeployOutcome, Option<Acceptance>)> = None;
+    let mut tail: Option<(PrOutcome, Option<Acceptance>)> = None;
     if tail_gate {
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        // first dev role owns both PR and deploy — one branch, one working tree
+        // first dev role owns the PR — one branch, one working tree
         let dev_role = roles.iter().find(|(r, _, _)| r.starts_with("dev")).map(|(r, _, _)| r.clone()).unwrap();
         append_tail_steps(&app, &run_id, &dev_role, "po").await;
         let dev_persona = persona_of(&app, &dev_role);
         let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        let deploy = run_deploy_stage(&app, &run_id, &dev_role, &repo_url, &pr.branch).await;
-        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
         let qa_persona = persona_of(&app, "qa");
         let po_persona = persona_of(&app, "po");
         let acceptance = run_demo_session(&app, &run_id, &task, &project_name, &dev_role,
-            &qa_persona, &dev_persona, &po_persona, &pr, &deploy).await;
-        tail = Some((pr, deploy, acceptance));
+            &qa_persona, &dev_persona, &po_persona, &pr).await;
+        tail = Some((pr, acceptance));
     }
 
     // ---- PO closes the mission with one summary ----
     if roles.iter().any(|(r, _, _)| r == "po") {
-        let (pname, ptitle, prules, pmodel) = persona_of(&app, "po");
+        let (pname, _ptitle, prules, pmodel) = persona_of(&app, "po");
         let (deliverables, meetings) = {
             let store = app.store.lock().unwrap();
             let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
@@ -4410,9 +4605,9 @@ A teammate raised a blocking question that needs your expertise. Answer directly
 Write ONE tight summary (≤200 words) of what the team produced and what the meetings decided — decisions and outcomes only, same language as the mission."
         );
         let tail_line = match &tail {
-            Some((pr, deploy, acc)) => format!(
-                "\n\n## Real delivery\n- {}\n- {}\n\n## Acceptance verdict\n{}",
-                pr.describe(), deploy.describe(),
+            Some((pr, acc)) => format!(
+                "\n\n## Real delivery\n- {}\n\n## Acceptance verdict\n{}",
+                pr.describe(),
                 acc.as_ref().map(|a| format!("VERDICT: {} — {}", a.verdict.to_uppercase(), a.summary.chars().take(300).collect::<String>()))
                     .unwrap_or_else(|| "(the demo did not produce a verdict)".into())
             ),
@@ -4533,6 +4728,10 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
         }
     };
     let repo_line = team_repo_line(&repo_path);
+    let (docs_section, docs_line) = {
+        let store = app.store.lock().unwrap();
+        prepare_project_docs(&store, &project_id)
+    };
 
     match kind.as_str() {
         // One teammate's relay deliverable, rebuilt with the same handoff the
@@ -4560,11 +4759,11 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                 save_runs(&store);
             }
             let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
-            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &run_id);
+            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &docs_line, &run_id);
             let user = if handoff.is_empty() {
-                format!("## Task from the user\n{task}\n\nYou are the first teammate to answer. Deliver your part.")
+                format!("## Task from the user\n{task}{docs_section}\n\nYou are the first teammate to answer. Deliver your part.")
             } else {
-                format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+                format!("## Task from the user\n{task}{docs_section}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
             };
             let cap = if ships_files { 6000 } else { 1400 };
             let result = match model.as_deref() {
@@ -4593,26 +4792,21 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                 Err(e) => error_outcome(e.1),
             }
         }
-        // The three tail stages are self-contained: re-running one redoes the
-        // real git/docker/LLM work against the current workspace state.
+        // The two tail stages are self-contained: re-running one redoes the
+        // real git/LLM work against the current workspace state.
         "pr" => {
             let dev = persona_of(&app, &role);
             let _ = run_pr_stage(&app, &run_id, &role, &repo_url, &task, &project_name, &dev).await;
         }
-        "deploy" => {
-            // the mission branch IS the run id (see run_pr_stage)
-            let _ = run_deploy_stage(&app, &run_id, &role, &repo_url, &run_id).await;
-        }
         "demo" => {
-            // Rebuild the PR/deploy facts of record from the stored steps,
-            // then rerun the scripted demo session against them.
-            let (pr, deploy, dev_role) = {
+            // Rebuild the PR facts of record from the stored steps, then rerun
+            // the scripted demo session against them.
+            let (pr, dev_role) = {
                 let store = app.store.lock().unwrap();
                 let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
                 let dev_role = run.steps.iter().find(|s| s.kind == "pr" || (s.kind == "work" && s.role.starts_with("dev")))
                     .map(|s| s.role.clone()).unwrap_or_default();
                 let pr_step = run.steps.iter().find(|s| s.kind == "pr");
-                let deploy_step = run.steps.iter().find(|s| s.kind == "deploy");
                 let pr = PrOutcome {
                     status: pr_step.map(|s| if s.status == "done" { "done".to_string() } else { s.status.clone() })
                         .unwrap_or_else(|| "skipped".into()),
@@ -4620,15 +4814,7 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                     branch: run_id.clone(),
                     note: pr_step.filter(|s| s.status != "done").map(|s| one_line(&s.output, 160)).unwrap_or_default(),
                 };
-                let deploy = DeployOutcome {
-                    status: deploy_step.map(|s| if s.status == "done" { "done".to_string() } else { s.status.clone() })
-                        .unwrap_or_else(|| "skipped".into()),
-                    url: if deploy_step.map(|s| s.status == "done").unwrap_or(false) {
-                        format!("http://localhost:{STAGING_WEB_PORT}")
-                    } else { String::new() },
-                    note: deploy_step.filter(|s| s.status != "done").map(|s| one_line(&s.output, 160)).unwrap_or_default(),
-                };
-                (pr, deploy, dev_role)
+                (pr, dev_role)
             };
             if dev_role.is_empty() {
                 step_transition(&app, &run_id, "po", "demo", "error", "no dev role found in this run — cannot rerun the acceptance demo").await;
@@ -4636,7 +4822,7 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                 let qa = persona_of(&app, "qa");
                 let dev = persona_of(&app, &dev_role);
                 let po = persona_of(&app, "po");
-                let _ = run_demo_session(&app, &run_id, &task, &project_name, &dev_role, &qa, &dev, &po, &pr, &deploy).await;
+                let _ = run_demo_session(&app, &run_id, &task, &project_name, &dev_role, &qa, &dev, &po, &pr).await;
             }
         }
         _ => {}
@@ -4843,7 +5029,7 @@ async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, 
     let mut current: Option<Value> = None;
     for run in runs.iter().filter(|r| r.status == "running" || r.status == "waiting_human") {
         if !run.steps.iter().any(|s| s.role == role) { continue; }
-        // a tail stage in flight (pr/deploy/demo) is the more specific live step
+        // a tail stage in flight (pr/demo) is the more specific live step
         let step = run.steps.iter().find(|s| s.role == role && s.status == "working")
             .or_else(|| run.steps.iter().find(|s| s.role == role && s.kind == "work"))
             .or_else(|| run.steps.iter().find(|s| s.role == role))
@@ -4859,9 +5045,7 @@ async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, 
             let d = run.discussions.iter().find(|d| d.status == "need_human" && (d.from == role || d.to.iter().any(|t| t == &role)));
             ("waiting_human".to_string(), "ทีมรอคำตอบจากคุณอยู่".to_string(), d.map(|d| d.topic.clone()))
         } else if step.status == "working" && step.kind == "pr" {
-            ("working".to_string(), "กำลังเปิด Pull Request จริงใน container".to_string(), None)
-        } else if step.status == "working" && step.kind == "deploy" {
-            ("working".to_string(), "กำลัง deploy staging จริง (docker compose)".to_string(), None)
+            ("working".to_string(), "กำลังเปิด Pull Request จริง".to_string(), None)
         } else if step.status == "working" && step.kind == "demo" {
             ("working".to_string(), "กำลัง demo ตรวจรับหน้างานกับ PO".to_string(), None)
         } else if step.status == "working" {
@@ -4888,7 +5072,7 @@ async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, 
         break;
     }
 
-    // History: EVERY step this agent owns in every run (work + pr/deploy/demo), newest first.
+    // History: EVERY step this agent owns in every run (work + pr/demo), newest first.
     let mut history: Vec<Value> = runs.iter()
         .filter(|r| r.steps.iter().any(|s| s.role == role))
         .flat_map(|r| {
@@ -4970,14 +5154,6 @@ async fn logout(State(app): State<App>, Json(req): Json<AuthVerify>) -> Json<Val
     Json(json!({ "ok": true }))
 }
 
-async fn vnc_secret(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
-    // The VNC password equals ADMIN_PASSWORD (.env) so there is ONE secret.
-    // Only handed out to logged-in sessions — the web UI uses it to auto-auth noVNC.
-    app.require_auth(&headers)?;
-    let password = std::env::var("ADMIN_PASSWORD").unwrap_or_default();
-    Ok(json_ok(json!({ "password": password })))
-}
-
 async fn me(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
     let token = headers.get("x-session-token").and_then(|t| t.to_str().ok()).unwrap_or("");
     let store = app.store.lock().unwrap();
@@ -5016,67 +5192,58 @@ fn busy_roles(store: &Store) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Background loop: every IDLE_SWEEP_INTERVAL_SECS, stop managed running
-/// containers that have been idle longer than config.idle_timeout_secs and
-/// are not needed by any live run. Pausing = docker stop + registry entry —
-/// the RAM release is the point (docker pause would keep it allocated).
-/// A stop that races an incoming activity is benign by design: the next
-/// `agent_container` / `ensure_running` call revives the container (~2s).
+/// Background loop: every IDLE_SWEEP_INTERVAL_SECS, kill the tmux sessions of
+/// agents that have been idle longer than config.idle_timeout_secs and are
+/// not needed by any live run. An idle shell costs nothing, but the sweep
+/// still kills stray long-running processes left in an agent's windows and
+/// keeps the paused/running state machine (and the UI) meaningful. Pausing =
+/// kill session + registry entry. A kill that races an incoming activity is
+/// benign by design: the next `agent_container` / `ensure_running` call
+/// recreates the session instantly.
 async fn idle_sweeper(app: App) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(IDLE_SWEEP_INTERVAL_SECS));
     loop {
         tick.tick().await;
-        let Some(docker) = app.docker.as_ref().cloned() else { continue };
         let (enabled, idle_after) = {
             let store = app.store.lock().unwrap();
             (store.config.auto_pause_enabled, store.config.idle_timeout_secs)
         };
         if !enabled || idle_after == 0 { continue; }
 
-        let (busy, registered) = {
+        let busy = {
             let store = app.store.lock().unwrap();
-            (busy_roles(&store), store.paused.keys().cloned().collect::<std::collections::HashSet<String>>())
+            busy_roles(&store)
         };
 
-        let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("{}={}", MANAGED_LABEL, MANAGED_VALUE)]);
-        filters.insert("status".to_string(), vec!["running".to_string()]);
-        let opts = ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        let Ok(list) = docker.list_containers(Some(opts)).await else { continue };
+        let sessions: Vec<String> = hostexec::list_sessions().await
+            .into_iter().filter(|s| s.starts_with("agent-")).collect();
 
-        // Reconcile: a registry entry whose container is running again (someone
+        // Reconcile: a registry entry whose session is alive again (someone
         // raced the sweeper with a start/resume) is stale — drop it.
         {
             let mut store = app.store.lock().unwrap();
             let mut changed = false;
-            for c in &list {
-                let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-                if store.paused.remove(&name).is_some() { changed = true; }
+            for name in &sessions {
+                if store.paused.remove(name).is_some() { changed = true; }
             }
             if changed { save_paused(&store); }
         }
 
         let now = now_secs();
-        for c in list {
-            let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-            let id = c.id.clone().unwrap_or_default();
-            if name.is_empty() || registered.contains(&name) { continue; }
-            let role = c.labels.as_ref().and_then(|l| l.get("role").cloned()).unwrap_or_default();
-            if !role.is_empty() && busy.contains(&role) { continue; }
+        for name in sessions {
+            let role = hostexec::role_of(&name).to_string();
+            if busy.contains(&role) { continue; }
             // First sighting starts the clock (persisted into the store, not
-            // just the snapshot) — a fresh container gets one full idle
-            // window before it is a candidate.
+            // just the snapshot) — a fresh session gets one full idle window
+            // before it is a candidate.
             let last = {
                 let mut store = app.store.lock().unwrap();
                 *store.last_activity.entry(name.clone()).or_insert(now)
             };
             if now.saturating_sub(last) < idle_after { continue; }
-            match docker.stop_container(&id, None::<StopContainerOptions>).await {
-                Ok(()) => {
-                    app.mark_paused(&name, true);
-                    println!("auto-paused idle container '{name}' (idle {}s, role '{role}')", now - last);
-                }
-                Err(e) => eprintln!("auto-pause of '{name}' failed: {e}"),
+            if hostexec::kill_session(&name).await {
+                app.mark_paused(&name, true);
+                println!("auto-paused idle agent '{name}' (idle {}s, role '{role}')", now - last);
             }
         }
     }
@@ -5084,23 +5251,37 @@ async fn idle_sweeper(app: App) {
 
 #[tokio::main]
 async fn main() {
-    let docker = Docker::connect_with_local_defaults().ok();
-    if docker.is_none() {
-        eprintln!("Docker client init failed — running without container management");
+    // Agents run on THIS machine — no Docker client, no per-agent containers,
+    // no container-based deploy stage. Docker plays no part in the platform.
+    let _ = hostexec::tmux_available(); // warn early when tmux is missing
+    hostexec::sweep_tmp(); // command files from a previous process are garbage
+    let ws = hostexec::workspace_dir();
+    if let Err(e) = std::fs::create_dir_all(&ws) {
+        eprintln!("warning: workspace {} unusable: {e} — set AAP_WORKSPACE", ws.display());
     }
 
     let app_state = App {
-        docker,
         store: {
             let mut store = Store::default();
-            load_runs(&mut store); // work history survives restarts (/data/runs.json)
-            load_paused(&mut store); // paused-registry survives restarts (/data/paused.json)
+            load_projects(&mut store); // projects survive restarts (projects.json) — BEFORE load_runs, whose counter salvage scans store.projects
+            load_runs(&mut store); // work history survives restarts (runs.json)
+            load_docs(&mut store); // document space survives restarts (docs.json)
+            load_paused(&mut store); // paused-registry survives restarts (paused.json)
+            load_agents(&mut store); // agent registry survives restarts (agents.json)
+            // tmux sessions outlive this process — adopt any live ones
+            for s in hostexec::list_sessions().await {
+                if s.starts_with("agent-") && store.agents.insert(s) {
+                    save_agents(&store);
+                }
+            }
             Arc::new(Mutex::new(store))
         },
         seq: Arc::new(AtomicUsize::new(1)),
     };
 
-    // Idle sweeper — auto-pause containers idle past the configured window.
+    println!("host execution — workspace {} (AAP_WORKSPACE overrides)", ws.display());
+
+    // Idle sweeper — auto-pause agents idle past the configured window.
     tokio::spawn(idle_sweeper(app_state.clone()));
 
     let cors = tower_http::cors::CorsLayer::permissive();
@@ -5115,7 +5296,6 @@ async fn main() {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
-        .route("/vnc/secret", get(vnc_secret))
         .route("/containers", get(list_containers).post(create_container))
         .route("/containers/{ident}", delete(delete_container))
         .route("/containers/{ident}/{action}", post(container_action))
@@ -5142,6 +5322,10 @@ async fn main() {
         .route("/tasks/{task_id}", delete(delete_task))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/{id}", get(get_project).put(update_project).delete(delete_project))
+        .route("/projects/{id}/docs", get(list_docs).post(create_doc))
+        .route("/projects/{id}/docs/upload",
+               post(upload_doc).layer(axum::extract::DefaultBodyLimit::max(DOC_UPLOAD_MAX_BYTES + 65536)))
+        .route("/projects/{id}/docs/{doc_id}", get(get_doc).put(update_doc).delete(delete_doc))
         .route("/projects/{id}/run", post(run_project))
         .route("/runs", get(list_runs))
         .route("/runs/{run_id}", get(get_run))

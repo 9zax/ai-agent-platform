@@ -62,7 +62,7 @@ test.describe('PR-stage GitHub connector', () => {
     await expect(page.getByTestId('human-reply')).toBeVisible()
   })
 
-  // Opt-in: needs a real LLM key, Docker, a PUBLIC throwaway repo, and the
+  // Opt-in: needs a real LLM key, a PUBLIC throwaway repo, and the
   // agent-base image (platform default). Set:
   //   E2E_GITHUB_DEVICE=1 E2E_TEST_REPO=https://github.com/<you>/throwaway
   // (optional E2E_DEV_IMAGE to pin the agent image)

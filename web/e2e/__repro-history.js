@@ -1,13 +1,19 @@
 // Final repro: open p-001's Oat (sa) node on :3000 with the user's real strings,
 // narrow viewport, mocked activity — measure blow-out.
 const { chromium } = require('@playwright/test')
-const { execSync } = require('child_process')
+const fs = require('fs')
+const path = require('path')
 
 const WEB = 'http://localhost:3000'
 const API = 'http://localhost:8000'
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || execSync(
-  'docker exec ai-agent-platform-orchestrator-1 printenv ADMIN_PASSWORD', { encoding: 'utf8' }
-).trim()
+function adminPassword() {
+  if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD
+  // repo-root .env (the orchestrator's own source of truth)
+  const env = fs.readFileSync(path.join(__dirname, '../../../.env'), 'utf8')
+  const line = env.split('\n').find(l => l.startsWith('ADMIN_PASSWORD='))
+  return line ? line.slice('ADMIN_PASSWORD='.length).trim() : ''
+}
+const ADMIN_PASSWORD = adminPassword()
 
 const TASK = 'ฝังโครง Design System starter: UX/UI ทำ design tokens (สี มิติก + typography + spacing) เป็น design-system/tokens.json พร้อมคู่มือใช้ design-system/USAGE.md และตัวอย่างประกอบใน design-system/example-page.html'
 const THAI_LONG = 'ทีมทำงานร่วมกันแบบอัตโนมัติ'

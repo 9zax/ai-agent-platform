@@ -28,21 +28,21 @@ const STATUS_LABEL = {
 function mapLive(c) {
   const raw = (c.status || '').split(' ')[0]
   const st = raw === 'exited' ? 'stopped' : raw
-  const image = (c.image || '').split(':')[0].replace('ai-agent-platform-', '')
   const role = c.labels?.role
   return {
     id: c.id,
     name: c.name,
-    type: role || image || 'docker',
+    type: role || 'host',
     tag: role ? 'purple' : 'blue',
-    model: c.labels?.model || 'docker',
+    model: c.labels?.model || 'host shell',
     status: st,
     paused_since: c.paused_since,
     auto_paused: c.auto_paused,
     idle_secs: c.idle_secs,
     uptime: '—',
     tasks: '—',
-    managed: c.labels?.['managed-by'] === 'ai-agent-platform',
+    // host mode: every listed agent is one this platform started
+    managed: true,
   }
 }
 
@@ -53,11 +53,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('all')
-  const [showAll, setShowAll] = useState(false)
   const [activeTasks, setActiveTasks] = useState(3)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [creating, setCreating] = useState(false)
-  const [form, setForm] = useState({ name: '', role: 'agent', image: 'alpine:latest' })
+  const [form, setForm] = useState({ name: '', role: 'agent' })
   const [formError, setFormError] = useState('')
 
   async function createContainer(e) {
@@ -74,7 +73,7 @@ export default function Dashboard() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       setDialogOpen(false)
-      setForm({ name: '', role: 'agent', image: 'alpine:latest' })
+      setForm({ name: '', role: 'agent' })
       await load()
     } catch (err) {
       setFormError(err.message)
@@ -82,11 +81,11 @@ export default function Dashboard() {
     setCreating(false)
   }
 
-  async function load(showEverything = false) {
+  async function load() {
     setLoading(true)
     try {
       const [cRes, tRes] = await Promise.all([
-        authFetch(`${API}/containers${showEverything ? '?all=true' : ''}`).then(r => r.json()),
+        authFetch(`${API}/containers`).then(r => r.json()),
         authFetch(`${API}/tasks`).then(r => r.json()).catch(() => []),
       ])
       setRows(cRes.map(mapLive))
@@ -100,16 +99,15 @@ export default function Dashboard() {
     setLoading(false)
   }
 
-  useEffect(() => { load(showAll) }, [showAll])
+  useEffect(() => { load() }, [])
 
   const filtered = useMemo(() => rows
-    .filter(r => showAll || r.managed)
     .filter(r => {
       const q = query.toLowerCase()
       const matchQ = !q || r.id.toLowerCase().includes(q) || r.name.toLowerCase().includes(q) || r.type.toLowerCase().includes(q)
       const matchS = filter === 'all' || r.status === filter
       return matchQ && matchS
-    }), [rows, query, filter, showAll])
+    }), [rows, query, filter])
 
   const running = rows.filter(r => r.managed && (r.status === 'running' || r.status === 'busy')).length
   const pausedCount = rows.filter(r => r.managed && r.status === 'paused').length
@@ -163,13 +161,13 @@ export default function Dashboard() {
 
         <Card>
           <div className="flex flex-wrap items-center justify-between gap-3 border-b p-4">
-            <div className="text-[14.5px] font-bold">AI Agent Containers</div>
+            <div className="text-[14.5px] font-bold">AI Agents <span className="ml-1.5 text-[11.5px] font-medium text-muted-foreground/60">tmux sessions on this machine</span></div>
             <div className="flex items-center gap-2.5">
               <div className="relative">
                 <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground/60" />
                 <Input
                   className="w-[180px] pl-8"
-                  placeholder="Search containers..."
+                  placeholder="Search agents..."
                   value={query}
                   onChange={e => setQuery(e.target.value)}
                 />
@@ -186,10 +184,7 @@ export default function Dashboard() {
                   <SelectItem value="stopped">Stopped</SelectItem>
                 </SelectContent>
               </Select>
-              <Button variant="outline" data-testid="toggle-all-containers" onClick={() => setShowAll(s => !s)}>
-                {showAll ? 'My agents only' : `All containers (${rows.length})`}
-              </Button>
-              <Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> New Container</Button>
+              <Button onClick={() => setDialogOpen(true)}><Plus className="h-4 w-4" /> New Agent</Button>
             </div>
           </div>
           <Table>
@@ -236,15 +231,15 @@ export default function Dashboard() {
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>New Container</DialogTitle>
-              <DialogDescription>Create an AI agent container. It will appear in the table once created.</DialogDescription>
+              <DialogTitle>New Agent</DialogTitle>
+              <DialogDescription>Start a host agent (a tmux session on this machine) with the given role. Name defaults to agent-&lt;role&gt;.</DialogDescription>
             </DialogHeader>
             <form onSubmit={createContainer} className="grid gap-4 pt-2">
               <div className="grid gap-1.5">
                 <label htmlFor="container-name" className="text-[13px] font-medium">Name</label>
                 <Input
                   id="container-name"
-                  placeholder="my-agent-01"
+                  placeholder="agent-dev"
                   value={form.name}
                   onChange={e => setForm({ ...form, name: e.target.value })}
                 />
@@ -253,24 +248,15 @@ export default function Dashboard() {
                 <label htmlFor="container-role" className="text-[13px] font-medium">Role</label>
                 <Input
                   id="container-role"
-                  placeholder="agent"
+                  placeholder="dev"
                   value={form.role}
                   onChange={e => setForm({ ...form, role: e.target.value })}
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <label htmlFor="container-image" className="text-[13px] font-medium">Image</label>
-                <Input
-                  id="container-image"
-                  placeholder="alpine:latest"
-                  value={form.image}
-                  onChange={e => setForm({ ...form, image: e.target.value })}
                 />
               </div>
               {formError && <div className="rounded-md bg-red-500/15 px-3 py-2 text-[12.5px] text-red-400">{formError}</div>}
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-                <Button type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create Container'}</Button>
+                <Button type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create Agent'}</Button>
               </DialogFooter>
             </form>
           </DialogContent>

@@ -100,7 +100,7 @@ export default function ConnectorsPage() {
       <div className="px-7 pb-1 pt-5">
         <h1 className="text-[21px] font-bold tracking-tight">Connectors</h1>
         <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-          บริการที่ agent container เชื่อมต่อใช้ได้ — เลือกเชื่อมต่อทีละเครื่องตามงานที่ต้องการ (แบบเดียวกับ Grok connectors)
+          บริการที่ agent บนเครื่องนี้เชื่อมต่อใช้ได้ — เครื่องเดียว identity เดียว (login ครั้งเดียวทั้งทีม)
         </div>
       </div>
 
@@ -127,12 +127,12 @@ export default function ConnectorsPage() {
       </div>
 
       <div className="px-7 pb-8">
-        <div className="mb-3 text-[13.5px] font-bold">Connector ต่อ container</div>
+        <div className="mb-3 text-[13.5px] font-bold">Connector ต่อเครื่อง (ใช้ร่วมทั้งทีม)</div>
         <Card className="p-0">
           {rows === null ? (
-            <div className="p-5 text-[12.5px] text-muted-foreground/70">Loading containers…</div>
+            <div className="p-5 text-[12.5px] text-muted-foreground/70">Loading agents…</div>
           ) : rows.length === 0 ? (
-            <div className="p-5 text-[12.5px] text-muted-foreground/70">ยังไม่มี container — สร้างจาก Dashboard ก่อน แล้วมาเชื่อมต่อที่นี่</div>
+            <div className="p-5 text-[12.5px] text-muted-foreground/70">ยังไม่มี agent — start จากหน้า Team หรือ Dashboard ก่อน แล้วมาเชื่อมต่อที่นี่</div>
           ) : (
             <Table>
               <TableHeader>

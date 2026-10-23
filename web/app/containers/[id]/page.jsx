@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation'
 import dynamic from 'next/dynamic'
 import { useEffect, useRef, useState } from 'react'
 import {
-  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, Figma, PauseCircle, PlayCircle,
+  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, Lightbulb, TriangleAlert, Github, Figma, PauseCircle, PlayCircle,
 } from 'lucide-react'
 import { ConnectorDialogs, connectorDisconnect } from '@/components/connector-flows'
 import { Button } from '@/components/ui/button'
@@ -16,7 +16,6 @@ import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const VNC_URL = process.env.NEXT_PUBLIC_VNC_URL || 'http://localhost:6080'
 
 // xterm.js touches the DOM at import time — client only
 const TerminalPanel = dynamic(() => import('@/components/terminal-panel'), {
@@ -107,10 +106,6 @@ export default function ContainerDetail() {
   const [tab, setTab] = useState('console')
   const [stats, setStats] = useState(null)
   const [files, setFiles] = useState(null)
-  const [inspect, setInspect] = useState(null)
-  const [vncState, setVncState] = useState('disconnected') // disconnected | connecting | connected | unavailable
-  const [vncSecret, setVncSecret] = useState('') // one secret: fetched from the platform after login, auto-auths noVNC
-  const [vncScaled, setVncScaled] = useState(false)
   const [mode, setMode] = useState('ai') // 'ai' = LLM decides, 'shell' = run directly
   const [agentModel, setAgentModel] = useState('')
   const [authRequired, setAuthRequired] = useState(false) // true = must be logged in to touch containers
@@ -196,10 +191,7 @@ export default function ContainerDetail() {
     if (tab === 'files' && files === null) {
       authFetch(`${API}/containers/${encodeURIComponent(id)}/files`).then(r => r.json()).then(setFiles).catch(() => setFiles({ error: 'unreachable' }))
     }
-    if ((tab === 'security' || tab === 'networks') && inspect === null) {
-      authFetch(`${API}/containers/${encodeURIComponent(id)}/inspect`).then(r => r.json()).then(setInspect).catch(() => setInspect({ error: 'unreachable' }))
-    }
-  }, [tab, id, files, inspect])
+  }, [tab, id, files])
 
   async function containerAction(action) {
     if (authRequired && !getToken()) return router.push('/login')
@@ -264,45 +256,12 @@ export default function ContainerDetail() {
     setBusy('')
   }
 
-  async function connectVnc() {
-    if (authRequired && !getToken()) {
-      router.push('/login')
-      return
-    }
-    await doConnect()
-  }
-
-  async function doConnect() {
-    setVncState('connecting')
-    // Single sign-on: logged-in users get the shared VNC secret (== ADMIN_PASSWORD)
-    // and noVNC is auto-authenticated with it — no second password prompt.
-    // Await it BEFORE mounting the iframe so the secret is always in the URL.
-    try {
-      const r = await authFetch(`${API}/vnc/secret`)
-      const { password } = r.ok ? await r.json() : { password: '' }
-      setVncSecret(password || '')
-    } catch {
-      setVncSecret('')
-    }
-    try {
-      await fetch(VNC_URL, { mode: 'no-cors', signal: AbortSignal.timeout(3000) })
-      setVncState('connected')
-    } catch {
-      setVncState('unavailable')
-    }
-  }
-
-  const metrics = stats
-    ? [
-        { k: 'CPU', v: `${stats.cpu_percent}%`, bar: Math.min(100, stats.cpu_percent) },
-        { k: 'Memory', v: fmtBytes(stats.mem_used), span: `/ ${fmtBytes(stats.mem_limit)}`, bar: stats.mem_limit ? Math.min(100, (stats.mem_used / stats.mem_limit) * 100) : 0 },
-        { k: 'Disk', v: stats.disk_used != null ? fmtBytes(stats.disk_used) : '—', span: stats.disk_total != null ? `/ ${fmtBytes(stats.disk_total)}` : '', bar: stats.disk_total ? Math.min(100, (stats.disk_used / stats.disk_total) * 100) : 0 },
-        { k: 'Network ↓', v: fmtBytes(stats.net_rx), span: 'received', bar: 40 },
-        { k: 'Network ↑', v: fmtBytes(stats.net_tx), span: 'sent', bar: 25 },
-      ]
-    : [
-        { k: 'CPU' }, { k: 'Memory' }, { k: 'Disk' }, { k: 'Network ↓' }, { k: 'Network ↑' },
-      ]
+  // Host agents have no per-cgroup cpu/mem/net numbers — those render as "—".
+  const metrics = [
+    { k: 'CPU', v: stats?.cpu_percent != null ? `${stats.cpu_percent}%` : null, bar: stats?.cpu_percent ?? 0 },
+    { k: 'Memory', v: stats?.mem_used != null ? fmtBytes(stats.mem_used) : null, span: stats?.mem_limit ? `/ ${fmtBytes(stats.mem_limit)}` : '', bar: stats?.mem_limit && stats?.mem_used ? Math.min(100, (stats.mem_used / stats.mem_limit) * 100) : 0 },
+    { k: 'Disk', v: stats?.disk_used != null ? fmtBytes(stats.disk_used) : null, span: stats?.disk_total != null ? `/ ${fmtBytes(stats.disk_total)}` : '', bar: stats?.disk_total && stats?.disk_used != null ? Math.min(100, (stats.disk_used / stats.disk_total) * 100) : 0 },
+  ]
 
   return (
     <>
@@ -320,7 +279,7 @@ export default function ContainerDetail() {
               </Badge>
             </h1>
             <div className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-              Container console &amp; AI agent control
+              Agent console — commands run on this machine (tmux session), not in a container
               {status === 'paused' && stats?.paused_since
                 ? <span className="ml-2 text-cyan-400/80">{stats.auto_paused ? 'auto-' : ''}paused {Math.max(0, Math.round((Date.now() / 1000 - stats.paused_since) / 60))} min ago</span>
                 : null}
@@ -348,7 +307,7 @@ export default function ContainerDetail() {
           <Tabs value={tab} onValueChange={setTab} className="w-full">
             <div className="border-b px-4">
               <TabsList className="h-auto w-full justify-start gap-1 rounded-none border-b border-transparent bg-transparent p-0">
-                {['console', 'files', 'analytics', 'security', 'networks'].map(t => (
+                {['console', 'files'].map(t => (
                   <TabsTrigger
                     key={t}
                     value={t}
@@ -360,68 +319,16 @@ export default function ContainerDetail() {
               </TabsList>
             </div>
 
-            {/* ---- Console tab ---- */}
+            {/* ---- Console tab — the agent's live tmux session (host execution:
+                  every command the orchestrator runs lands in this terminal) ---- */}
             <TabsContent value="console" className="mt-0 p-4">
-              <div className="relative mx-auto flex aspect-[16/9.5] flex-col overflow-hidden rounded-[10px] bg-[linear-gradient(135deg,#2c1e4d_0%,#1a1030_45%,#0f1a2e_100%)]">
-                {vncState === 'connected' ? (
-                  <iframe
-                    src={`${VNC_URL}/vnc.html?autoconnect=1&resize=${vncScaled ? 'off' : 'scale'}${vncSecret ? `&password=${encodeURIComponent(vncSecret)}` : ''}`}
-                    className="h-full w-full border-0"
-                    title="noVNC console"
-                  />
-                ) : (
-                  <>
-                    <div className="flex h-[30px] items-center gap-2 bg-black/55 px-3.5 text-[11.5px] text-[#cbb8ff] backdrop-blur">
-                      <span className="h-2 w-2 rounded-full bg-[#b39ddb] opacity-80" />
-                      <span className="h-2 w-2 rounded-full bg-[#b39ddb] opacity-80" />
-                      <span className="h-2 w-2 rounded-full bg-[#b39ddb] opacity-80" />
-                      <span className="ml-1.5">Containers ×</span>
-                      <span className="ml-auto opacity-70">noVNC · {VNC_URL}</span>
-                    </div>
-                    <div className="flex flex-1 flex-col items-center justify-center gap-2.5 p-4 text-center">
-                      {vncState === 'connecting' ? (
-                        <div className="text-[14px] text-slate-200/80">Connecting to noVNC…</div>
-                      ) : vncState === 'unavailable' ? (
-                        <>
-                          <div className="text-[15px] font-semibold text-slate-200/90">noVNC agent not reachable</div>
-                          <div className="max-w-[440px] text-[12px] leading-relaxed text-slate-200/55">
-                            Start the agent container to get a live Ubuntu desktop here:
-                          </div>
-                          <code className="rounded-md border border-violet-400/30 bg-black/45 px-3 py-1.5 font-mono text-[11.5px] text-[#c4b5fd]">
-                            docker compose --profile example up -d
-                          </code>
-                        </>
-                      ) : (
-                        <>
-                          <div className="text-[34px] font-extrabold tracking-tight text-slate-200/90 [text-shadow:0_4px_30px_rgba(124,92,252,0.55)]">
-                            Ubuntu Desktop
-                          </div>
-                          <div className="text-[12px] text-slate-200/55">XFCE · Chromium · Terminal — streamed live from the agent container</div>
-                        </>
-                      )}
-                    </div>
-                  </>
-                )}
+              <div className="mb-2.5 flex items-center justify-between">
+                <div className="text-[13.5px] font-bold">Live terminal <span className="ml-1.5 text-[11px] font-medium text-muted-foreground/60">tmux session on this machine</span></div>
+                <code className="rounded-md border bg-[#0d1420] px-2.5 py-1 font-mono text-[11px] text-muted-foreground">tmux attach -t {id}</code>
               </div>
+              <TerminalPanel containerId={id} tall />
 
-              <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
-                {vncState === 'connected' ? (
-                  <>
-                    <Button variant="outline" className="h-8 text-[12px]" onClick={() => setVncScaled(s => !s)}>
-                      <MonitorUp className="h-3.5 w-3.5" /> {vncScaled ? 'Scale to fit' : 'Actual size'}
-                    </Button>
-                    <Button variant="outline" className="h-8 border-red-500/40 text-[12px] text-red-400 hover:bg-red-500/10 hover:text-red-400" onClick={() => setVncState('disconnected')}>
-                      Disconnect
-                    </Button>
-                  </>
-                ) : (
-                  <Button variant="outline" className="h-8 text-[12px]" disabled={vncState === 'connecting'} onClick={connectVnc} data-testid="vnc-connect">
-                    Connect{authRequired ? <Lock className="h-3.5 w-3.5" /> : ''}
-                  </Button>
-                )}
-              </div>
-
-              <div className="mt-4 grid grid-cols-5 gap-3 border-t pt-4 max-[900px]:grid-cols-3 max-[600px]:grid-cols-2">
+              <div className="mt-4 grid grid-cols-3 gap-3 border-t pt-4 max-[900px]:grid-cols-3 max-[600px]:grid-cols-2">
                 {metrics.map(m => (
                   <div key={m.k} data-testid="metric">
                     <div className="text-[11px] font-semibold text-muted-foreground/70">{m.k}</div>
@@ -437,91 +344,12 @@ export default function ContainerDetail() {
             {/* ---- Files tab ---- */}
             <TabsContent value="files" className="mt-0 p-4">
               <div className="mb-3 flex items-center justify-between">
-                <div className="text-[13.5px] font-bold">Workspace files</div>
+                <div className="text-[13.5px] font-bold">Workspace files <span className="ml-1.5 text-[11px] font-medium text-muted-foreground/60">shared working tree of the whole team</span></div>
                 <Button variant="outline" size="sm" onClick={() => setFiles(null)}>Refresh</Button>
               </div>
               <pre className="overflow-x-auto rounded-[10px] border bg-[#0d1420] p-4 font-mono text-[11.5px] leading-relaxed text-muted-foreground" data-testid="files-output">
                 {files === null ? 'Loading…' : files.output || files.error || '(empty)'}
               </pre>
-            </TabsContent>
-
-            {/* ---- Analytics tab ---- */}
-            <TabsContent value="analytics" className="mt-0 p-4">
-              <div className="mb-3 text-[13.5px] font-bold">Live resource usage <span className="ml-2 text-[11px] font-medium text-muted-foreground/60">updates every 5s</span></div>
-              <div className="grid grid-cols-2 gap-3 max-[600px]:grid-cols-1">
-                {stats ? (
-                  <>
-                    {[
-                      ['CPU', `${stats.cpu_percent}%`, Math.min(100, stats.cpu_percent)],
-                      ['Memory', `${fmtBytes(stats.mem_used)} / ${fmtBytes(stats.mem_limit)}`, stats.mem_limit ? (stats.mem_used / stats.mem_limit) * 100 : 0],
-                      ['Disk', stats.disk_used != null ? `${fmtBytes(stats.disk_used)} / ${fmtBytes(stats.disk_total)}` : '—', stats.disk_total ? (stats.disk_used / stats.disk_total) * 100 : 0],
-                      ['Network ↓ (received)', fmtBytes(stats.net_rx), 40],
-                      ['Network ↑ (sent)', fmtBytes(stats.net_tx), 25],
-                    ].map(([k, v, bar]) => (
-                      <div key={k} className="rounded-[10px] border bg-[#0d1420] p-4">
-                        <div className="text-[11px] font-semibold text-muted-foreground/70">{k}</div>
-                        <div className="mb-2 mt-1 text-[18px] font-bold">{v}</div>
-                        <Progress value={Math.round(bar)} />
-                      </div>
-                    ))}
-                  </>
-                ) : (
-                  <div className="col-span-2 py-8 text-center text-[13px] text-muted-foreground/70">Collecting stats…</div>
-                )}
-              </div>
-            </TabsContent>
-
-            {/* ---- Security tab ---- */}
-            <TabsContent value="security" className="mt-0 p-4">
-              <div className="mb-3 text-[13.5px] font-bold">Container security &amp; metadata</div>
-              {inspect?.error ? (
-                <div className="py-8 text-center text-[13px] text-muted-foreground/70">Inspect unavailable</div>
-              ) : inspect ? (
-                <div className="rounded-[10px] border bg-[#0d1420] p-4">
-                  {[
-                    ['Container ID', inspect.id],
-                    ['Image', inspect.image],
-                    ['State', inspect.state],
-                    ['Created', new Date(inspect.created).toLocaleString()],
-                    ['Restart policy', inspect.restart_policy],
-                  ].map(([k, v]) => (
-                    <div key={k} className="flex items-center justify-between gap-4 border-b border-dashed border-border py-2.5 text-[12.5px] last:border-0">
-                      <span className="text-muted-foreground/70">{k}</span>
-                      <span className="truncate font-mono text-[11.5px]">{String(v)}</span>
-                    </div>
-                  ))}
-                  <div className="mt-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">Labels</div>
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {Object.entries(inspect.labels || {}).slice(0, 12).map(([k, v]) => (
-                      <Badge key={k} variant="gray" className="max-w-full truncate font-mono text-[10.5px]">{k}={v}</Badge>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="py-8 text-center text-[13px] text-muted-foreground/70">Inspecting…</div>
-              )}
-            </TabsContent>
-
-            {/* ---- Networks tab ---- */}
-            <TabsContent value="networks" className="mt-0 p-4">
-              <div className="mb-3 text-[13.5px] font-bold">Networks</div>
-              {inspect?.error ? (
-                <div className="py-8 text-center text-[13px] text-muted-foreground/70">Inspect unavailable</div>
-              ) : inspect ? (
-                <div className="grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(240px,1fr))]">
-                  {inspect.networks.map(n => (
-                    <div key={n.name} className="rounded-[10px] border bg-[#0d1420] p-4">
-                      <div className="text-[13px] font-bold">{n.name}</div>
-                      <div className="mt-2 font-mono text-[11.5px] text-muted-foreground">IP: {n.ip?.filter(Boolean).join(', ') || '—'}</div>
-                      {n.aliases?.length > 0 && (
-                        <div className="mt-1 font-mono text-[11px] text-muted-foreground/70">aliases: {n.aliases.filter(Boolean).join(', ')}</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="py-8 text-center text-[13px] text-muted-foreground/70">Inspecting…</div>
-              )}
             </TabsContent>
           </Tabs>
         </Card>

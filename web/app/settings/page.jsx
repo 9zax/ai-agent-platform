@@ -112,11 +112,12 @@ export default function SettingsPage() {
 
   const rows = [
     ['Orchestrator', health ? 'Healthy' : 'Unreachable', health ? 'text-emerald-400' : 'text-red-400'],
-    ['Docker socket', health?.docker ? 'Connected' : 'Not connected', health?.docker ? 'text-emerald-400' : 'text-amber-400'],
+    ['Execution mode', health?.mode === 'host' ? 'Host (tmux sessions)' : health ? 'Unknown' : '—', health ? 'text-emerald-400' : ''],
+    ['tmux', health?.tmux ? 'Available' : 'Not found — agents run headless', health?.tmux ? 'text-emerald-400' : 'text-amber-400'],
     ['API endpoint', API, ''],
     ['AI provider', aiStatus?.provider || config?.ai_provider || '—', ''],
     ['Model (provider default)', aiStatus?.model || '—', ''],
-    ['Max containers', config?.max_containers ?? '—', ''],
+    ['Max agents', config?.max_containers ?? '—', ''],
     ['Auto-restart', config ? (config.auto_restart ? 'On' : 'Off') : '—', ''],
     ['Auto-pause', config ? (config.auto_pause_enabled ? `On · ${Math.round((config.idle_timeout_secs || 0) / 60)} min` : 'Off') : '—', ''],
   ]
@@ -237,16 +238,17 @@ export default function SettingsPage() {
             <ShieldCheck className="h-4 w-4 text-primary" /> Safety
           </div>
           <div className="text-[12.5px] leading-relaxed text-muted-foreground/80">
-            Only containers created by this platform (label <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px]">managed-by=ai-agent-platform</code>) can be
-            stopped, restarted, executed in, or deleted through the UI and API.
+            Only agents started by this platform (tmux session <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px]">agent-*</code>) can be
+            stopped, restarted, executed in, or deleted through the UI and API. Commands run on
+            your machine with your environment — the platform never installs anything.
           </div>
           <div className="mt-4"><Badge variant="green">Lifecycle guarded</Badge></div>
           <div className="mb-4 mt-6 flex items-center gap-2 text-[14px] font-bold">
             <Package className="h-4 w-4 text-primary" /> Deployment
           </div>
           <div className="text-[12.5px] leading-relaxed text-muted-foreground/80">
-            Production build: Next.js <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px]">next start</code> ·
-            API: FastAPI/Uvicorn · Orchestrated with Docker Compose.
+            Host processes via <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px]">make run</code>: orchestrator (Rust/Axum) ·
+            web: Next.js <code className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[11px]">next start</code> — no Docker.
           </div>
         </Card>
       </div>

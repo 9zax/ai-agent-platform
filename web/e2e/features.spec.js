@@ -1,6 +1,6 @@
 const { test, expect } = require('@playwright/test')
 
-// Interactive features — full lifecycle against real Docker via the orchestrator API
+// Interactive features — full lifecycle against real host agents via the orchestrator API
 test.describe('Container lifecycle', () => {
   let containerName
 

@@ -41,36 +41,35 @@ test.describe('Settings', () => {
   test('shows live system status', async ({ page }) => {
     await page.goto('/settings')
     await expect(page.getByTestId('settings-card')).toContainText('Healthy')
-    await expect(page.getByTestId('settings-card')).toContainText('Connected')
+    // host execution mode: the runtime row reflects tmux availability
+    await expect(page.getByTestId('settings-card')).toContainText('tmux')
   })
 })
 
-test.describe('Container detail tabs', () => {
-  test('analytics shows live stats for a running container', async ({ page }) => {
-    await page.goto('/containers/ai-agent-platform-web-1')
-    await page.getByRole('tab', { name: 'Analytics' }).click()
-    await expect(page.getByText(/CPU/).first()).toBeVisible()
-    await expect(page.getByText(/Collecting stats/)).toHaveCount(0, { timeout: 10000 })
-  })
+test.describe('Agent detail', () => {
+  test('live terminal tab + files tab list the shared workspace', async ({ page }) => {
+    // establish the app origin first (storageState logs us in)
+    await page.goto('/')
+    // host agents are tmux sessions — start one (idempotent) then inspect it
+    const API = 'http://localhost:8000'
+    const created = await page.evaluate(async api => {
+      const token = localStorage.getItem('aap_token') || ''
+      const headers = { 'Content-Type': 'application/json', 'x-session-token': token }
+      const res = await fetch(`${api}/agents/dev-fe/start`, { method: 'POST', headers, body: '{}' })
+      return res.ok
+    }, API)
+    expect(created).toBeTruthy()
 
-  test('security shows container metadata', async ({ page }) => {
-    await page.goto('/containers/ai-agent-platform-web-1')
-    await page.getByRole('tab', { name: 'Security' }).click()
-    await expect(page.getByText('Container ID')).toBeVisible()
-    await expect(page.getByText('Restart policy')).toBeVisible()
-  })
-
-  test('networks shows attached networks', async ({ page }) => {
-    await page.goto('/containers/ai-agent-platform-web-1')
-    await page.getByRole('tab', { name: 'Networks' }).click()
-    await expect(page.getByText('agent-net', { exact: false })).toBeVisible({ timeout: 10000 })
-  })
-
-  test('files tab lists workspace contents', async ({ page }) => {
-    await page.goto('/containers/ai-agent-platform-orchestrator-1')
+    await page.goto('/containers/agent-dev-fe')
+    // console tab: the live terminal panel attaches to the tmux session
+    await expect(page.getByTestId('terminal-panel')).toBeVisible({ timeout: 15_000 })
+    // metrics render (disk is real, cpu/mem are honest "—")
+    await expect(page.getByTestId('metric').first()).toBeVisible()
+    // files tab lists the shared workspace
     await page.getByRole('tab', { name: 'Files' }).click()
     const output = page.getByTestId('files-output')
     await expect(output).not.toContainText('Loading…', { timeout: 10000 })
     await expect(output).toContainText('.')
+    await expect(output).not.toContainText('Agent is not running')
   })
 })
