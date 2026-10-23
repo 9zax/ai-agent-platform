@@ -1,23 +1,31 @@
 // Task board → task detail routes. Creates its own project + task through the
 // API so it never depends on demo data, and deletes the project afterwards.
 const { test, expect } = require('@playwright/test')
-const { authHeaders } = require('./lib/auth')
+const { useIsolatedApi } = require('./lib/isolated-ui')
+const { login, getToken } = require('./lib/isolated')
 
 const API = process.env.API_URL || 'http://localhost:8000'
 
 let project
 let task
 
+test.beforeEach(async ({ page, request }) => {
+  // re-auth each test: a persistence spec may have restarted the orchestrator
+  await login(request)
+  await useIsolatedApi(page, getToken())
+})
+
 test.beforeAll(async ({ request }) => {
+  await login(request)
   const pRes = await request.post(`${API}/projects`, {
-    headers: authHeaders(),
+    headers: { 'x-session-token': getToken() },
     data: { name: `E2E Tasks ${Date.now()}`, description: 'task route coverage' },
   })
   expect(pRes.ok()).toBeTruthy()
   project = await pRes.json()
 
   const tRes = await request.post(`${API}/projects/${project.id}/tasks`, {
-    headers: authHeaders(),
+    headers: { 'x-session-token': getToken() },
     data: {
       title: 'E2E task: task board and detail',
       description: 'Created by the Playwright suite; deleted in afterAll.',
@@ -30,7 +38,7 @@ test.beforeAll(async ({ request }) => {
 })
 
 test.afterAll(async ({ request }) => {
-  if (project) await request.delete(`${API}/projects/${project.id}`, { headers: authHeaders() })
+  if (project) await request.delete(`${API}/projects/${project.id}`, { headers: { 'x-session-token': getToken() } })
 })
 
 test.describe('task board → task routes', () => {

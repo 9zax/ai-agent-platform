@@ -3881,13 +3881,23 @@ fn load_runs(store: &mut Store) {
             }
         }
         // A closed run (whatever closed it — restart, Stop, an older build with
-        // the finish gap) must not carry steps stuck at "working": nobody will
-        // ever advance them, and the UI would show a busy spinner forever.
-        for step in run.steps.iter_mut().filter(|s| s.status == "working") {
-            dirty = true;
-            step.status = "stopped".into();
-            step.output = "stopped mid-work — the run already ended while this step was in flight".into();
-            if step.finished_at == 0 { step.finished_at = now; }
+        // the finish gap) must not carry steps stuck at "working" or never-run
+        // "pending" steps: nobody will ever advance them, and the UI would show
+        // a busy spinner forever. Same normalization finish_run applies.
+        for step in run.steps.iter_mut() {
+            match step.status.as_str() {
+                "pending" => {
+                    dirty = true;
+                    step.status = "skipped".into();
+                }
+                "working" => {
+                    dirty = true;
+                    step.status = "stopped".into();
+                    step.output = "stopped mid-work — the run already ended while this step was in flight".into();
+                    if step.finished_at == 0 { step.finished_at = now; }
+                }
+                _ => {}
+            }
         }
         run.stop_requested = false;
     }
@@ -4462,7 +4472,15 @@ async fn routine_scheduler(app: App) {
 /// Directory name for a cloned repo URL: last path segment, ".git" stripped,
 /// sanitized to safe filename chars ("repo" when nothing usable remains).
 fn repo_dir_name(repo_url: &str) -> String {
-    let last = repo_url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let rest = repo_url.split("://").nth(1).unwrap_or(repo_url).trim_end_matches('/');
+    let path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
+    let last = if path.trim_matches('/').is_empty() {
+        // host-only URL: there is no repo name to borrow
+        if rest.contains('.') { "" } else { rest }
+    } else {
+        path.rsplit('/').next().unwrap_or("")
+    };
+    let last = last.trim_end_matches(".git");
     let cleaned: String = last.chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
         .collect();
@@ -4609,8 +4627,11 @@ fn parse_files(output: &str) -> Vec<(String, String)> {
         if in_fence {
             if t.trim_start().starts_with("```") {
                 if let Some(p) = path.take() {
-                    if !body.contains("AAP_EOF_9Z") {
-                        files.push((p, std::mem::take(&mut body)));
+                    // take the body even when the entry is rejected, so a
+                    // poisoned payload can never leak into the next file
+                    let content = std::mem::take(&mut body);
+                    if !content.contains("AAP_EOF_9Z") {
+                        files.push((p, content));
                     }
                 }
                 in_fence = false;
@@ -5207,7 +5228,10 @@ enum HumanOutcome { Answered, Stopped, TimedOut }
 /// reply in the discussion, a Stop, or the timeout. The lock is taken and
 /// dropped inside each tick — never held across an await.
 async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome {
-    let mut human_seen = {
+    // Baseline captured once, on entry. Never re-read it between ticks: a
+    // reply that lands while we sleep is exactly the one we must detect, and
+    // folding it into the baseline would swallow it forever.
+    let human_seen = {
         let store = app.store.lock().unwrap();
         store.runs.iter().find(|r| r.id == run_id)
             .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
@@ -5215,7 +5239,6 @@ async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome 
             .unwrap_or(0)
     };
     let deadline = now_secs() + HUMAN_TIMEOUT_SECS;
-    eprintln!("[trace] wait_for_human {run_id}/{disc_id} enter human_seen={human_seen}");
     loop {
         {
             let mut store = app.store.lock().unwrap();
@@ -5236,7 +5259,6 @@ async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome 
                     }
                     run.status = "running".into();
                     save_runs(&store);
-                    eprintln!("[trace] wait_for_human {run_id}/{disc_id} answered");
                     return HumanOutcome::Answered;
                 }
             }
@@ -5255,13 +5277,6 @@ async fn wait_for_human(app: &App, run_id: &str, disc_id: &str) -> HumanOutcome 
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        human_seen = {
-            let store = app.store.lock().unwrap();
-            store.runs.iter().find(|r| r.id == run_id)
-                .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
-                .map(|d| d.messages.iter().filter(|m| m.from == "human").count())
-                .unwrap_or(human_seen)
-        };
     }
 }
 
@@ -5338,7 +5353,7 @@ fn raise_github_auth_discussion(app: &App, run_id: &str, dev_role: &str, user_co
 /// await — same discipline as wait_for_human.
 async fn wait_for_github_auth(app: &App, run_id: &str, disc_id: &str, container_id: &str, baseline: u64, deadline: u64) -> GhAuthOutcome {
     let cache_key = format!("{container_id}:github");
-    let mut human_seen = {
+    let human_seen = {
         let store = app.store.lock().unwrap();
         store.runs.iter().find(|r| r.id == run_id)
             .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
@@ -5381,13 +5396,6 @@ async fn wait_for_github_auth(app: &App, run_id: &str, disc_id: &str, container_
             return if code == 0 { GhAuthOutcome::Connected("github".into()) } else { GhAuthOutcome::RepliedUnauthed };
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        human_seen = {
-            let store = app.store.lock().unwrap();
-            store.runs.iter().find(|r| r.id == run_id)
-                .and_then(|r| r.discussions.iter().find(|d| d.id == disc_id))
-                .map(|d| d.messages.iter().filter(|m| m.from == "human").count())
-                .unwrap_or(human_seen)
-        };
     }
 }
 
@@ -5710,12 +5718,9 @@ async fn review_gate(
 
     for round in 0..MAX_REVIEW_ROUNDS {
         if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
-        eprintln!("[trace] review_gate {run_id} round {round} start");
         let disc_id = open_review(app, run_id, &files, &diff);
         if disc_id.is_empty() { return ReviewOutcome::Stopped; }
-        eprintln!("[trace] review_gate {run_id} opened {disc_id}, waiting");
         let status = wait_review(app, run_id, &disc_id).await;
-        eprintln!("[trace] review_gate {run_id} round {round} status {status}");
         // The review discussion is closed either way; the outcome is in Run.review.
         {
             let mut store = app.store.lock().unwrap();
@@ -5744,26 +5749,25 @@ async fn review_gate(
                     if comment.is_empty() { "(no comment)" } else { &comment }, diff
                 );
                 if let Some(m) = dev.3.as_deref() {
-                    eprintln!("[trace] review_gate {run_id} revising with model {m}");
                     match llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
                         Ok(Some(output)) => {
-                            eprintln!("[trace] review_gate {run_id} revision answered ({} chars)", output.len());
                             let mut clean = strip_ask(&output);
                             apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
-                            eprintln!("[trace] review_gate {run_id} revision files applied");
+                            // The revised work replaces the round-1 deliverable, so
+                            // the UI (and later missions) see the version that
+                            // actually went through review.
+                            deliver_and_close(app, run_id, dev_role, &clean, Some(2)).await;
                         }
                         // The budget guard stopped the run mid-revision.
                         Ok(None) => return ReviewOutcome::Stopped,
-                        Err(e) => eprintln!("[trace] review_gate {run_id} revision failed: {}", e.1),
+                        Err(_) => {}
                     }
                 }
                 if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
-                eprintln!("[trace] review_gate {run_id} collecting diff again");
                 match collect_repo_diff(app, &cid, repo_path).await {
                     Some((f, d)) => { files = f; diff = d; }
                     None => return ReviewOutcome::Skip("the Dev revision produced no changes — nothing was pushed".into()),
                 }
-                eprintln!("[trace] review_gate {run_id} diff recollected, next round");
             }
             _ => return ReviewOutcome::Skip("diff review was not approved — nothing was pushed".into()),
         }
@@ -5807,14 +5811,25 @@ async fn run_pr_stage(
     // missions/ deliverables and the code/design files the dev/UX agents
     // applied. The reviewed diff is therefore the pushed diff, and the gate
     // lives here (inside the PR stage) so a retry cannot bypass it.
+    //
+    // The clone is shared and may still sit on a previous mission's branch:
+    // snapshot the CURRENT work tree (agents already applied their files),
+    // move the mission branch to the origin base, then replay the snapshot as
+    // a delta. A plain `git checkout -B` would either fail on the dirty tree
+    // or silently drop the applied files.
     let ws = hostexec::workspace_str();
     let prep = format!(
         "cd '{repo_path}' || exit 10; \
          git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
          git fetch --all --quiet >/dev/null 2>&1 || true; \
-         git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
          mkdir -p 'missions/{run_id}'; \
-         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
+         cp \"{ws}/\"{run_id}-*.md 'missions/{run_id}/' 2>/dev/null || true; \
+         git add -A; \
+         tree=$(git write-tree); \
+         base=$(git rev-parse --verify -q origin/HEAD || git rev-parse --verify -q origin/main || git rev-parse HEAD); \
+         git update-ref 'refs/heads/{branch}' \"$base\"; \
+         git checkout -q -f '{branch}'; \
+         git diff --binary \"$base\" \"$tree\" | git apply --index --whitespace=nowarn || echo TREE_APPLY_FAILED; \
          git add -A"
     );
     let (pcode, pout) = app.exec_in(&cid, &prep).await
@@ -5826,6 +5841,11 @@ async fn run_pr_stage(
     }
     if pout.contains("NO_REMOTE") {
         let n = "no git remote 'origin' in the cloned repo — cannot push a PR".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    if pout.contains("TREE_APPLY_FAILED") {
+        let n = "could not replay the team's files onto the mission branch — nothing was pushed".to_string();
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -5841,15 +5861,13 @@ async fn run_pr_stage(
         }
     }
 
-    // Branch + commit: everything staged above rides the mission branch.
+    // Branch + commit: the mission branch was created at review time and the
+    // reviewed diff is already staged, so commit exactly that (never reset the
+    // branch here — that would discard the reviewed work).
     let commit_msg = format!("mission {run_id}: team deliverables");
     let script = format!(
         "cd '{repo_path}' || exit 10; \
          git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
-         git fetch --all --quiet >/dev/null 2>&1 || true; \
-         git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
-         mkdir -p 'missions/{run_id}'; \
-         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
          git add -A; \
          git status --porcelain | head -30; \
          git commit -q -m '{commit_msg}' 2>/dev/null || echo NOTHING_TO_COMMIT; \
@@ -7152,9 +7170,16 @@ The last iteration's acceptance verdict from the demo session is listed under 'A
 Reply with EITHER the concrete task for the next iteration (one sentence, same language as the goal, ≤60 words — build on what is already done, do not repeat it) OR exactly `DONE` when the goal is achieved and no further iteration adds value."
             );
             let user = format!("## Standing goal\n{task}\n\n## Iterations so far\n{chain}\n\n## Acceptance verdict\n{acc_text}\n\nDecide: the next iteration's task, or `DONE`.");
-            if let Ok(Some(next)) = llm_step(&app, &run_id, "po", "", &model, &system, &user, 200).await {
+            // The run is already closed by finish_run above, so llm_step would
+            // short-circuit on "not live" — call the provider directly and
+            // record the spend on the closed run. Stop is re-checked before a
+            // child is spawned so a Stop during the decision still wins.
+            if let Ok((next, usage)) = llm_retry_usage(&app, &model, &system, &user, 200).await {
+                record_usage(&app, &run_id, "po", "", &model, usage);
                 let next = next.trim().trim_matches('`').to_string();
-                if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600 {
+                if !next.is_empty() && !next.eq_ignore_ascii_case("done") && next.len() < 600
+                    && !stop_requested(&app, &run_id)
+                {
                     let next_task = next.lines().last().unwrap_or(&next).to_string();
                     if let Ok(child) = spawn_run_with(&app, &project_id, &next_task, true, iteration + 1, "loop", None, parent_task_id.as_deref()) {
                         let mut store = app.store.lock().unwrap();
@@ -7749,10 +7774,15 @@ async fn decide_review(
     let mut store = app.store.lock().unwrap();
     let run = store.runs.iter_mut().find(|r| r.id == run_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    // A run closed by a restart/Stop has no engine left to act on the verdict.
     let review = run.review.as_mut()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "this run has no diff review"))?;
     if review.status != "pending" {
         return Err(err(StatusCode::BAD_REQUEST, format!("review is already {}", review.status)));
+    }
+    if run.status != "running" && run.status != "waiting_human" {
+        return Err(err(StatusCode::CONFLICT,
+            format!("run is {} — its review can no longer be decided", run.status)));
     }
     let approve = decision == "approve";
     review.status = if approve { "approved".into() } else { "rejected".into() };
@@ -8618,5 +8648,129 @@ mod tests {
         run.review.as_mut().unwrap().status = "pending".into();
         apply_review_text(&mut run, "looks fine to me");
         assert_eq!(run.review.as_ref().unwrap().status, "pending");
+    }
+
+    // ---- output parsers -------------------------------------------------
+
+    #[test]
+    fn ask_block_is_parsed_and_stripped() {
+        let out = "# Spec\nbody\n\n## ASK\nTo: SA, QA\nWhich contract do we build against?";
+        let (to, topic) = parse_ask(out).expect("ask block");
+        assert_eq!(to, vec!["sa".to_string(), "qa".to_string()]);
+        assert_eq!(topic, "Which contract do we build against?");
+        let stripped = strip_ask(out);
+        assert_eq!(stripped, "# Spec\nbody");
+        assert!(!stripped.contains("ASK"));
+        // a heading with no addressee or no question is not an ask
+        assert!(parse_ask("plain output").is_none());
+        assert!(parse_ask("## ASK\nTo: sa\n").is_none());
+        assert!(parse_ask("## ASK\nno addressee").is_none());
+    }
+
+    #[test]
+    fn files_block_is_parsed_and_stripped() {
+        let out = "# Work\nrationale\n\n## FILES\n### src/a.js\n```js\nconsole.log(1)\n```\n\n### docs/b.md\n```\n# b\n```";
+        let files = parse_files(out);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "src/a.js");
+        assert!(files[0].1.contains("console.log(1)"));
+        assert_eq!(files[1].0, "docs/b.md");
+        assert_eq!(files[1].1, "# b\n");
+        let stripped = strip_files(out);
+        assert_eq!(stripped, "# Work\nrationale");
+        assert!(strip_files("no files here").contains("no files here"));
+    }
+
+    #[test]
+    fn files_block_rejects_unsafe_paths_and_terminators() {
+        // absolute path, traversal, foreign chars, empty body, heredoc terminator — all dropped
+        let out = concat!(
+            "## FILES\n",
+            "### /etc/passwd\n```\nx\n```\n",
+            "### ../escape\n```\nx\n```\n",
+            "### bad path!.md\n```\nx\n```\n",
+            "### empty.md\n```\n```\n",
+            "### ok.md\n```\nAAP_EOF_9Z\n```\n",
+            "### good.md\n```\ny\n```",
+        );
+        let files = parse_files(out);
+        assert_eq!(files, vec![("good.md".to_string(), "y\n".to_string())]);
+    }
+
+    #[test]
+    fn verdict_parsing_accepts_english_and_thai() {
+        assert_eq!(parse_verdict("## Check\nVERDICT: PASS"), Some("pass".into()));
+        assert_eq!(parse_verdict("**VERDICT: fail**"), Some("fail".into()));
+        assert_eq!(parse_verdict("`verdict: ผ่าน`"), Some("pass".into()));
+        assert_eq!(parse_verdict("VERDICT: ไม่ผ่าน"), Some("fail".into()));
+        // last verdict wins
+        assert_eq!(parse_verdict("VERDICT: fail\nVERDICT: PASS"), Some("pass".into()));
+        assert_eq!(parse_verdict("no verdict here"), None);
+    }
+
+    #[test]
+    fn pr_url_and_text_parsing() {
+        assert_eq!(
+            extract_pr_url("created https://github.com/acme/repo/pull/42."),
+            Some("https://github.com/acme/repo/pull/42".into()),
+        );
+        assert_eq!(extract_pr_url("https://github.com/acme/repo"), None);
+        assert_eq!(extract_pr_url("no url"), None);
+
+        let (title, body) = parse_pr_text("TITLE: Ship the slice\nBODY:\n- delivered\n- tested", "task", "run-1");
+        assert_eq!(title, "Ship the slice");
+        assert_eq!(body, "- delivered\n- tested");
+        // missing fields fall back honestly instead of fabricating
+        let (title, body) = parse_pr_text("no shape", "Long mission task that should be truncated by the one-line cap", "run-9");
+        assert!(title.starts_with("Mission run-9: Long mission task"));
+        assert_eq!(body, "Long mission task that should be truncated by the one-line cap");
+    }
+
+    #[test]
+    fn one_line_flattens_and_caps() {
+        // newlines/tabs become spaces; existing runs are left alone
+        assert_eq!(one_line("a\nb   c ", 10), "a b   c");
+        assert_eq!(one_line("abcdef", 3), "abc");
+        assert_eq!(one_line("", 5), "");
+    }
+
+    #[test]
+    fn task_columns_and_priorities_are_whitelisted() {
+        assert_eq!(task_column("todo"), Some("todo"));
+        assert_eq!(task_column("in_progress"), Some("in_progress"));
+        assert_eq!(task_column("doing"), None);
+        assert_eq!(task_priority("urgent"), Some("urgent"));
+        assert_eq!(task_priority("p0"), None);
+    }
+
+    #[test]
+    fn repo_dir_name_sanitizes_and_falls_back() {
+        assert_eq!(repo_dir_name("https://github.com/acme/my-repo.git"), "my-repo");
+        assert_eq!(repo_dir_name("file:///tmp/aap-test/origin"), "origin");
+        assert_eq!(repo_dir_name("https://github.com/acme/a b"), "a-b");
+        assert_eq!(repo_dir_name("https://github.com/"), "repo");
+    }
+
+    #[test]
+    fn resolve_targets_expands_all_and_keeps_human_last() {
+        let team = role_rows(&["po", "ba", "sa", "qa"]);
+        assert_eq!(resolve_targets(&["all".into()], &team, "ba"), vec!["po", "sa", "qa"]);
+        assert_eq!(resolve_targets(&["human".into(), "sa".into()], &team, "ba"), vec!["sa", "human"]);
+        // unknown addressee is dropped; an empty result falls back to the PO
+        assert_eq!(resolve_targets(&["ghost".into()], &team, "ba"), vec!["po"]);
+        assert!(resolve_targets(&["ghost".into()], &team, "po").is_empty());
+    }
+
+    #[test]
+    fn handoff_brief_truncates_plain_roles_from_the_tail() {
+        let short = handoff_brief("dev", "short");
+        assert_eq!(short, "short");
+        let long = "y".repeat(2000);
+        let brief = handoff_brief("dev", &long);
+        assert_eq!(brief.chars().count(), handoff_cap("dev"));
+        let sa = format!("{}\n## Work Split\nTAIL", "z".repeat(6000));
+        let brief = handoff_brief("sa", &sa);
+        assert!(brief.contains("## Work Split"));
+        assert!(brief.contains("TAIL"));
     }
 }

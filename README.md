@@ -200,10 +200,20 @@ Start agents from the AI Team page, open a project, set a goal/budget if you wan
 
 ```bash
 make test    # runs the Playwright suite with .env credentials (needs the platform running)
-cd orchestrator && cargo test   # unit tests: cron parsing, next-run, pricing, harness, review, watchdog, task titles/prompts
+cd orchestrator && cargo test   # 23 unit tests: cron parsing, next-run, pricing, harness, review, watchdog, task titles/prompts, output parsers
+
+# deterministic isolated suite — mock LLM, throwaway DATA_DIR, private tmux socket,
+# local bare origin and no gh on PATH. Never touches the real agents or data.
+tests/start-stack.sh
+cd web/e2e && set -a && source /tmp/aap-test/env.sh && set +a && \
+  AAP_TEST_API=1 npx playwright test api-contract.spec.js run-engine.spec.js \
+  task-routes.spec.js ui-flows.spec.js persistence.spec.js
+tests/stop-stack.sh
 ```
 
-**19 spec files / ~59 Playwright cases** — auth gate, dashboard, agent detail, AI team + org view, projects, routines, docs workspace, board, connectors, inbox, skills studio, platform, plus mission dispatch, pause/resume, step retry, PR-auth flows and the task board → task drill-down.
+**21 spec files** — auth gate, dashboard, agent detail, AI team + org view, projects, routines, docs workspace, board, connectors, inbox, skills studio, platform, plus mission dispatch, pause/resume, step retry, PR-auth flows and the task board → task drill-down.
+
+The isolated path adds **45 deterministic cases**: 22 REST contract checks, 14 run-engine scenarios (relay, meetings, ASK-to-human, stop, review approve/reject/chat-decide, budget + unpriced fail-closed, loop NEXT, per-step retry, empty answers, task dispatch), task-board routes, three full UI flows (dispatch → Stop, review approve → tail, budget raise), and a real process restart that proves projects/docs/tasks/skills/routines/runs survive while in-flight runs close honestly.
 
 ## 📁 Repository layout
 
