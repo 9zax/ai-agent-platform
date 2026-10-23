@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Shared working tree for the whole team — the host equivalent of the old
 /// ai-agent-platform-workspace volume: one cloned repo + deliverables, like a
@@ -106,6 +106,11 @@ pub async fn session_alive(name: &str) -> bool {
 /// session starts in the shared workspace with a plain "main" window that no
 /// orchestrator command ever runs in — all execs get their own window.
 pub async fn ensure_session(name: &str) -> Result<(), String> {
+    // No tmux on this machine → headless mode. There is no session to create;
+    // every exec falls through to `run_headless`, so runs still work.
+    if !tmux_available() {
+        return Ok(());
+    }
     if session_alive(name).await {
         return Ok(());
     }
@@ -141,11 +146,12 @@ pub async fn list_sessions() -> Vec<String> {
         .collect()
 }
 
-async fn window_exists(session: &str, window_id: &str) -> bool {
-    let Ok(o) = tmux(&["list-windows", "-t", &exact(session), "-F", "#{window_id}"]).await else {
-        return false;
-    };
-    String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == window_id)
+/// None = tmux itself could not answer (transient error) — NOT proof that the
+/// window died. Treating an error as death used to make callers report a
+/// failed command and retry while the first process kept running.
+async fn window_exists(session: &str, window_id: &str) -> Option<bool> {
+    let o = tmux(&["list-windows", "-t", &exact(session), "-F", "#{window_id}"]).await.ok()?;
+    Some(String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim() == window_id))
 }
 
 async fn kill_window(session: &str, window_id: &str) -> bool {
@@ -187,7 +193,7 @@ pub fn sweep_tmp() {
 
 /// Single-quote a value for sh ('…' with ' escaped as '\'' — safe for every
 /// byte including newlines).
-fn shq(s: &str) -> String {
+pub(crate) fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -206,11 +212,20 @@ static CMD_SEQ: AtomicU64 = AtomicU64::new(1);
 /// line — the same secret-safety rule the old exec ENV injection had. No
 /// overall timeout, matching docker exec.
 pub async fn run(agent: &str, command: &str, env: &[String]) -> Result<(i64, String), String> {
+    run_with_timeout(agent, command, env, None).await
+}
+
+/// Same seam as `run`, but a timeout KILLS the tmux window (and the headless
+/// child) before returning — a CLI harness that hits its cap must not keep
+/// mutating the repo in the background after the step already failed.
+pub async fn run_with_timeout(
+    agent: &str, command: &str, env: &[String], timeout: Option<Duration>,
+) -> Result<(i64, String), String> {
     let ws = workspace_dir();
     std::fs::create_dir_all(&ws).map_err(|e| format!("workspace {} unusable: {e}", ws.display()))?;
 
     if !tmux_available() || !session_alive(agent).await {
-        return run_headless(&ws, command, env).await;
+        return run_headless(&ws, command, env, timeout).await;
     }
 
     let tmp = crate::data_dir().join("tmp");
@@ -259,6 +274,8 @@ pub async fn run(agent: &str, command: &str, env: &[String]) -> Result<(i64, Str
     }
     let window_id = String::from_utf8_lossy(&window_id.stdout).trim().to_string();
 
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let mut tmux_errors = 0u32;
     loop {
         if let Ok(code) = std::fs::read_to_string(&code_file) {
             // written only after tee's pipe closed — output is fully flushed
@@ -269,20 +286,52 @@ pub async fn run(agent: &str, command: &str, env: &[String]) -> Result<(i64, Str
             let code = code.trim().parse::<i64>().unwrap_or(-1);
             return Ok((code, output));
         }
-        if !window_exists(agent, &window_id).await {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                let output = std::fs::read_to_string(&out_file).unwrap_or_default();
+                let _ = kill_window(agent, &window_id).await;
+                let _ = std::fs::remove_file(&out_file);
+                let _ = std::fs::remove_file(&code_file);
+                let tail = output.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
+                return Err(if tail.trim().is_empty() {
+                    format!("command timed out after {secs}s")
+                } else {
+                    format!("command timed out after {secs}s; last output:\n{tail}")
+                });
+            }
+        }
+        match window_exists(agent, &window_id).await {
+            Some(true) => tmux_errors = 0,
             // the pane died without finishing — the user killed the session,
             // or the tmux server went down. Report what streamed so far.
-            let output = std::fs::read_to_string(&out_file).unwrap_or_default();
-            let _ = std::fs::remove_file(&out_file);
-            return Ok((-1, format!("{output}\n(the agent's tmux window closed before the command finished)")));
+            Some(false) => {
+                let output = std::fs::read_to_string(&out_file).unwrap_or_default();
+                let _ = std::fs::remove_file(&out_file);
+                let _ = std::fs::remove_file(&code_file);
+                return Ok((-1, format!("{output}\n(the agent's tmux window closed before the command finished)")));
+            }
+            // tmux could not answer — do not mistake a transient error for
+            // death (the command would keep running unseen). Give it 15s.
+            None => {
+                tmux_errors += 1;
+                if tmux_errors > 100 {
+                    let _ = kill_window(agent, &window_id).await;
+                    let _ = std::fs::remove_file(&out_file);
+                    let _ = std::fs::remove_file(&code_file);
+                    return Err("tmux stopped responding while the command was running".into());
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
-async fn run_headless(ws: &std::path::Path, command: &str, env: &[String]) -> Result<(i64, String), String> {
+async fn run_headless(
+    ws: &std::path::Path, command: &str, env: &[String], timeout: Option<Duration>,
+) -> Result<(i64, String), String> {
     let mut cmd = tokio::process::Command::new("bash");
-    cmd.arg("-c").arg(command).current_dir(ws);
+    cmd.arg("-c").arg(command).current_dir(ws).kill_on_drop(true);
     for kv in env {
         if let Some((k, v)) = kv.split_once('=') {
             if valid_env_key(k) {
@@ -290,7 +339,13 @@ async fn run_headless(ws: &std::path::Path, command: &str, env: &[String]) -> Re
             }
         }
     }
-    let out = cmd.output().await.map_err(|e| format!("bash spawn failed: {e}"))?;
+    let out = match timeout {
+        Some(d) => match tokio::time::timeout(d, cmd.output()).await {
+            Ok(r) => r.map_err(|e| format!("bash spawn failed: {e}"))?,
+            Err(_) => return Err(format!("command timed out after {}s", d.as_secs())),
+        },
+        None => cmd.output().await.map_err(|e| format!("bash spawn failed: {e}"))?,
+    };
     let mut text = out.stdout;
     text.extend_from_slice(&out.stderr);
     Ok((out.status.code().map(i64::from).unwrap_or(-1), String::from_utf8_lossy(&text).into_owned()))

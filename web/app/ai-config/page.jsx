@@ -19,11 +19,15 @@ export default function AIConfigPage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
   const [newModel, setNewModel] = useState('')
 
   useEffect(() => {
     authFetch(`${API}/providers`).then(r => r.json()).then(setProviders).catch(() => setProviders([]))
-    authFetch(`${API}/config`).then(r => r.json()).then(setConfig).catch(() => setConfig(null))
+    authFetch(`${API}/config`)
+      .then(r => r.json().then(d => { if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`); return d }))
+      .then(setConfig)
+      .catch(e => setLoadError(e.message))
   }, [])
 
   function pickProvider(p) {
@@ -36,15 +40,19 @@ export default function AIConfigPage() {
   }
 
   function setPrice(model, field, value) {
+    // Keep the RAW input string while editing: parsing on every keystroke turns
+    // "0." and "" into 0, so the field snaps back and decimals cannot be typed.
     setConfig(c => ({
       ...c,
       pricing: {
         ...(c.pricing || {}),
-        [model]: { ...(c.pricing?.[model] || {}), [field]: Math.max(0, Number(value) || 0) },
+        [model]: { ...(c.pricing?.[model] || {}), [field]: value },
       },
     }))
     setSaved(false)
   }
+
+  const num = v => Math.max(0, Number(v) || 0)
 
   function addModel() {
     const model = newModel.trim()
@@ -75,9 +83,12 @@ export default function AIConfigPage() {
       const body = {
         ai_provider: config.ai_provider,
         ai_base_url: config.ai_base_url,
-        pricing: config.pricing || {},
-        default_input_per_mtok: Number(config.default_input_per_mtok) || 0,
-        default_output_per_mtok: Number(config.default_output_per_mtok) || 0,
+        pricing: Object.fromEntries(Object.entries(config.pricing || {}).map(([m, p]) => [m, {
+          input_per_mtok: num(p?.input_per_mtok),
+          output_per_mtok: num(p?.output_per_mtok),
+        }])),
+        default_input_per_mtok: num(config.default_input_per_mtok),
+        default_output_per_mtok: num(config.default_output_per_mtok),
       }
       if (apiKey) body.ai_api_key = apiKey
       const res = await authFetch(`${API}/config`, {
@@ -97,7 +108,11 @@ export default function AIConfigPage() {
   }
 
   if (!config) {
-    return <div className="px-7 pt-5 text-muted-foreground/70">Loading configuration…</div>
+    return (
+      <div className="px-7 pt-5 text-[13px] text-muted-foreground/70" data-testid="config-loading">
+        {loadError ? `โหลด config ไม่ได้: ${loadError}` : 'Loading configuration…'}
+      </div>
+    )
   }
 
   return (
@@ -222,14 +237,14 @@ export default function AIConfigPage() {
                 type="number" min="0" step="0.01"
                 className="h-8 text-[11.5px] tabular-nums"
                 value={config.default_input_per_mtok ?? 0}
-                onChange={e => { setConfig({ ...config, default_input_per_mtok: Math.max(0, Number(e.target.value) || 0) }); setSaved(false) }}
+                onChange={e => { setConfig({ ...config, default_input_per_mtok: e.target.value }); setSaved(false) }}
                 aria-label="default input price"
               />
               <Input
                 type="number" min="0" step="0.01"
                 className="h-8 text-[11.5px] tabular-nums"
                 value={config.default_output_per_mtok ?? 0}
-                onChange={e => { setConfig({ ...config, default_output_per_mtok: Math.max(0, Number(e.target.value) || 0) }); setSaved(false) }}
+                onChange={e => { setConfig({ ...config, default_output_per_mtok: e.target.value }); setSaved(false) }}
                 aria-label="default output price"
               />
               <span />

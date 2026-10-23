@@ -24,13 +24,13 @@ export default function AuthGate({ children }) {
     let alive = true
     const check = async () => {
       try {
-        const cfg = await (await fetch(`${API}/config`)).json()
-        if (!alive) return
-        if (!cfg.auth_required) { setState('open'); return }
+        // /auth/me is the only public probe: it reports auth_required itself, so
+        // the gate never needs the (session-protected) /config endpoint.
         const token = getToken()
-        if (!token) { setState('locked'); return }
-        const me = await fetch(`${API}/auth/me`, { headers: { 'x-session-token': token } }).then(r => r.json())
+        const headers = token ? { 'x-session-token': token } : {}
+        const me = await fetch(`${API}/auth/me`, { headers }).then(r => r.json())
         if (!alive) return
+        if (!me.auth_required) { setState('open'); return }
         setState(me.valid ? 'open' : 'locked')
       } catch {
         if (alive) setState('open') // backend unreachable — let pages surface their own errors

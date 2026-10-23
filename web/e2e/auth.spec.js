@@ -21,7 +21,8 @@ test.describe('Auth gate', () => {
   })
 
   test('unauthenticated UI shows only the locked screen', async ({ page, request }) => {
-    test.skip(!(await (await request.get(`${API}/config`)).json()).auth_required, 'auth disabled')
+    const authRequired = (await (await request.get(`${API}/auth/me`)).json()).auth_required
+    test.skip(!authRequired, 'auth disabled')
 
     await page.goto('/containers/agent-dev-be')
     const locked = page.getByTestId('auth-locked')
@@ -35,7 +36,8 @@ test.describe('Auth gate', () => {
   })
 
   test('login with valid credentials restores access', async ({ page, request }) => {
-    test.skip(!(await (await request.get(`${API}/config`)).json()).auth_required, 'auth disabled')
+    const authRequired = (await (await request.get(`${API}/auth/me`)).json()).auth_required
+    test.skip(!authRequired, 'auth disabled')
 
     await page.goto('/login')
     await page.getByLabel('Username').fill(process.env.ADMIN_USER || 'admin')

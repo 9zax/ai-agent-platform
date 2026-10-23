@@ -712,6 +712,12 @@ struct Run {
     /// pre-push diff review (None = gate not reached / skipped)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     review: Option<RunReview>,
+    /// watchdog: no heartbeat from the engine for too long (None = healthy).
+    /// Advisory only — it never changes the run's status; the user decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog_note: Option<String>,
+    #[serde(default)]
+    watchdog_at: u64,
 }
 
 fn default_trigger() -> String { "manual".into() }
@@ -1141,7 +1147,11 @@ impl App {
         match code {
             0 => Ok(path),
             3 => Err(err(StatusCode::BAD_GATEWAY, "git is not installed on this machine — brew install git")),
-            _ => Err(err(StatusCode::BAD_GATEWAY, format!("cloning {repo_url} into {path} failed (exit {code}): {out}"))),
+            _ => {
+                // git often echoes the remote URL, which carries the PAT.
+                let safe_out = if git_token.is_empty() { out.clone() } else { out.replace(&git_token, "***") };
+                Err(err(StatusCode::BAD_GATEWAY, format!("cloning {repo_url} into {path} failed (exit {code}): {safe_out}")))
+            }
         }
     }
 
@@ -1276,7 +1286,13 @@ impl App {
             return Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team"));
         }
 
-        let client = reqwest::Client::new();
+        // A provider that accepts the connection and then goes silent would
+        // otherwise hang the step (and the whole run) forever.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client init failed: {e}")))?;
         let resp: reqwest::Response = if template.protocol == "anthropic" {
             client.post(format!("{base}/v1/messages"))
                 .header("x-api-key", &api_key)
@@ -1858,7 +1874,8 @@ async fn container_files(State(app): State<App>, headers: axum::http::HeaderMap,
     if status != "running" {
         return Err(err(StatusCode::BAD_REQUEST, format!("Agent is not running (status: {status})")));
     }
-    let cmd = format!("ls -la {} 2>&1 || ls -la /", q.path);
+    // q.path is user input — never interpolate it raw into a shell string.
+    let cmd = format!("ls -la -- {} 2>&1 || ls -la -- {}", hostexec::shq(&q.path), hostexec::shq(&q.path));
     let (_, output) = app.exec_in(&name, &cmd).await?;
     Ok(json_ok(json!({ "path": q.path, "output": output })))
 }
@@ -2517,7 +2534,8 @@ async fn list_agents(State(app): State<App>, headers: axum::http::HeaderMap) -> 
     Ok(json_ok(Value::Array(agents)))
 }
 
-async fn create_persona(State(app): State<App>, Json(mut p): Json<Persona>) -> ApiResult {
+async fn create_persona(State(app): State<App>, headers: axum::http::HeaderMap, Json(mut p): Json<Persona>) -> ApiResult {
+    app.require_auth(&headers)?;
     p.role = p.role.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>().trim_matches('-').to_string();
     if p.role.is_empty() || p.name.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "role and name are required"));
@@ -2542,7 +2560,8 @@ async fn create_persona(State(app): State<App>, Json(mut p): Json<Persona>) -> A
     Ok(json_ok(serde_json::to_value(p).unwrap()))
 }
 
-async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(req): Json<PersonaUpdate>) -> ApiResult {
+async fn update_persona(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>, Json(req): Json<PersonaUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let provider_id = store.config.ai_provider.clone();
     // Validate the harness transition against the FINAL state before mutating.
@@ -2582,7 +2601,8 @@ async fn update_persona(State(app): State<App>, Path(role): Path<String>, Json(r
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_persona(State(app): State<App>, Path(role): Path<String>) -> ApiResult {
+async fn delete_persona(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.personas.len();
     store.personas.retain(|p| p.role != role);
@@ -2623,7 +2643,8 @@ async fn list_tasks(State(app): State<App>, headers: axum::http::HeaderMap) -> R
     Ok(Json(app.store.lock().unwrap().tasks.clone()))
 }
 
-async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> ApiResult {
+async fn create_task(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<TaskCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     store.task_counter += 1;
     let status = match req.status.as_str() {
@@ -2646,7 +2667,8 @@ async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> Api
     Ok(json_ok(serde_json::to_value(task).unwrap()))
 }
 
-async fn delete_task(State(app): State<App>, Path(task_id): Path<String>) -> ApiResult {
+async fn delete_task(State(app): State<App>, headers: axum::http::HeaderMap, Path(task_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.tasks.len();
     store.tasks.retain(|t| t.id != task_id);
@@ -2686,11 +2708,13 @@ fn config_json(cfg: &AiConfig) -> Value {
     })
 }
 
-async fn get_config(State(app): State<App>) -> Json<Value> {
-    Json(config_json(&app.store.lock().unwrap().config))
+async fn get_config(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
+    Ok(json_ok(config_json(&app.store.lock().unwrap().config)))
 }
 
-async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) -> ApiResult {
+async fn update_config(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<ConfigUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     if let Some(p) = req.ai_provider.as_deref() {
         if provider_template(p).is_none() {
             let ids: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
@@ -2732,7 +2756,8 @@ async fn list_skills(State(app): State<App>, headers: axum::http::HeaderMap) -> 
     Ok(Json(app.store.lock().unwrap().skills.clone()))
 }
 
-async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> ApiResult {
+async fn create_skill(State(app): State<App>, headers: axum::http::HeaderMap, Json(req): Json<SkillCreate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let id: String = req.name.to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -2757,7 +2782,8 @@ async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> A
     Ok(json_ok(serde_json::to_value(skill).unwrap()))
 }
 
-async fn update_skill(State(app): State<App>, Path(skill_id): Path<String>, Json(req): Json<SkillUpdate>) -> ApiResult {
+async fn update_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>, Json(req): Json<SkillUpdate>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
@@ -2793,7 +2819,8 @@ async fn update_skill(State(app): State<App>, Path(skill_id): Path<String>, Json
 
 /// Restore a previous snapshot; the current state is snapshotted first so the
 /// restore itself is undoable.
-async fn restore_skill(State(app): State<App>, Path((skill_id, version)): Path<(String, u32)>) -> ApiResult {
+async fn restore_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path((skill_id, version)): Path<(String, u32)>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
@@ -2818,7 +2845,8 @@ async fn restore_skill(State(app): State<App>, Path((skill_id, version)): Path<(
 }
 
 /// Save the Skill Studio test bench inputs (trimmed, non-empty, max 20).
-async fn set_skill_tests(State(app): State<App>, Path(skill_id): Path<String>, Json(req): Json<SkillTestsInput>) -> ApiResult {
+async fn set_skill_tests(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>, Json(req): Json<SkillTestsInput>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let skill = store.skills.iter_mut().find(|s| s.id == skill_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Skill '{skill_id}' not found")))?;
@@ -2884,7 +2912,8 @@ async fn run_skill_tests(
     Ok(json_ok(serde_json::to_value(out).unwrap()))
 }
 
-async fn delete_skill(State(app): State<App>, Path(skill_id): Path<String>) -> ApiResult {
+async fn delete_skill(State(app): State<App>, headers: axum::http::HeaderMap, Path(skill_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
     let len = store.skills.len();
     store.skills.retain(|s| s.id != skill_id);
@@ -3320,6 +3349,63 @@ fn runs_file() -> std::path::PathBuf {
     data_dir().join("runs.json")
 }
 
+/// Repair permissions left by older builds: the data dir holds sessions,
+/// tokens and API keys, so it must be 0700 and every store file 0600 — an
+/// upgrade should not leave a world-readable config.json behind.
+fn harden_data_dir() {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() { continue; }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") || name.ends_with(".json.tmp") {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Create files 0600 (never a world-readable window) and fsync the file + its
+/// directory before returning, so a crash cannot leave a truncated or
+/// plainly-readable store behind. The tmp name is unique per process.
+fn write_atomic_private(path: &std::path::Path, payload: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "data.json".into());
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp)?
+    };
+    file.write_all(payload.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 /// Atomic whole-file save of the run history (tmp + rename — a crash never
 /// leaves a half-written file). Called after every run mutation.
 fn save_runs(store: &Store) {
@@ -3332,13 +3418,9 @@ fn save_runs(store: &Store) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let dir = data_dir();
-    if std::fs::create_dir_all(&dir).is_err() { return; }
-    let path = runs_file();
-    let tmp = dir.join("runs.json.tmp");
     // Best effort: platform keeps working in memory even when the disk write fails.
-    if std::fs::write(&tmp, payload).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
-        eprintln!("warning: could not persist runs to {}", path.display());
+    if let Err(e) = write_atomic_private(&runs_file(), &payload) {
+        eprintln!("warning: could not persist runs: {e}");
     }
 }
 
@@ -3360,8 +3442,10 @@ fn load_runs(store: &mut Store) {
     };
     let mut runs = parsed.runs;
     let now = now_secs();
+    let mut dirty = false;
     for run in runs.iter_mut() {
         if run.status == "running" || run.status == "waiting_human" {
+            dirty = true;
             run.status = "stopped".into();
             run.phase = "done".into();
             for d in run.discussions.iter_mut().filter(|d| d.status != "resolved") {
@@ -3378,6 +3462,7 @@ fn load_runs(store: &mut Store) {
         // the finish gap) must not carry steps stuck at "working": nobody will
         // ever advance them, and the UI would show a busy spinner forever.
         for step in run.steps.iter_mut().filter(|s| s.status == "working") {
+            dirty = true;
             step.status = "stopped".into();
             step.output = "stopped mid-work — the run already ended while this step was in flight".into();
             if step.finished_at == 0 { step.finished_at = now; }
@@ -3398,6 +3483,11 @@ fn load_runs(store: &mut Store) {
     store.project_counter = store.project_counter.max(max_pid);
     println!("restored {} run(s) from {}", runs.len(), runs_file().display());
     store.runs = runs;
+    if dirty {
+        // Persist the restart cleanup — otherwise every boot re-closes (and
+        // re-notifies) the same runs until the file is written by something else.
+        save_runs(store);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3615,23 +3705,15 @@ fn load_agents(store: &mut Store) {
 }
 
 /// Generic atomic JSON write for the smaller registries (tmp + rename).
-/// `private` = 0600 (config.json holds provider keys / the Git token).
-fn write_json_atomic<T: Serialize>(name: &str, value: &T, private: bool) -> bool {
-    let dir = data_dir();
-    if std::fs::create_dir_all(&dir).is_err() { return false; }
+/// All stores are private: they carry agent output, prompts and config, so
+/// they are created 0600 in a 0700 directory regardless of `_private`.
+fn write_json_atomic<T: Serialize>(name: &str, value: &T, _private: bool) -> bool {
     let payload = match serde_json::to_string_pretty(value) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let path = dir.join(name);
-    let tmp = dir.join(format!("{name}.tmp"));
-    if std::fs::write(&tmp, payload).is_err() { return false; }
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    let ok = std::fs::rename(&tmp, &path).is_ok();
+    let path = data_dir().join(name);
+    let ok = write_atomic_private(&path, &payload).is_ok();
     if !ok {
         eprintln!("warning: could not persist {}", path.display());
     }
@@ -3814,8 +3896,13 @@ fn cron_matches_day(spec: &CronSpec, t: &chrono::DateTime<Local>) -> bool {
 /// two years ahead so a nonsense-but-valid cron cannot loop forever.
 fn next_run_at(expr: &str, after_secs: u64) -> Option<u64> {
     let spec = cron_parse(expr)?;
-    let mut t = Local.timestamp_opt(after_secs as i64, 0).single()?
-        .with_second(0)?.with_nanosecond(0)?;
+    // DST fall-back makes one local minute ambiguous; .single() would return
+    // None and freeze that routine forever. Take the earliest occurrence.
+    let mut t = match Local.timestamp_opt(after_secs as i64, 0) {
+        chrono::LocalResult::Single(t) => t,
+        chrono::LocalResult::Ambiguous(a, _) => a,
+        chrono::LocalResult::None => return None,
+    }.with_second(0)?.with_nanosecond(0)?;
     t += chrono::Duration::minutes(1);
     for _ in 0..(366 * 2 * 24 * 60u32) {
         if spec.months.contains(&t.month())
@@ -3840,10 +3927,12 @@ fn fire_routine(app: &App, routine: &Routine) -> Result<Run, ApiError> {
     };
     let now = now_secs();
     if busy {
+        // Do NOT consume the occurrence: once the project frees up, the next
+        // 30s tick fires the routine instead of silently skipping it (the
+        // Paperclip "event wake" behaviour, adapted to cron).
         let mut store = app.store.lock().unwrap();
         if let Some(r) = store.routines.iter_mut().find(|r| r.id == routine.id) {
-            r.last_run_at = now;
-            r.last_result = "skipped: project busy".into();
+            r.last_result = format!("waiting: project busy (since {})", now);
         }
         save_routines(&store);
         return Err(err(StatusCode::CONFLICT, "project already has a running mission"));
@@ -3916,39 +4005,39 @@ fn repo_dir_name(repo_url: &str) -> String {
     if cleaned.is_empty() { "repo".into() } else { cleaned }
 }
 
-/// Write a text deliverable into the shared workspace via a quoted heredoc.
-async fn write_deliverable(app: &App, agent: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
+/// Write a text deliverable into the shared workspace. Host execution means
+/// the workspace is a local path — write it directly instead of piping model
+/// output through a heredoc, so an emitted `AAP_EOF_…` line can never run
+/// shell commands on the user's machine.
+async fn write_deliverable(_app: &App, _agent: &str, run_id: &str, role: &str, output: &str) -> Result<String, ApiError> {
     let clean = output.replace('\r', "");
     let ws = hostexec::workspace_str();
-    let path = format!("{ws}/{run_id}-{role}.md");
-    let script = format!(
-        "mkdir -p '{ws}' && cat > '{path}' << 'AAP_EOF_9Z'\n{clean}\nAAP_EOF_9Z\n",
-    );
-    let (exit_code, out) = app.exec_in(agent, &script).await?;
-    if exit_code != 0 {
-        return Err(err(StatusCode::BAD_GATEWAY, format!("writing deliverable failed (exit {exit_code}): {out}")));
+    let path = std::path::PathBuf::from(format!("{ws}/{run_id}-{role}.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| err(
+            StatusCode::INTERNAL_SERVER_ERROR, format!("could not create {}: {e}", parent.display())))?;
     }
-    Ok(path)
+    std::fs::write(&path, clean).map_err(|e| err(
+        StatusCode::INTERNAL_SERVER_ERROR, format!("writing {} failed: {e}", path.display())))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
-/// Write FILES-block entries into the repo working tree in the shared
-/// workspace (mkdir -p + quoted heredoc — same pattern as write_deliverable;
-/// paths were charset-guarded by parse_files). Returns how many files landed.
-async fn apply_files_to_repo(app: &App, agent: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
+/// Write FILES-block entries into the repo working tree (a local path under
+/// host execution). Written directly — never through a shell heredoc — and
+/// traversal is rejected here even though parse_files already guards it.
+async fn apply_files_to_repo(_app: &App, _agent: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
+    let root = std::path::Path::new(repo_path);
     let mut applied = 0usize;
     for (path, content) in files {
-        let dir = match path.rsplit_once('/').map(|(d, _)| d) {
-            Some(d) if !d.is_empty() => d,
-            _ => ".",
-        };
-        let script = format!(
-            "mkdir -p '{repo_path}/{dir}' && cat > '{repo_path}/{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n",
-            content.replace('\r', ""),
-        );
-        let (code, out) = app.exec_in(agent, &script).await.map_err(|e| e.1)?;
-        if code != 0 {
-            return Err(format!("writing {path} failed (exit {code}): {out}"));
+        if path.starts_with('/') || path.split('/').any(|c| c == ".." || c == ".") {
+            return Err(format!("refusing unsafe file path '{path}'"));
         }
+        let full = root.join(path);
+        if let Some(dir) = full.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(&full, content.replace('\r', ""))
+            .map_err(|e| format!("writing {path} failed: {e}"))?;
         applied += 1;
     }
     Ok(applied)
@@ -4119,13 +4208,16 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
         None => (None, None),
     };
     let mut store = app.store.lock().unwrap();
-    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
-        step.status = "done".into();
-        step.output = output.to_string();
-        step.container = container;
-        step.deliverable = deliverable;
-        step.finished_at = now_secs();
-        if rev.is_some() { step.rev = rev; }
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if run.status != "running" && run.status != "waiting_human" { return; }
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == "work") {
+            step.status = "done".into();
+            step.output = output.to_string();
+            step.container = container;
+            step.deliverable = deliverable;
+            step.finished_at = now_secs();
+            if rev.is_some() { step.rev = rev; }
+        }
     }
     save_runs(&store);
 }
@@ -4133,6 +4225,14 @@ async fn deliver_and_close(app: &App, run_id: &str, role: &str, output: &str, re
 /// True once POST /runs/{id}/stop flagged this run.
 fn stop_requested(app: &App, run_id: &str) -> bool {
     app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).map(|r| r.stop_requested).unwrap_or(false)
+}
+
+/// Terminal runs (done / stopped / error) must never be moved back to life by
+/// a late tail write — only the explicit per-step retry endpoint reopens one.
+fn run_is_live(app: &App, run_id: &str) -> bool {
+    app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id)
+        .map(|r| r.status == "running" || r.status == "waiting_human")
+        .unwrap_or(false)
 }
 
 /// USD per million tokens for a model: the editable table first, then the
@@ -4271,11 +4371,103 @@ async fn guard_budget(app: &App, run_id: &str) -> bool {
     }
 }
 
+/// Fail closed when a project budget is set but the model has no price: an
+/// unpriceable call would add $0 to the ledger and silently defeat the whole
+/// guardrail. The run pauses (waiting_human) and resumes only once AI Config
+/// has a price for the model (then a chat reply re-checks), or the user stops.
+async fn guard_model_pricing(app: &App, run_id: &str, model: &str) -> bool {
+    let has_budget = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .and_then(|r| r.budget_usd)
+            .map(|b| b > 0.0)
+            .unwrap_or(false)
+    };
+    if !has_budget { return true; }
+    loop {
+        let (ip, op, _) = model_price(app, model);
+        if ip > 0.0 || op > 0.0 { return true; }
+        let disc_id = {
+            let mut store = app.store.lock().unwrap();
+            let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) else { return false };
+            if run.status != "running" && run.status != "waiting_human" { return false; }
+            if let Some(d) = run.discussions.iter().rev().find(|d| d.kind == "unpriced" && d.status != "resolved") {
+                d.id.clone()
+            } else {
+                let id = format!("d-{:03}", run.discussions.len() + 1);
+                run.status = "waiting_human".into();
+                run.phase = "budget".into();
+                run.discussions.push(Discussion {
+                    id: id.clone(),
+                    kind: "unpriced".into(),
+                    from: "orchestrator".into(),
+                    to: vec!["human".into()],
+                    topic: format!("โมเดล {model} ยังไม่มีราคา — งบประมาณคุมไม่ได้"),
+                    status: "need_human".into(),
+                    answering: Some("human".into()),
+                    messages: vec![MeetingMessage {
+                        from: "orchestrator".into(),
+                        text: format!(
+                            "⚖️ This project has a budget, but model '{model}' has no price in AI Config — cost would record as $0 and the guardrail would never trip. Add input/output USD per 1M tokens for this model (or set the default price), then reply here to continue. Chat alone cannot bypass this check; Stop ends the run."
+                        ),
+                        at: now_secs(),
+                    }],
+                    round: 0,
+                    created_at: now_secs(),
+                });
+                id
+            }
+        };
+        save_runs(&app.store.lock().unwrap());
+        match wait_for_human(app, run_id, &disc_id).await {
+            HumanOutcome::Answered => {
+                let (ip, op, _) = model_price(app, model);
+                if ip > 0.0 || op > 0.0 {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                            d.status = "resolved".into();
+                            d.answering = None;
+                        }
+                    }
+                    save_runs(&store);
+                    return true;
+                }
+                let mut store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                    run.status = "waiting_human".into();
+                    run.phase = "budget".into();
+                    if let Some(d) = run.discussions.iter_mut().find(|d| d.id == disc_id) {
+                        d.status = "need_human".into();
+                        d.answering = Some("human".into());
+                        d.messages.push(MeetingMessage {
+                            from: "orchestrator".into(),
+                            text: format!("Still no price for '{model}' — add it in AI Config → Pricing, then reply again."),
+                            at: now_secs(),
+                        });
+                    }
+                }
+                save_runs(&store);
+            }
+            HumanOutcome::Stopped | HumanOutcome::TimedOut => {
+                finish_run(app, run_id, "stopped");
+                return false;
+            }
+        }
+    }
+}
+
 /// One LLM call inside a run: budget guard, retry, usage ledger. `kind` "" =
 /// call not attached to a step (meeting answers, PR text, PO summary).
 /// `Ok(None)` = the guard stopped the run — the caller must wind down.
 async fn llm_step(app: &App, run_id: &str, role: &str, kind: &str, model: &str, system: &str, user: &str, max: u32) -> Result<Option<String>, ApiError> {
+    if stop_requested(app, run_id) || !run_is_live(app, run_id) {
+        return Ok(None);
+    }
     if !guard_budget(app, run_id).await {
+        return Ok(None);
+    }
+    if !guard_model_pricing(app, run_id, model).await {
         return Ok(None);
     }
     let (text, usage) = llm_retry_usage(app, model, system, user, max).await?;
@@ -4360,6 +4552,7 @@ async fn harness_step(
     app: &App, run_id: &str, role: &str, harness: &str, custom: &str,
     model: &str, system: &str, user: &str,
 ) -> Result<Option<String>, ApiError> {
+    if stop_requested(app, run_id) || !run_is_live(app, run_id) { return Ok(None); }
     if !guard_budget(app, run_id).await { return Ok(None); }
     let template = harness_template(harness, custom).ok_or_else(|| err(
         StatusCode::BAD_REQUEST,
@@ -4384,24 +4577,18 @@ async fn harness_step(
     let _ = std::fs::create_dir_all(&tmp);
     let n = app.seq.fetch_add(1, Ordering::SeqCst);
     let prompt_file = tmp.join(format!("harness-{n}.md"));
-    std::fs::write(&prompt_file, format!("{system}\n\n{user}\n")).map_err(|e| err(
+    write_atomic_private(&prompt_file, &format!("{system}\n\n{user}\n")).map_err(|e| err(
         StatusCode::INTERNAL_SERVER_ERROR, format!("could not write harness prompt: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600));
-    }
     let cmd = template
-        .replace("{prompt_file}", &prompt_file.to_string_lossy())
-        .replace("{model}", model)
-        .replace("{role}", role);
-    let run = tokio::time::timeout(
-        std::time::Duration::from_secs(HARNESS_TIMEOUT_SECS),
-        hostexec::run(&cid, &cmd, &[]),
+        .replace("{prompt_file}", &hostexec::shq(&prompt_file.to_string_lossy()))
+        .replace("{model}", &hostexec::shq(model))
+        .replace("{role}", &hostexec::shq(role));
+    let run = hostexec::run_with_timeout(
+        &cid, &cmd, &[], Some(std::time::Duration::from_secs(HARNESS_TIMEOUT_SECS)),
     ).await;
     let _ = std::fs::remove_file(&prompt_file);
     match run {
-        Ok(Ok((0, out))) => {
+        Ok((0, out)) => {
             let out = out.trim().to_string();
             if out.is_empty() {
                 Err(err(StatusCode::BAD_GATEWAY, format!("harness '{harness}' returned an empty answer")))
@@ -4409,11 +4596,11 @@ async fn harness_step(
                 Ok(Some(out))
             }
         }
-        Ok(Ok((code, out))) => Err(err(StatusCode::BAD_GATEWAY, format!(
+        Ok((code, out)) => Err(err(StatusCode::BAD_GATEWAY, format!(
             "harness '{harness}' exited {code}: {}", one_line(&out, 400)))),
-        Ok(Err(e)) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("harness failed: {e}"))),
-        Err(_) => Err(err(StatusCode::GATEWAY_TIMEOUT, format!(
-            "harness '{harness}' timed out after {} min", HARNESS_TIMEOUT_SECS / 60))),
+        Err(e) if e.contains("timed out") => Err(err(StatusCode::GATEWAY_TIMEOUT, format!(
+            "harness '{harness}' timed out after {} min and was killed", HARNESS_TIMEOUT_SECS / 60))),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("harness failed: {e}"))),
     }
 }
 
@@ -4434,11 +4621,22 @@ fn finish_run(app: &App, run_id: &str, status: &str) {
         }
         run.status = status.into();
         run.phase = "done".into();
+        run.watchdog_note = None;
+        run.watchdog_at = 0;
         for d in run.discussions.iter_mut().filter(|d| d.status != "resolved") {
             d.status = "resolved".into();
             d.answering = None;
         }
         save_runs(&store);
+    }
+}
+
+/// Exit point for an `Ok(None)` from llm_step: the user pressed Stop (close the
+/// run as stopped) or the budget guard paused it (leave waiting_human intact).
+/// Returning without this left a stopped run looking alive forever.
+fn wind_down_or_pause(app: &App, run_id: &str) {
+    if stop_requested(app, run_id) {
+        finish_run(app, run_id, "stopped");
     }
 }
 
@@ -4716,13 +4914,14 @@ impl PrOutcome {
 /// same persona can own work/pr/demo steps in one run.
 async fn step_transition(app: &App, run_id: &str, role: &str, kind: &str, status: &str, output: &str) {
     let mut store = app.store.lock().unwrap();
-    if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id)
-        .and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == kind))
-    {
-        step.status = status.into();
-        step.output = output.to_string();
-        if status == "working" { step.started_at = now_secs(); }
-        if status == "done" || status == "error" || status == "skipped" { step.finished_at = now_secs(); }
+    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        if run.status != "running" && run.status != "waiting_human" { return; }
+        if let Some(step) = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind) {
+            step.status = status.into();
+            step.output = output.to_string();
+            if status == "working" { step.started_at = now_secs(); }
+            if status == "done" || status == "error" || status == "skipped" { step.finished_at = now_secs(); }
+        }
     }
     save_runs(&store);
 }
@@ -4866,6 +5065,9 @@ fn open_review(app: &App, run_id: &str, files: &[String], diff: &str) -> String 
     let mut store = app.store.lock().unwrap();
     let disc_id = format!("d-{:03}", store.runs.iter().find(|r| r.id == run_id).map(|r| r.discussions.len() + 1).unwrap_or(1));
     if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+        // A budget stop / user stop may have closed the run while the diff was
+        // being staged — never resurrect it as a live review.
+        if run.status != "running" { return String::new(); }
         run.review = Some(RunReview {
             status: "pending".into(),
             diff: diff.to_string(),
@@ -4898,15 +5100,31 @@ fn open_review(app: &App, run_id: &str, files: &[String], diff: &str) -> String 
     disc_id
 }
 
-/// Wait for the human's decision on the pending review.
+/// Wait for the human's decision on the pending review. A plain chat message
+/// ("why this file?") wakes the wait but is NOT a decision — the review stays
+/// pending, the run stays visibly paused, and we keep waiting for an explicit
+/// Approve/Reject or an APPROVE/REJECT chat line.
 async fn wait_review(app: &App, run_id: &str, disc_id: &str) -> String {
-    match wait_for_human(app, run_id, disc_id).await {
-        HumanOutcome::Answered => review_state(app, run_id).0,
-        HumanOutcome::TimedOut => {
-            set_review_status(app, run_id, "timed_out", "");
-            "timed_out".into()
+    loop {
+        match wait_for_human(app, run_id, disc_id).await {
+            HumanOutcome::Answered => {
+                let status = review_state(app, run_id).0;
+                if status != "pending" { return status; }
+                {
+                    let mut store = app.store.lock().unwrap();
+                    if let Some(run) = store.runs.iter_mut().find(|r| r.id == run_id) {
+                        if run.status == "running" { run.status = "waiting_human".into(); }
+                        run.phase = "review".into();
+                    }
+                    save_runs(&store);
+                }
+            }
+            HumanOutcome::TimedOut => {
+                set_review_status(app, run_id, "timed_out", "");
+                return "timed_out".into();
+            }
+            HumanOutcome::Stopped => return "stopped".into(),
         }
-        HumanOutcome::Stopped => "stopped".into(),
     }
 }
 
@@ -4929,7 +5147,9 @@ async fn review_gate(
     let dev = persona_of(app, dev_role);
 
     for round in 0..MAX_REVIEW_ROUNDS {
+        if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
         let disc_id = open_review(app, run_id, &files, &diff);
+        if disc_id.is_empty() { return ReviewOutcome::Stopped; }
         let status = wait_review(app, run_id, &disc_id).await;
         // The review discussion is closed either way; the outcome is in Run.review.
         {
@@ -4959,11 +5179,17 @@ async fn review_gate(
                     if comment.is_empty() { "(no comment)" } else { &comment }, diff
                 );
                 if let Some(m) = dev.3.as_deref() {
-                    if let Ok(Some(output)) = llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
-                        let mut clean = strip_ask(&output);
-                        apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
+                    match llm_step(app, run_id, dev_role, "work", m, &system, &user, 6000).await {
+                        Ok(Some(output)) => {
+                            let mut clean = strip_ask(&output);
+                            apply_files_note(app, Some(repo_path), dev_role, &mut clean).await;
+                        }
+                        // The budget guard stopped the run mid-revision.
+                        Ok(None) => return ReviewOutcome::Stopped,
+                        Err(_) => {}
                     }
                 }
+                if !run_is_live(app, run_id) { return ReviewOutcome::Stopped; }
                 match collect_repo_diff(app, &cid, repo_path).await {
                     Some((f, d)) => { files = f; diff = d; }
                     None => return ReviewOutcome::Skip("the Dev revision produced no changes — nothing was pushed".into()),
@@ -5007,12 +5233,46 @@ async fn run_pr_stage(
     // gh auth + git identity for THIS container (idempotent, best-effort)
     app.ensure_tools(&cid).await;
 
-    // Branch + commit: everything that changed in the team's shared working
-    // tree rides the mission branch — deliverable markdown copied under
-    // missions/, PLUS any real code/design files the dev/UX agents applied
-    // via their FILES blocks during the relay.
-    let commit_msg = format!("mission {run_id}: team deliverables");
+    // Stage exactly what the PR would push BEFORE asking for review — branch,
+    // missions/ deliverables and the code/design files the dev/UX agents
+    // applied. The reviewed diff is therefore the pushed diff, and the gate
+    // lives here (inside the PR stage) so a retry cannot bypass it.
     let ws = hostexec::workspace_str();
+    let prep = format!(
+        "cd '{repo_path}' || exit 10; \
+         git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
+         git fetch --all --quiet >/dev/null 2>&1 || true; \
+         git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
+         mkdir -p 'missions/{run_id}'; \
+         cp '{ws}/{run_id}-*.md' 'missions/{run_id}/' 2>/dev/null || true; \
+         git add -A"
+    );
+    let (pcode, pout) = app.exec_in(&cid, &prep).await
+        .unwrap_or((-1, "exec failed".into()));
+    if pcode == 10 {
+        let n = format!("repo path {repo_path} disappeared on this machine");
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    if pout.contains("NO_REMOTE") {
+        let n = "no git remote 'origin' in the cloned repo — cannot push a PR".to_string();
+        step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+        return skip(n);
+    }
+    match review_gate(app, run_id, dev_role, repo_url, &repo_path, task, project_name).await {
+        ReviewOutcome::Proceed => {}
+        ReviewOutcome::Stopped => {
+            finish_run(app, run_id, "stopped");
+            return PrOutcome { status: "skipped".into(), url: String::new(), branch: branch.clone(), note: "run stopped during diff review".into() };
+        }
+        ReviewOutcome::Skip(n) => {
+            step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
+            return skip(n);
+        }
+    }
+
+    // Branch + commit: everything staged above rides the mission branch.
+    let commit_msg = format!("mission {run_id}: team deliverables");
     let script = format!(
         "cd '{repo_path}' || exit 10; \
          git remote get-url origin >/dev/null 2>&1 || {{ echo NO_REMOTE; exit 0; }}; \
@@ -5066,9 +5326,14 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
         },
         None => (format!("Mission {run_id}: {}", one_line(task, 60)), task.to_string()),
     };
-    let heredoc = |path: &str, content: &str| format!("cat > '{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n", content.replace('\r', ""));
-    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-title.txt", &title)).await;
-    let _ = app.exec_in(&cid, &heredoc("/tmp/aap-pr-body.md", &body)).await;
+    // PR text is model output — write it locally (0600) instead of heredoc'ing
+    // it through the shell, so an injected terminator line cannot execute.
+    let title_path = std::env::temp_dir().join(format!("aap-pr-title-{run_id}.txt"));
+    let body_path = std::env::temp_dir().join(format!("aap-pr-body-{run_id}.md"));
+    let _ = write_atomic_private(&title_path, &title.replace('\r', ""));
+    let _ = write_atomic_private(&body_path, &body.replace('\r', ""));
+    let title_arg = hostexec::shq(&title_path.to_string_lossy());
+    let body_arg = hostexec::shq(&body_path.to_string_lossy());
 
     // Auth gate → push → PR. Missing auth first triggers the in-mission device
     // flow (need-human chat with the code) — the run waits for the user to
@@ -5111,7 +5376,7 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
         return PrOutcome { status: "error".into(), url: String::new(), branch, note: n };
     }
     let (code, out) = app.exec_in(&cid, &format!(
-        "cd '{repo_path}' && gh pr create --head '{branch}' --title \"$(cat /tmp/aap-pr-title.txt)\" --body-file /tmp/aap-pr-body.md 2>&1"
+        "cd '{repo_path}' && gh pr create --head '{branch}' --title \"$(cat {title_arg})\" --body-file {body_arg} 2>&1"
     )).await.unwrap_or((-1, "exec failed".into()));
     let url = extract_pr_url(&out);
     if let Some(u) = url.filter(|_| code == 0) {
@@ -5763,7 +6028,7 @@ async fn execute_run(app: App, run_id: String) {
                     raise_discussion(&role, &to, &topic, 1);
                 }
             }
-            Ok(None) => return,
+            Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
             Ok(Some(_)) => {
                 let mut store = app.store.lock().unwrap();
                 if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
@@ -5898,7 +6163,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 };
                 let text = match answer {
                     Ok(Some(t)) if !t.is_empty() => t.trim().chars().take(900).collect::<String>(),
-                    Ok(None) => return,
+                    Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
                     Ok(Some(_)) => "(empty answer)".into(),
                     Err(e) => format!("⚠️ could not answer: {}", e.1),
                 };
@@ -5965,7 +6230,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                         None => {}
                     }
                 }
-                Ok(None) => return,
+                Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
                 // Revision failed — keep the round-1 deliverable, it is still valid work
                 _ => {
                     let mut store = app.store.lock().unwrap();
@@ -6008,29 +6273,22 @@ A teammate raised a blocking question that needs your expertise. Answer directly
         // Spending checkpoint before the tail: never commit/push for a run
         // whose budget is already exhausted.
         if !guard_budget(&app, &run_id).await { return; }
-        // Review gate: nothing is committed or pushed until the human approves
-        // the staged diff (approve → PR, first reject → one Dev revision).
-        let reviewed = if let Some(rp) = repo_path.as_deref() {
-            match review_gate(&app, &run_id, &dev_role, &repo_url, rp, &task, &project_name).await {
-                ReviewOutcome::Proceed => None,
-                ReviewOutcome::Stopped => { finish_run(&app, &run_id, "stopped"); return; }
-                ReviewOutcome::Skip(note) => {
-                    step_transition(&app, &run_id, &dev_role, "pr", "skipped", &note).await;
-                    Some(PrOutcome { status: "skipped".into(), url: String::new(), branch: run_id.clone(), note })
-                }
-            }
-        } else {
-            None
-        };
-        let pr = match reviewed {
-            Some(outcome) => outcome,
-            None => run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await,
-        };
-        if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
+        // run_pr_stage owns the review gate: it stages the exact diff, waits
+        // for the human's decision, then commits/pushes. Retries go through
+        // the same path, so there is no bypass.
+        let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
+        if stop_requested(&app, &run_id) || !run_is_live(&app, &run_id) {
+            finish_run(&app, &run_id, "stopped");
+            return;
+        }
         let qa_persona = persona_of(&app, "qa");
         let po_persona = persona_of(&app, "po");
         let acceptance = run_demo_session(&app, &run_id, &task, &project_name, &dev_role,
             &qa_persona, &dev_persona, &po_persona, &pr).await;
+        if stop_requested(&app, &run_id) || !run_is_live(&app, &run_id) {
+            finish_run(&app, &run_id, "stopped");
+            return;
+        }
         tail = Some((pr, acceptance));
     }
 
@@ -6065,7 +6323,7 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
         match result {
-            Ok(None) => return,
+            Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
             Ok(Some(summary)) if !summary.is_empty() => {
                 if let Some((cid, _)) = app.agent_container("po").await {
                     let _ = write_deliverable(&app, &cid, &run_id, "summary", &summary).await;
@@ -6081,19 +6339,21 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
     }
 
     // ---- Close the run, then let the PO decide the next loop iteration ----
+    // finish_run is the single close gate: it refuses to overwrite a run that
+    // was already stopped/closed (budget stop or user Stop), and it closes any
+    // step left "working" so the UI never shows a zombie.
     let all_error = {
-        let mut store = app.store.lock().unwrap();
-        let all_error = match store.runs.iter_mut().find(|r| r.id == run_id) {
-            Some(run) => {
-                run.status = if run.steps.iter().all(|s| s.status == "error") { "error".into() } else { "done".into() };
-                run.phase = "done".into();
-                run.steps.iter().all(|s| s.status == "error")
-            }
+        let store = app.store.lock().unwrap();
+        match store.runs.iter().find(|r| r.id == run_id) {
+            Some(run) => run.steps.iter().all(|s| s.status == "error"),
             None => return,
-        };
-        save_runs(&store);
-        all_error
+        }
     };
+    finish_run(&app, &run_id, if all_error { "error" } else { "done" });
+    // Only a genuinely completed run may spawn the next loop iteration; a
+    // budget/stop-closed run leaves the chain ended.
+    let closed_status = app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).map(|r| r.status.clone());
+    if closed_status.as_deref() != Some("done") { return; }
 
     // Loop mode: the PO looks at the whole chain so far and either writes the
     // next iteration's task or declares the goal done.
@@ -6244,7 +6504,7 @@ async fn retry_step_engine(app: App, run_id: String, role: String, kind: String)
                     }
                     deliver_and_close(&app, &run_id, &role, &clean, None).await;
                 }
-                Ok(None) => return,
+                Ok(None) => { wind_down_or_pause(&app, &run_id); return; }
                 Ok(Some(_)) => error_outcome("Model returned an empty answer".into()),
                 Err(e) => error_outcome(e.1),
             }
@@ -6317,9 +6577,33 @@ fn spawn_run_with(
         let p = store.projects.iter().find(|p| p.id == project_id)
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")))?;
         let (project_name, agents) = (p.name.clone(), p.agents.clone());
-        let (goal, budget_usd) = (p.goal.clone(), p.budget_usd);
+        let (goal, mut budget_usd) = (p.goal.clone(), p.budget_usd);
         if agents.is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "Project has no team — add agents on the flow first"));
+        }
+        // One live mission per project: manual runs (double-click / API), loop
+        // children and routines all share one working tree + one tmux session,
+        // so concurrent runs would cross-contaminate each other's commits.
+        if store.runs.iter().any(|r| r.project_id == project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+        {
+            return Err(err(StatusCode::CONFLICT,
+                "A mission is already active on this project — wait for it to finish or stop it first"));
+        }
+        // A loop child may only spend what the chain has left.
+        if iteration > 1 {
+            if let Some(parent) = store.runs.iter()
+                .filter(|r| r.project_id == project_id)
+                .max_by_key(|r| r.iteration)
+            {
+                if let Some(b) = parent.budget_usd {
+                    let remaining = (b - parent.cost_usd).max(0.0);
+                    if remaining <= 0.0 {
+                        return Err(err(StatusCode::CONFLICT, "loop stopped: project budget exhausted"));
+                    }
+                    budget_usd = Some(remaining);
+                }
+            }
         }
         let personas = store.personas.clone();
         let steps = agents.iter()
@@ -6362,6 +6646,8 @@ fn spawn_run_with(
             output_tokens: 0,
             cost_alerted: false,
             review: None,
+            watchdog_note: None,
+            watchdog_at: 0,
         };
         store.runs.push(run.clone());
         save_runs(&store);
@@ -6444,6 +6730,10 @@ async fn create_routine(
         return Err(err(StatusCode::BAD_REQUEST,
             "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
     }
+    if next_run_at(&cron, now_secs()).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST,
+            "this cron never fires (e.g. day 31 in February) — check the day-of-month / month combination"));
+    }
     let mut store = app.store.lock().unwrap();
     if !store.projects.iter().any(|p| p.id == project_id) {
         return Err(err(StatusCode::NOT_FOUND, format!("Project '{project_id}' not found")));
@@ -6483,6 +6773,10 @@ async fn update_routine(
         if cron_parse(cron).is_none() {
             return Err(err(StatusCode::BAD_REQUEST,
                 "invalid cron — use 5 fields (minute hour day-of-month month day-of-week), e.g. '0 9 * * 1-5'"));
+        }
+        if next_run_at(cron, now_secs()).is_none() {
+            return Err(err(StatusCode::BAD_REQUEST,
+                "this cron never fires (e.g. day 31 in February) — check the day-of-month / month combination"));
         }
         routine.cron = cron.to_string();
     }
@@ -6590,17 +6884,24 @@ async fn reply_discussion(
 async fn stop_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(run_id): Path<String>) -> ApiResult {
     app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
-    let status = match store.runs.iter_mut().find(|r| r.id == run_id) {
+    let (status, stalled) = match store.runs.iter_mut().find(|r| r.id == run_id) {
         Some(run) => {
             if run.status != "running" && run.status != "waiting_human" {
                 return Err(err(StatusCode::BAD_REQUEST, format!("Run is already {}", run.status)));
             }
             run.stop_requested = true;
-            run.status.clone()
+            (run.status.clone(), run.watchdog_note.is_some())
         }
         None => return Err(err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found"))),
     };
     save_runs(&store);
+    drop(store);
+    // A waiting run and a watchdog-flagged run have no engine tick coming:
+    // close them here, otherwise Stop leaves them "running" forever and the
+    // project stays blocked by its one-live-run rule.
+    if status == "waiting_human" || stalled {
+        finish_run(&app, &run_id, "stopped");
+    }
     Ok(json_ok(json!({ "ok": true, "status": status })))
 }
 
@@ -6731,11 +7032,23 @@ async fn retry_step(
 ) -> ApiResult {
     app.require_auth(&headers)?;
     let mut store = app.store.lock().unwrap();
+    {
+        let run = store.runs.iter().find(|r| r.id == run_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+        if run.status == "running" || run.status == "waiting_human" {
+            return Err(err(StatusCode::BAD_REQUEST, format!("Run is still {} — wait for it to finish first", run.status)));
+        }
+        // Reopening this run must not collide with a newer live mission on the
+        // same project (same working tree + branch).
+        if store.runs.iter().any(|r| r.id != run_id && r.project_id == run.project_id
+            && (r.status == "running" || r.status == "waiting_human"))
+        {
+            return Err(err(StatusCode::CONFLICT,
+                "A newer mission is active on this project — wait for it to finish before retrying this step"));
+        }
+    }
     let run = store.runs.iter_mut().find(|r| r.id == run_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
-    if run.status == "running" || run.status == "waiting_human" {
-        return Err(err(StatusCode::BAD_REQUEST, format!("Run is still {} — wait for it to finish first", run.status)));
-    }
     let step = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Step '{role}/{kind}' not found in run '{run_id}'")))?;
     if step.status != "error" && step.status != "skipped" && step.status != "stopped" {
@@ -6850,9 +7163,38 @@ async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, 
 // Admin auth — one password gates console access to all containers
 // ---------------------------------------------------------------------------
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 32 random bytes from the OS → 64 hex chars. Falls back to hashing a few
+/// process/high-resolution values only if /dev/urandom is unreadable.
+fn random_hex(bytes: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !ok {
+        let seed = format!("{:?}:{}:{}", std::time::SystemTime::now(), std::process::id(), bytes);
+        let mut out = String::new();
+        while out.len() < bytes * 2 {
+            out.push_str(&sha256_hex(&format!("{seed}:{}", out.len())));
+        }
+        return out.chars().take(bytes * 2).collect();
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 async fn verify_admin(State(app): State<App>, Json(req): Json<AuthVerify>) -> Json<Value> {
     let hash = app.store.lock().unwrap().config.admin_password_hash.clone();
-    Json(json!({ "ok": !hash.is_empty() && sha256_hex(&req.password) == hash }))
+    let attempt = sha256_hex(&req.password);
+    Json(json!({ "ok": !hash.is_empty() && constant_time_eq(attempt.as_bytes(), hash.as_bytes()) }))
 }
 
 // ---------------------------------------------------------------------------
@@ -6875,14 +7217,12 @@ async fn login(State(app): State<App>, Json(req): Json<LoginRequest>) -> ApiResu
     }
     let user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let pass = std::env::var("ADMIN_PASSWORD").unwrap_or_default();
-    if req.username != user || req.password != pass {
+    let user_ok = constant_time_eq(req.username.as_bytes(), user.as_bytes());
+    let pass_ok = constant_time_eq(req.password.as_bytes(), pass.as_bytes());
+    if !(user_ok & pass_ok) {
         return Err(err(StatusCode::UNAUTHORIZED, "Invalid username or password"));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let token = sha256_hex(&format!("{}:{}:{nanos}", req.username, req.password));
+    let token = random_hex(32);
     app.store.lock().unwrap().sessions.insert(token.clone(), req.username.clone());
     Ok(json_ok(json!({ "ok": true, "token": token, "user": req.username })))
 }
@@ -6988,12 +7328,85 @@ async fn idle_sweeper(app: App) {
     }
 }
 
+/// Advisory run watchdog (Paperclip-style heartbeat check, without the kill):
+/// a `running` run that has produced no step/discussion activity for a long
+/// time is probably wedged — a hung provider call, a lost goroutine, a machine
+/// asleep. We do NOT change its status (that would fight the engine's own
+/// state machine); we flag it so the UI can tell the user to look or stop it.
+/// The flag clears itself as soon as fresh activity lands.
+fn watchdog_stall_secs() -> u64 {
+    std::env::var("AAP_WATCHDOG_STALL_SECS").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 60)
+        .unwrap_or(45 * 60)
+}
+
+/// Newest timestamp anywhere in a run — step start/finish, chat message,
+/// discussion open, or run creation. The watchdog treats this as the run's
+/// heartbeat; anything newer means the engine is still moving.
+fn run_last_heartbeat(run: &Run) -> u64 {
+    let mut last = run.created_at;
+    for s in &run.steps { last = last.max(s.started_at).max(s.finished_at); }
+    for d in &run.discussions {
+        last = last.max(d.created_at);
+        for m in &d.messages { last = last.max(m.at); }
+    }
+    last
+}
+
+async fn run_watchdog(app: App) {
+    let stall = watchdog_stall_secs();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let now = now_secs();
+        let mut changed = false;
+        {
+            let mut store = app.store.lock().unwrap();
+            for run in store.runs.iter_mut() {
+                let last = run_last_heartbeat(run);
+                if run.status != "running" {
+                    // Closed runs keep no warning; a reopened one starts clean.
+                    if run.watchdog_note.is_some() || run.watchdog_at != 0 {
+                        run.watchdog_note = None;
+                        run.watchdog_at = 0;
+                        changed = true;
+                    }
+                    continue;
+                }
+                let idle = now.saturating_sub(last);
+                if idle >= stall && run.watchdog_at < last.max(1) {
+                    let working: Vec<&str> = run.steps.iter()
+                        .filter(|s| s.status == "working")
+                        .map(|s| s.name.as_str())
+                        .collect();
+                    let who = if working.is_empty() { "ทั้งทีม".to_string() } else { working.join(", ") };
+                    run.watchdog_note = Some(format!(
+                        "ไม่มีความคืบหน้ามา {} นาที — {} อาจค้างอยู่ (provider ไม่ตอบ / เครื่อง sleep / process หาย) \
+                         ตรวจสอบ terminal ของ agent หรือกดหยุด run แล้วลองใหม่",
+                        idle / 60, who,
+                    ));
+                    run.watchdog_at = now;
+                    changed = true;
+                } else if run.watchdog_at != 0 && last > run.watchdog_at {
+                    // heartbeats are flowing again — withdraw the warning
+                    run.watchdog_note = None;
+                    run.watchdog_at = 0;
+                    changed = true;
+                }
+            }
+            if changed { save_runs(&store); }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Agents run on THIS machine — no Docker client, no per-agent containers,
     // no container-based deploy stage. Docker plays no part in the platform.
     let _ = hostexec::tmux_available(); // warn early when tmux is missing
     hostexec::sweep_tmp(); // command files from a previous process are garbage
+    harden_data_dir(); // 0700 data dir / 0600 stores, even after an upgrade
     let ws = hostexec::workspace_dir();
     if let Err(e) = std::fs::create_dir_all(&ws) {
         eprintln!("warning: workspace {} unusable: {e} — set AAP_WORKSPACE", ws.display());
@@ -7029,6 +7442,8 @@ async fn main() {
     tokio::spawn(idle_sweeper(app_state.clone()));
     // Routine scheduler — fires enabled cron schedules every 30 s.
     tokio::spawn(routine_scheduler(app_state.clone()));
+    // Run watchdog — flags runs that stopped producing any heartbeat.
+    tokio::spawn(run_watchdog(app_state.clone()));
 
     let cors = tower_http::cors::CorsLayer::permissive();
 
@@ -7098,8 +7513,17 @@ async fn main() {
         .layer(cors)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.expect("bind :8000");
-    println!("{SERVICE_NAME} listening on :8000");
+    // Loopback unless auth is on (or the operator explicitly widens the bind):
+    // every endpoint controls real processes on this Mac, so a LAN-reachable
+    // server with login disabled would hand anyone the host.
+    let bind = std::env::var("AAP_BIND").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        if auth_enabled() { "0.0.0.0:8000".into() } else { "127.0.0.1:8000".into() }
+    });
+    if !auth_enabled() {
+        println!("auth disabled (no ADMIN_PASSWORD) — listening on {bind}; set AAP_BIND to expose it");
+    }
+    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| panic!("bind {bind}: {e}"));
+    println!("{SERVICE_NAME} listening on {bind}");
     axum::serve(listener, router).await.expect("server error");
 }
 
@@ -7138,7 +7562,31 @@ mod tests {
             output_tokens: 0,
             cost_alerted: false,
             review: None,
+            watchdog_note: None,
+            watchdog_at: 0,
         }
+    }
+
+    #[test]
+    fn watchdog_heartbeat_uses_newest_signal() {
+        let mut run = test_run("running");
+        run.created_at = 100;
+        run.steps.push(RunStep {
+            role: "dev".into(), name: "Dev".into(), title: "Dev".into(), kind: "work".into(),
+            status: "working".into(), output: String::new(), model: None, container: None,
+            deliverable: None, rev: None, started_at: 200, finished_at: 0, harness: None,
+            input_tokens: 0, output_tokens: 0, cost_usd: 0.0, metered: true, priced: true,
+        });
+        run.discussions.push(Discussion {
+            id: "d-001".into(), kind: String::new(), from: "dev".into(), to: vec!["qa".into()],
+            topic: "?".into(), status: "open".into(), answering: None,
+            messages: vec![MeetingMessage { from: "qa".into(), text: "answer".into(), at: 300 }],
+            round: 1, created_at: 150,
+        });
+        assert_eq!(run_last_heartbeat(&run), 300);
+        // A closed run's creation time is the floor, never 0.
+        let empty = test_run("done");
+        assert_eq!(run_last_heartbeat(&empty), empty.created_at);
     }
 
     #[test]

@@ -212,9 +212,23 @@ function TypingRow({ label, tone = 'amber', revert = false }) {
 function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending }) {
   const scrollRef = useRef(null)
   const [reply, setReply] = useState('')
+  // Local lock: replySending is shared across threads and only flips after the
+  // parent re-renders — Enter spam before that used to fire the same reply twice.
+  const sendingRef = useRef(false)
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [d.messages.length, d.answering, d.status])
+
+  async function submitReply(e) {
+    e.preventDefault()
+    const text = reply.trim()
+    if (!text || sendingRef.current) return
+    sendingRef.current = true
+    const ok = await onReply(d.id, text)
+    // Keep the draft when the send failed — losing a long answer to a blip hurts.
+    if (ok) setReply('')
+    sendingRef.current = false
+  }
 
   const isDemo = d.kind === 'demo'
   const asker = stepByRole[d.from]?.name || d.from
@@ -258,14 +272,14 @@ function MeetingChat({ d, stepByRole, waitingHuman, round, onReply, replySending
         <form
           className="flex gap-2 border-t border-rose-400/25 px-3.5 py-2.5"
           data-testid="human-reply"
-          onSubmit={e => { e.preventDefault(); if (!reply.trim()) return; onReply(d.id, reply.trim()) ; setReply('') }}
+          onSubmit={submitReply}
         >
           <Textarea
             className="min-h-[38px] flex-1 text-[12px]"
             placeholder="พิมพ์คำตอบถึงทีม…"
             value={reply}
             onChange={e => setReply(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form?.requestSubmit() } }}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sendingRef.current) e.target.form?.requestSubmit() } }}
           />
           <Button type="submit" size="sm" disabled={replySending || !reply.trim()} className="h-fit">
             {replySending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />} ตอบ
@@ -398,7 +412,7 @@ function fmtWhen(secs) {
 }
 
 // Scheduled missions for this project (5-field cron, local time).
-function RoutinesTab({ projectId }) {
+function RoutinesTab({ projectId, onRunStarted }) {
   const [routines, setRoutines] = useState(null)
   const [error, setError] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -408,9 +422,13 @@ function RoutinesTab({ projectId }) {
   const [runningId, setRunningId] = useState(null)
 
   const load = useCallback(() => {
-    authFetch(`${API}/projects/${projectId}/routines`).then(r => r.json())
+    authFetch(`${API}/projects/${projectId}/routines`).then(async r => {
+      const d = await r.json()
+      if (!r.ok) throw new Error(d.detail || `HTTP ${r.status}`)
+      return d
+    })
       .then(d => setRoutines(Array.isArray(d) ? d : []))
-      .catch(() => setRoutines([]))
+      .catch(err => { setRoutines([]); setError(err.message) })
   }, [projectId])
   useEffect(() => { load() }, [load])
 
@@ -470,6 +488,9 @@ function RoutinesTab({ projectId }) {
       const res = await authFetch(`${API}/routines/${r.id}/run`, { method: 'POST' })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      // Adopt the spawned run so Mission Control shows it immediately —
+      // otherwise "Run now" silently starts work the user cannot see.
+      if (data && data.id) onRunStarted?.(data)
       load()
     } catch (err) {
       setError(err.message)
@@ -618,6 +639,7 @@ export default function ProjectFlow() {
   const [reviewDeciding, setReviewDeciding] = useState(false)
   const [budgetBusy, setBudgetBusy] = useState(false)
   const [openComments, setOpenComments] = useState(0)
+  const [tab, setTab] = useState('mission')
   const outputRef = useRef(null)
 
   // Click a node in the chart → live activity + work history of that agent
@@ -711,7 +733,7 @@ export default function ProjectFlow() {
 
   // The human's answer to a need-human meeting — POST then refresh the run
   async function replyHuman(discId, text) {
-    if (!run) return
+    if (!run) return false
     setReplySending(true)
     try {
       const res = await authFetch(`${API}/runs/${run.id}/discussions/${discId}/reply`, {
@@ -723,10 +745,13 @@ export default function ProjectFlow() {
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
       const fresh = await authFetch(`${API}/runs/${run.id}`).then(r => r.json()).catch(() => null)
       if (fresh && !fresh.detail) setRun(fresh)
+      return true
     } catch (e) {
       setRunError(e.message)
+      return false
+    } finally {
+      setReplySending(false)
     }
-    setReplySending(false)
   }
 
   async function stopTeam() {
@@ -769,12 +794,28 @@ export default function ProjectFlow() {
     setSaving(true)
     setSaved(false)
     setError('')
+    // Validate before sending: Number('') is 0 and Number('abc') is NaN — both
+    // would silently persist a nonsense ceiling (or JSON.stringify to null).
+    if (budgetUsd !== '') {
+      const b = Number(budgetUsd)
+      if (!Number.isFinite(b) || b <= 0) {
+        setError('Budget ต้องเป็นตัวเลขมากกว่า 0 (หรือเว้นว่าง = ไม่จำกัด)')
+        setSaving(false)
+        return
+      }
+    }
+    const pct = Number(alertPct)
+    if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
+      setError('Alert % ต้องอยู่ระหว่าง 1–100')
+      setSaving(false)
+      return
+    }
     try {
       const body = {
         repo_url: repoUrl,
         goal: goal.trim(),
         budget_usd: budgetUsd === '' ? null : Number(budgetUsd),
-        budget_alert_pct: Math.min(100, Math.max(1, Number(alertPct) || 80)),
+        budget_alert_pct: pct,
         agents: nodes.map(n => n.id),
         links: edges.map(e => ({ from: e.source, to: e.target })),
         positions: Object.fromEntries(nodes.map(n => [n.id, { x: n.position.x, y: n.position.y }])),
@@ -1035,7 +1076,7 @@ export default function ProjectFlow() {
       />
 
       <div className="page-body">
-        <Tabs defaultValue="mission" className="w-full">
+        <Tabs value={tab} onValueChange={setTab} className="w-full">
           <TabsList className="mb-6 h-auto w-full justify-start gap-1 rounded-none border-b border-white/[0.06] bg-transparent p-0">
             {[['mission', 'Mission Control'], ['routines', 'Routines'], ['docs', 'Docs']].map(([v, label]) => (
               <TabsTrigger
@@ -1078,6 +1119,7 @@ export default function ProjectFlow() {
                 placeholder="Git repo (https://github.com/owner/repo) — ทีมจะ clone ลง /workspace ของ container ก่อนทำงานทุกครั้ง"
                 value={repoUrl}
                 onChange={e => { setRepoUrl(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
               />
               {!saved && repoUrl !== (project?.repo_url || '') && (
                 <span className="shrink-0 text-[11px] text-amber-400">กด Save Team เพื่อบันทึก repo</span>
@@ -1091,6 +1133,7 @@ export default function ProjectFlow() {
                 placeholder="Goal ของโปรเจกต์ — ทีมจะยึดเป็นเป้าหมายหลัก ทุก deliverable"
                 value={goal}
                 onChange={e => { setGoal(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
                 title="Goal ancestry: ถูกใส่ใน prompt ของทุกขั้นตอน"
               />
             </div>
@@ -1105,6 +1148,7 @@ export default function ProjectFlow() {
                 placeholder="Budget / run (USD)"
                 value={budgetUsd}
                 onChange={e => { setBudgetUsd(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
                 title="เพดานต่อ run — ถึงเพดานแล้ว run จะ pause รออนุมัติ ไม่ตัดจบเอง"
               />
               <span className="text-[11.5px] text-muted-foreground/60">alert ที่</span>
@@ -1116,6 +1160,7 @@ export default function ProjectFlow() {
                 className="h-9 w-20 rounded-lg border border-white/10 bg-black/20 px-3 text-[12.5px] text-foreground outline-none transition-colors placeholder:text-muted-foreground/45 hover:border-white/[0.16] focus:border-primary/60 focus:ring-[3px] focus:ring-primary/15"
                 value={alertPct}
                 onChange={e => { setAlertPct(e.target.value); setSaved(false) }}
+                onKeyDown={e => { if (e.key === 'Enter') e.preventDefault() }}
                 title="แจ้งเตือนเมื่อใช้ถึง % ของ budget (ไม่หยุดงาน)"
               />
               <span className="text-[11.5px] text-muted-foreground/50">% — ถึงเพดานแล้ว run pause รอคุณอนุมัติเพิ่มงบ</span>
@@ -1160,7 +1205,11 @@ export default function ProjectFlow() {
                           ? <><MonitorPlay className="h-3 w-3" /> demo & acceptance — PO ตรวจรับ</>
                           : 'team working')
                     : run.status === 'waiting_human'
-                      ? <><User className="h-3 w-3" /> รอคุณตอบในแชท</>
+                      ? run.phase === 'budget'
+                        ? <><Wallet className="h-3 w-3" /> รอคุณอนุมัติเพิ่มงบ</>
+                        : run.phase === 'review'
+                          ? <><ShieldCheck className="h-3 w-3" /> รอคุณ review diff</>
+                          : <><User className="h-3 w-3" /> รอคุณตอบในแชท</>
                       : run.status}
                 </Badge>
                 {run.loop_mode && (
@@ -1243,6 +1292,17 @@ export default function ProjectFlow() {
                 </div>
               )}
 
+              {run.watchdog_note && (
+                <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-200" data-testid="watchdog-note">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{run.watchdog_note}</span>
+                </div>
+              )}
+              {runError && (
+                <div className="mb-3 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12.5px] text-red-300" data-testid="run-error">
+                  {runError}
+                </div>
+              )}
               <ReviewCard run={run} onDecide={decideReview} deciding={reviewDeciding} />
               {(run.discussions || []).filter(d => d.kind === 'budget').length > 0 && (
                 <div className="mb-3 flex flex-col gap-2.5">
@@ -1448,7 +1508,15 @@ export default function ProjectFlow() {
           </TabsContent>
 
           <TabsContent value="routines" className="mt-0">
-            <RoutinesTab projectId={id} />
+            <RoutinesTab
+              projectId={id}
+              onRunStarted={r => {
+                setRun(r)
+                setCollapsed({})
+                setTab('mission')
+                requestAnimationFrame(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+              }}
+            />
           </TabsContent>
 
           <TabsContent value="docs" className="mt-0">

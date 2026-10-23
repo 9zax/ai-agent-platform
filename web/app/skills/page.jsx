@@ -18,6 +18,7 @@ const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 export default function SkillsPage() {
   const [skills, setSkills] = useState(null)
+  const [listError, setListError] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingSkill, setEditingSkill] = useState(null) // null = create mode
   const [form, setForm] = useState({ name: '', description: '' })
@@ -33,9 +34,13 @@ export default function SkillsPage() {
   async function load() {
     try {
       const res = await authFetch(`${API}/skills`)
-      setSkills(await res.json())
-    } catch {
-      setSkills([])
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setSkills(Array.isArray(data) ? data : [])
+      setListError('')
+    } catch (err) {
+      setSkills(prev => (Array.isArray(prev) ? prev : []))
+      setListError(err.message)
     }
   }
 
@@ -136,11 +141,20 @@ export default function SkillsPage() {
       body: JSON.stringify({ enabled: !skill.enabled }),
     })
     const updated = await res.json()
+    if (!res.ok) return setListError(updated.detail || `HTTP ${res.status}`)
+    setListError('')
     setSkills(list => list.map(s => (s.id === updated.id ? updated : s)))
   }
 
   async function remove(skill) {
-    await authFetch(`${API}/skills/${skill.id}`, { method: 'DELETE' })
+    const res = await authFetch(`${API}/skills/${skill.id}`, { method: 'DELETE' })
+    // Only drop it from the list after the server confirms — a failed delete
+    // used to vanish from the UI and reappear on the next load.
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      return setListError(data.detail || `HTTP ${res.status}`)
+    }
+    setListError('')
     setSkills(list => list.filter(s => s.id !== skill.id))
   }
 
@@ -154,6 +168,11 @@ export default function SkillsPage() {
       />
 
       <div className="page-body">
+        {listError && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[12px] text-red-300" data-testid="skills-error">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {listError}
+          </div>
+        )}
         <div className="grid gap-3.5 [grid-template-columns:repeat(auto-fit,minmax(290px,1fr))]">
           {skills === null && [0, 1, 2].map(i => (
             <Card key={i} className="h-[170px] p-4">

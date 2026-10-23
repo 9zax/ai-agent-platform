@@ -25,15 +25,24 @@ test.describe('Pause / resume containers', () => {
 
   // Config changes go straight to the API (login like global-setup does) so
   // they work from any page state — including the finally cleanup.
+  async function configToken(request) {
+    if (!process.env.ADMIN_PASSWORD) return ''
+    const res = await request.post('http://localhost:8000/auth/login', {
+      headers: { 'Content-Type': 'application/json' },
+      data: { username: process.env.ADMIN_USER || 'admin', password: process.env.ADMIN_PASSWORD },
+    })
+    return res.ok() ? (await res.json()).token : ''
+  }
+
+  async function getConfig(request) {
+    const token = await configToken(request)
+    return request.get('http://localhost:8000/config', {
+      headers: token ? { 'x-session-token': token } : {},
+    })
+  }
+
   async function putConfig(request, body) {
-    let token = ''
-    if (process.env.ADMIN_PASSWORD) {
-      const res = await request.post('http://localhost:8000/auth/login', {
-        headers: { 'Content-Type': 'application/json' },
-        data: { username: process.env.ADMIN_USER || 'admin', password: process.env.ADMIN_PASSWORD },
-      })
-      if (res.ok()) token = (await res.json()).token
-    }
+    const token = await configToken(request)
     return request.put('http://localhost:8000/config', {
       headers: { 'Content-Type': 'application/json', ...(token ? { 'x-session-token': token } : {}) },
       data: body,
@@ -86,7 +95,7 @@ test.describe('Pause / resume containers', () => {
     containerName = `e2e-pause-auto-${Date.now()}`
 
     // Shorten the idle window for this test only; always restore afterwards
-    const before = await (await request.get('http://localhost:8000/config')).json()
+    const before = await (await getConfig(request)).json()
     const originalIdle = before.idle_timeout_secs || 900
     try {
       await putConfig(request, { idle_timeout_secs: 60 })
