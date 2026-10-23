@@ -172,7 +172,7 @@ export default function Dashboard() {
             testId="stat-containers"
             icon={Package}
             tone="bg-primary/[0.12] text-primary ring-primary/20"
-            label="Agent Containers"
+            label="AI Agents"
             value={managedCount}
             meta={<>
               <span className="font-semibold text-emerald-400">{running} running</span>
@@ -235,7 +235,7 @@ export default function Dashboard() {
           <Table className="min-w-[600px]">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-1/4">Container</TableHead>
+                <TableHead className="w-1/4">Agent</TableHead>
                 <TableHead>Type</TableHead>
                 <TableHead>Model</TableHead>
                 <TableHead>Status</TableHead>
@@ -275,7 +275,7 @@ export default function Dashboard() {
                         <span className="flex h-9 w-9 items-center justify-center rounded-full border border-white/[0.07] bg-white/[0.03]">
                           <Search className="h-4 w-4 text-muted-foreground/50" />
                         </span>
-                        No containers match your filter.
+                        No agents match your filter.
                       </span>
                     )}
                   </TableCell>

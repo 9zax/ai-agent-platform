@@ -370,7 +370,7 @@ export default function ContainerDetail() {
             </div>
             {[
               ['Model', agentModel || '—', ''],
-              ['Container', status === 'running' ? 'Ready' : status, status === 'running' ? 'text-emerald-400' : ''],
+              ['Session', status === 'running' ? 'Ready' : status, status === 'running' ? 'text-emerald-400' : ''],
             ].map(([k, v, color]) => (
               <div key={k} className="flex items-center justify-between border-b border-dashed border-border py-1.5 text-[12.5px] last:border-0">
                 <span className="text-muted-foreground/70">{k}</span>
