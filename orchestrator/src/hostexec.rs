@@ -198,17 +198,20 @@ fn valid_env_key(k: &str) -> bool {
 static CMD_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Run `command` as the agent, in the agent's tmux session (live pane) or
-/// headless when tmux is missing. Env pairs ("K=V") ride the script file /
-/// process env — never a command line — the same secret-safety rule the old
-/// exec ENV injection had. No overall timeout, matching docker exec.
+/// headless when there is no live session (tmux missing, agent paused/swept).
+/// NEVER creates a session — callers that need the agent alive ensure it first
+/// (create/start/ensure_running/agent_container); this keeps probes (connectors)
+/// from resurrecting a paused agent, which would defeat the idle sweeper.
+/// Env pairs ("K=V") ride the script file / process env — never a command
+/// line — the same secret-safety rule the old exec ENV injection had. No
+/// overall timeout, matching docker exec.
 pub async fn run(agent: &str, command: &str, env: &[String]) -> Result<(i64, String), String> {
     let ws = workspace_dir();
     std::fs::create_dir_all(&ws).map_err(|e| format!("workspace {} unusable: {e}", ws.display()))?;
 
-    if !tmux_available() {
+    if !tmux_available() || !session_alive(agent).await {
         return run_headless(&ws, command, env).await;
     }
-    ensure_session(agent).await?;
 
     let tmp = crate::data_dir().join("tmp");
     std::fs::create_dir_all(&tmp).map_err(|e| format!("tmp dir {} unusable: {e}", tmp.display()))?;

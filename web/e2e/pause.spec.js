@@ -7,9 +7,9 @@ test.describe('Pause / resume containers', () => {
 
   async function createContainer(page, name) {
     await page.goto('/')
-    await page.getByRole('button', { name: /New Container/ }).click()
+    await page.getByRole('button', { name: /New Agent/ }).click()
     await page.getByLabel('Name').fill(name)
-    await page.getByRole('button', { name: 'Create Container' }).click()
+    await page.getByRole('button', { name: 'Create Agent' }).click()
     await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 30000 })
     await expect(page.getByTestId('container-row').filter({ hasText: name })).toBeVisible({ timeout: 30000 })
     await page.getByTestId('container-row').filter({ hasText: name }).click()
@@ -67,9 +67,9 @@ test.describe('Pause / resume containers', () => {
     await page.getByRole('button', { name: 'Pause', exact: true }).click()
     await expect(page.getByTestId('status-badge')).toHaveText('Paused', { timeout: 20000 })
 
-    // Opening the shell auto-resumes the container (terminal_ws revives it)
+    // Opening the shell auto-resumes the agent (terminal_ws revives it)
     await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    const term = page.getByTestId('terminal')
+    const term = page.getByTestId('terminal').nth(1)
     await expect(term).toBeVisible({ timeout: 20000 })
     await term.click()
     await page.keyboard.type('echo back')
