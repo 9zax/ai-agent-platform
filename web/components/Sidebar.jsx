@@ -52,8 +52,8 @@ export default function Sidebar() {
   }, [pathname])
 
   return (
-    <aside className="sticky top-0 flex h-screen w-[232px] min-w-[232px] flex-col border-r bg-[#0d1420] px-3.5 py-5">
-      <div className="flex items-center gap-2.5 px-2.5 pb-4">
+    <aside className="sticky top-0 flex h-screen w-[232px] min-w-[232px] flex-col border-r bg-[#0d1420] px-3.5 py-4">
+      <div className="flex shrink-0 items-center gap-2.5 px-2.5 pb-3">
         <div className="flex h-[34px] w-[34px] items-center justify-center rounded-[9px] bg-gradient-to-br from-primary to-blue-500 text-white">
           <Bot className="h-4 w-4" />
         </div>
@@ -63,11 +63,13 @@ export default function Sidebar() {
         </div>
       </div>
 
-      {/* Global inbox — need-human meeting alerts on every page */}
-      <HumanInbox />
+      {/* Scrollable middle — on short viewports the nav must scroll, not overflow the screen */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {/* Global inbox — need-human meeting alerts on every page */}
+        <HumanInbox />
 
-      <nav className="mt-1 flex flex-col gap-0.5">
-        <div className="px-2.5 pb-1.5 pt-3.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/60">
+        <nav className="mt-1 flex flex-col gap-0.5">
+        <div className="px-2.5 pb-1.5 pt-3 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/60">
           Main
         </div>
         {MAIN.map(item => {
@@ -91,7 +93,7 @@ export default function Sidebar() {
             </Link>
           )
         })}
-        <div className="px-2.5 pb-1.5 pt-3.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/60">
+        <div className="px-2.5 pb-1.5 pt-3 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/60">
           Platform
         </div>
         {PLATFORM.map(item => {
@@ -127,9 +129,10 @@ export default function Sidebar() {
             </Link>
           )
         })}
-      </nav>
+        </nav>
+      </div>
 
-      <div className="mt-auto rounded-xl border bg-card p-3">
+      <div className="mt-3 shrink-0 rounded-xl border bg-card p-3">
         <div className="flex items-center gap-2 text-[12.5px] font-semibold">
           <span className={cn('h-2 w-2 rounded-full', health ? 'bg-emerald-500 shadow-[0_0_0_3px_rgba(16,185,129,0.15)]' : 'bg-muted-foreground/50')} />
           {health ? 'All Systems Operational' : 'Orchestrator Offline'}
@@ -140,7 +143,7 @@ export default function Sidebar() {
         <Progress value={agents.total ? Math.round((agents.running / agents.total) * 100) : 0} />
       </div>
 
-      <div className="mt-2.5 flex items-center gap-2.5 rounded-xl border bg-card p-2.5">
+      <div className="mt-2.5 flex shrink-0 items-center gap-2.5 rounded-xl border bg-card p-2.5">
         <Avatar className="h-[30px] w-[30px]">
           <AvatarFallback>{session?.valid ? session.user.slice(0, 2).toUpperCase() : '?'}</AvatarFallback>
         </Avatar>

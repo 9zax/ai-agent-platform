@@ -79,7 +79,7 @@ test.describe('PR-stage GitHub connector', () => {
     const pid = await page.evaluate(async ({ api, name, repo }) => {
       const token = localStorage.getItem('aap_token') || ''
       const headers = { 'Content-Type': 'application/json', 'x-session-token': token }
-      const existing = await (await fetch(`${api}/projects`)).json()
+      const existing = await (await fetch(`${api}/projects`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
       for (const p of existing.filter(p => p.name === name)) {
         await fetch(`${api}/projects/${p.id}`, { method: 'DELETE', headers })
       }
@@ -111,7 +111,7 @@ test.describe('PR-stage GitHub connector', () => {
       await expect(page.getByTestId('run-timeline')).toBeVisible()
 
       const runId = await page.evaluate(async ({ api, projectId }) => {
-        const runs = await (await fetch(`${api}/runs`)).json()
+        const runs = await (await fetch(`${api}/runs`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
         return runs.filter(r => r.project_id === projectId)[0]?.id
       }, { api: API, projectId: pid })
       expect(runId).toBeTruthy()
@@ -122,7 +122,7 @@ test.describe('PR-stage GitHub connector', () => {
       let disc = null
       await expect.poll(async () => {
         const run = await page.evaluate(async ({ api, rid }) => {
-          return await (await fetch(`${api}/runs/${rid}`)).json()
+          return await (await fetch(`${api}/runs/${rid}`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
         }, { api: API, rid: runId })
         disc = (run.discussions || []).find(d =>
           d.status === 'need_human' && (d.messages || []).some(m =>
@@ -131,17 +131,17 @@ test.describe('PR-stage GitHub connector', () => {
       }, { timeout: 420_000, intervals: [10_000] }).toBe('arrived')
 
       const run = await page.evaluate(async ({ api, rid }) => {
-        return await (await fetch(`${api}/runs/${rid}`)).json()
+        return await (await fetch(`${api}/runs/${rid}`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
       }, { api: API, rid: runId })
       expect(run.status).toBe('waiting_human')
 
       // the container's GitHub connector is pending with a user code
       const cid = await page.evaluate(async ({ api, name }) => {
-        const list = await (await fetch(`${api}/containers`)).json()
+        const list = await (await fetch(`${api}/containers`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
         return (list.find(c => c.name === name) || {}).id
       }, { api: API, name: CONTAINER })
       const connectors = await page.evaluate(async ({ api, containerId }) => {
-        return await (await fetch(`${api}/containers/${containerId}/connectors`)).json()
+        return await (await fetch(`${api}/containers/${containerId}/connectors`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
       }, { api: API, containerId: cid })
       const github = (connectors || []).find(c => c.type === 'github')
       expect(github?.state).toBe('pending')
@@ -160,12 +160,12 @@ test.describe('PR-stage GitHub connector', () => {
       }, { api: API, rid: runId })
       await expect.poll(async () => {
         return await page.evaluate(async ({ api, rid }) => {
-          return (await (await fetch(`${api}/runs/${rid}`)).json()).status
+          return (await (await fetch(`${api}/runs/${rid}`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()).status
         }, { api: API, rid: runId })
       }, { timeout: 60_000, intervals: [2_000] }).toBe('stopped')
 
       const stopped = await page.evaluate(async ({ api, rid }) => {
-        return await (await fetch(`${api}/runs/${rid}`)).json()
+        return await (await fetch(`${api}/runs/${rid}`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
       }, { api: API, rid: runId })
       const prStep = stopped.steps.find(s => s.kind === 'pr')
       expect(prStep).toBeTruthy()
@@ -175,7 +175,7 @@ test.describe('PR-stage GitHub connector', () => {
       await page.evaluate(async ({ api, container, projectId }) => {
         const token = localStorage.getItem('aap_token') || ''
         const headers = { 'x-session-token': token }
-        const list = await (await fetch(`${api}/containers`)).json()
+        const list = await (await fetch(`${api}/containers`, { headers: { 'x-session-token': localStorage.getItem('aap_token') || '' } })).json()
         const mine = (list.find(c => c.name === container) || {}).id
         if (mine) await fetch(`${api}/containers/${mine}`, { method: 'DELETE', headers })
         await fetch(`${api}/projects/${projectId}`, { method: 'DELETE', headers })

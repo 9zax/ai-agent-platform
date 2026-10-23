@@ -31,9 +31,13 @@ test.describe('Dashboard', () => {
     // Other tests create/delete containers in parallel — reload until DOM and API agree
     await expect(async () => {
       const apiRows = await page.evaluate(async () => {
-        const res = await fetch('http://localhost:8000/containers')
+        // Same auth as the app itself: protected mode rejects bare fetches with 401
+        const res = await fetch('http://localhost:8000/containers', {
+          headers: { 'x-session-token': localStorage.getItem('aap_token') || '' },
+        })
         return res.json()
       })
+      expect(Array.isArray(apiRows)).toBe(true)
       expect(apiRows.length).toBeGreaterThan(0)
       await page.goto('/')
       await showAllContainers(page)
@@ -50,8 +54,15 @@ test.describe('Dashboard', () => {
     await page.getByPlaceholder('Search containers...').fill('orchestrator')
 
     const rows = page.getByTestId('container-row')
-    await expect(rows).toHaveCount(1)
-    await expect(rows.first()).toContainText('orchestrator')
+    await expect(rows.first()).toBeVisible()
+    // The host may run more than one orchestrator (prod + staging) — every
+    // surviving row must match the query, and the no-match empty state must not.
+    const count = await rows.count()
+    expect(count).toBeGreaterThan(0)
+    for (let i = 0; i < count; i++) {
+      await expect(rows.nth(i)).toContainText('orchestrator')
+    }
+    await expect(page.getByText('No containers match your filter.')).toHaveCount(0)
   })
 
   test('search with no match shows empty state', async ({ page }) => {

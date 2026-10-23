@@ -8,7 +8,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { marked } from 'marked'
-import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, Rocket, MonitorPlay } from 'lucide-react'
+import { Save, Plus, ArrowLeft, Send, Loader2, CheckCircle2, XCircle, Clock, Container, ChevronDown, MessageCircle, MessagesSquare, Check, GitBranch, Undo2, Square, User, Repeat, PauseCircle, GitPullRequest, Rocket, MonitorPlay, RotateCcw } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -130,6 +130,7 @@ function StepStatusIcon({ status }) {
   if (status === 'done') return <CheckCircle2 className="h-4 w-4 text-emerald-400" />
   if (status === 'error') return <XCircle className="h-4 w-4 text-red-400" />
   if (status === 'skipped') return <PauseCircle className="h-4 w-4 text-muted-foreground/60" />
+  if (status === 'stopped') return <Square className="h-3.5 w-3.5 text-muted-foreground/60" />
   return <Clock className="h-4 w-4 text-muted-foreground/50" />
 }
 
@@ -307,6 +308,8 @@ export default function ProjectFlow() {
   const [collapsed, setCollapsed] = useState({})
   const [loopMode, setLoopMode] = useState(false)
   const [stopping, setStopping] = useState(false)
+  const [retrying, setRetrying] = useState(false)
+  const [retryingStep, setRetryingStep] = useState(null)
   const [replySending, setReplySending] = useState(false)
   const outputRef = useRef(null)
 
@@ -489,6 +492,47 @@ export default function ProjectFlow() {
       setRunError(err.message)
     }
     setDispatching(false)
+  }
+
+  // Re-dispatch the SAME task as a fresh run — the recovery path for a mission
+  // whose steps died on a transient failure (e.g. provider 401 blip): nothing
+  // mid-run is resumed, the team just takes the mission from the top.
+  async function retryRun() {
+    if (!run?.task || retrying) return
+    setRetrying(true)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/projects/${id}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: run.task, loop: false }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+      setCollapsed({})
+      requestAnimationFrame(() => outputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setRetrying(false)
+  }
+
+  // Per-step retry — failures are per-step, so recovery is per-step too: only
+  // THIS step is redone in place, everyone else's finished work is kept.
+  async function retryOneStep(role, kind) {
+    if (!run || retryingStep) return
+    setRetryingStep(`${role}-${kind}`)
+    setRunError('')
+    try {
+      const res = await authFetch(`${API}/runs/${run.id}/steps/${role}/${kind}/retry`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+      setRun(data)
+    } catch (err) {
+      setRunError(err.message)
+    }
+    setRetryingStep(null)
   }
 
   if (error && !project) {
@@ -717,6 +761,19 @@ export default function ProjectFlow() {
                     {stopping ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />} หยุดทีม
                   </Button>
                 )}
+                {!live && run.steps.some(s => s.status === 'error') && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={retryRun}
+                    disabled={retrying}
+                    data-testid="retry-mission"
+                    className="h-7 gap-1.5 border-amber-500/40 text-[11.5px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+                    title="สั่งงานเดิมซ้ำเป็น run ใหม่ — ทีมทำ mission นี้ตั้งแต่ต้นอีกรอบ (ถ้า failed แค่บาง step ให้กดปุ่ม ลองซ้ำ ที่ step นั้นแทน)"
+                  >
+                    {retrying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />} เริ่ม mission ใหม่
+                  </Button>
+                )}
               </div>
 
               {run.acceptance && (
@@ -756,29 +813,44 @@ export default function ProjectFlow() {
                   const reverting = live && kind === 'work' && revisingRoles.has(step.role) && step.status === 'working'
                   return (
                     <div key={sKey} className={`rounded-xl border bg-[#0d1420] ${reverting ? 'revert-flash border-rose-400/60' : ''}`} data-testid={`run-step-${step.role}${kind !== 'work' ? `-${kind}` : ''}`} data-status={step.status} data-revert={reverting ? '1' : undefined}>
-                      <button
-                        className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left"
-                        onClick={() => setCollapsed(c => ({ ...c, [sKey]: open }))}
-                      >
-                        <StepStatusIcon status={reverting ? 'revising' : step.status} />
-                        <Avatar className="h-6 w-6">
-                          <AvatarFallback className="text-[10px]">{initials(step.name)}</AvatarFallback>
-                        </Avatar>
-                        <div className="min-w-0 flex-1">
-                          <div className="text-[13px] font-semibold">
-                            <span className="text-muted-foreground/50">{i + 1}. </span>{step.name}
-                            <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
-                            {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
-                            {kind !== 'work' && <StepKindBadge kind={kind} />}
+                      <div className="flex w-full items-center gap-3 px-3.5 py-2.5">
+                        <button
+                          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                          onClick={() => setCollapsed(c => ({ ...c, [sKey]: open }))}
+                        >
+                          <StepStatusIcon status={reverting ? 'revising' : step.status} />
+                          <Avatar className="h-6 w-6">
+                            <AvatarFallback className="text-[10px]">{initials(step.name)}</AvatarFallback>
+                          </Avatar>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[13px] font-semibold">
+                              <span className="text-muted-foreground/50">{i + 1}. </span>{step.name}
+                              <span className="ml-2 text-[11px] font-normal text-muted-foreground/70">{step.title}</span>
+                              {step.rev && <span className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[9.5px] font-semibold text-rose-300">↩ rev {step.rev} · แก้ตาม meeting</span>}
+                              {kind !== 'work' && <StepKindBadge kind={kind} />}
+                            </div>
                           </div>
-                        </div>
-                        {step.container && (
-                          <span className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-medium text-emerald-400 sm:flex" title={`deliverable: ${step.deliverable || '-'}`}>
-                            <Container className="h-3 w-3" /> {step.container}
-                          </span>
+                          {step.container && (
+                            <span className="hidden items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10.5px] font-medium text-emerald-400 sm:flex" title={`deliverable: ${step.deliverable || '-'}`}>
+                              <Container className="h-3 w-3" /> {step.container}
+                            </span>
+                          )}
+                          <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground/50 transition-transform ${open ? '' : '-rotate-90'}`} />
+                        </button>
+                        {!live && (step.status === 'error' || step.status === 'skipped' || step.status === 'stopped') && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => retryOneStep(step.role, kind)}
+                            disabled={retryingStep !== null}
+                            data-testid={`retry-step-${step.role}${kind !== 'work' ? `-${kind}` : ''}`}
+                            className="h-7 shrink-0 gap-1.5 border-amber-500/40 text-[11px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+                            title={`สั่งเฉพาะ step นี้ซ้ำ — งานที่เสร็จแล้วของคนอื่นถูกเก็บไว้ทั้งหมด (สถานะเดิม: ${step.status})`}
+                          >
+                            {retryingStep === sKey ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />} ลองซ้ำ
+                          </Button>
                         )}
-                        <ChevronDown className={`h-4 w-4 text-muted-foreground/50 transition-transform ${open ? '' : '-rotate-90'}`} />
-                      </button>
+                      </div>
                       {open && (
                         <div className="border-t px-3.5 py-3">
                           {step.status === 'pending' && <div className="text-[12px] text-muted-foreground/60">รอรับงาน…</div>}
@@ -787,7 +859,8 @@ export default function ProjectFlow() {
                               <Loader2 className="h-3.5 w-3.5 animate-spin" /> ↩ ถูกตีกลับแก้จาก meeting — กำลังแก้งานใหม่เป็น rev {run.round}…
                             </div>
                           )}
-                          {step.status === 'working' && !reverting && <div className="flex items-center gap-2 text-[12px] text-blue-400"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังทำงาน…</div>}
+                          {step.status === 'working' && !reverting && live && <div className="flex items-center gap-2 text-[12px] text-blue-400"><Loader2 className="h-3.5 w-3.5 animate-spin" /> กำลังทำงาน…</div>}
+                          {step.status === 'stopped' && <div className="text-[12px] text-muted-foreground/70">หยุดกลางคัน — run จบตอน step นี้กำลังทำงาน</div>}
                           {step.status === 'error' && <div className="text-[12.5px] text-red-400">{step.output}</div>}
                           {step.status === 'skipped' && <div className="text-[12px] text-muted-foreground/70">ข้าม — {step.output || 'ไม่มีเหตุผลระบุ'}</div>}
                           {step.status === 'done' && (

@@ -6,7 +6,9 @@ import { useEffect, useState } from 'react'
 import { Figma, Github, Plug } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { ConnectorDialogs, connectorDisconnect } from '@/components/connector-flows'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -14,8 +16,10 @@ function connectorOf(row, type) {
   return row.connectors?.find(c => c.type === type) || { type, state: 'disconnected' }
 }
 
-// One connector column cell — badge + login/reason, shared by every connector
-function StateCell({ conn, ctype }) {
+// One connector column cell — badge + login/reason plus the action button
+// (Connect opens the shared flow dialog, Disconnect runs inline). Shared by
+// every connector column.
+function StateCell({ conn, ctype, busy, onConnect, onDisconnect }) {
   return (
     <div className="flex items-center gap-2">
       <Badge
@@ -26,6 +30,26 @@ function StateCell({ conn, ctype }) {
       </Badge>
       {conn.state === 'connected' && conn.login && <span className="text-[12px] text-muted-foreground">@{conn.login}</span>}
       {conn.state !== 'connected' && conn.reason && <span className="text-[11px] text-muted-foreground/60">{conn.reason}</span>}
+      {conn.state === 'connected' ? (
+        <Button
+          size="sm" variant="ghost"
+          className="h-6 px-2 text-[11px] text-red-400 hover:bg-red-500/10 hover:text-red-400"
+          disabled={busy}
+          onClick={onDisconnect}
+          data-testid={`connector-row-disconnect-${ctype}`}
+        >
+          {busy ? 'Disconnecting…' : 'Disconnect'}
+        </Button>
+      ) : conn.state === 'disconnected' && (
+        <Button
+          size="sm" variant="outline"
+          className="h-6 px-2 text-[11px]"
+          onClick={onConnect}
+          data-testid={`connector-row-connect-${ctype}`}
+        >
+          Connect
+        </Button>
+      )}
     </div>
   )
 }
@@ -33,6 +57,9 @@ function StateCell({ conn, ctype }) {
 export default function ConnectorsPage() {
   const [catalog, setCatalog] = useState(null)
   const [rows, setRows] = useState(null)
+  const [flow, setFlow] = useState(null) // { container, ctype } — opens the shared dialog
+  const [busyKey, setBusyKey] = useState('') // `${container}:${ctype}:disconnect`
+  const [refresh, setRefresh] = useState(0) // bumped after a change → repoll now
 
   useEffect(() => {
     authFetch(`${API}/connectors`).then(r => r.json()).then(setCatalog).catch(() => setCatalog([]))
@@ -50,7 +77,16 @@ export default function ConnectorsPage() {
     load()
     const t = setInterval(load, 5000)
     return () => { alive = false; clearInterval(t) }
-  }, [])
+  }, [refresh])
+
+  async function disconnect(container, ctype) {
+    setBusyKey(`${container}:${ctype}:disconnect`)
+    try {
+      await connectorDisconnect(container, ctype)
+      setRefresh(t => t + 1)
+    } catch { /* the next poll re-derives the true state */ }
+    setBusyKey('')
+  }
 
   const cards = catalog === null
     ? [
@@ -117,8 +153,22 @@ export default function ConnectorsPage() {
                       {r.role && <span className="ml-2 font-mono text-[11px] text-muted-foreground/60">{r.role}</span>}
                     </TableCell>
                     <TableCell className="max-w-[220px] truncate font-mono text-[11.5px] text-muted-foreground">{r.image}</TableCell>
-                    <TableCell><StateCell conn={connectorOf(r, 'github')} ctype="github" /></TableCell>
-                    <TableCell><StateCell conn={connectorOf(r, 'figma')} ctype="figma" /></TableCell>
+                    <TableCell>
+                      <StateCell
+                        conn={connectorOf(r, 'github')} ctype="github"
+                        busy={busyKey === `${r.name}:github:disconnect`}
+                        onConnect={() => setFlow({ container: r.name, ctype: 'github' })}
+                        onDisconnect={() => disconnect(r.name, 'github')}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <StateCell
+                        conn={connectorOf(r, 'figma')} ctype="figma"
+                        busy={busyKey === `${r.name}:figma:disconnect`}
+                        onConnect={() => setFlow({ container: r.name, ctype: 'figma' })}
+                        onDisconnect={() => disconnect(r.name, 'figma')}
+                      />
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -126,6 +176,13 @@ export default function ConnectorsPage() {
           )}
         </Card>
       </div>
+
+      <ConnectorDialogs
+        containerId={flow?.container || null}
+        ctype={flow?.ctype || null}
+        onClose={() => setFlow(null)}
+        onChanged={() => setRefresh(t => t + 1)}
+      />
     </>
   )
 }

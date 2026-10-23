@@ -7,6 +7,7 @@ import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { PersonaEditor } from '@/components/persona-editor'
+import { ConnectorChips, ConnectorDialogs } from '@/components/connector-flows'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -16,6 +17,9 @@ export default function TeamPage() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [editingAgent, setEditingAgent] = useState(null) // persona object, or null = new
   const [agentStatus, setAgentStatus] = useState(null) // {model, provider, provider_id} from /agent/status
+  const [connectorRows, setConnectorRows] = useState(null) // /connectors/status rows — null = loading
+  const [flow, setFlow] = useState(null) // { container, ctype } — opens the shared connect dialog
+  const [connRefresh, setConnRefresh] = useState(0) // bumped after a dialog change → repoll now
 
   async function load() {
     try {
@@ -25,6 +29,21 @@ export default function TeamPage() {
       setAgents([])
     }
   }
+
+  // Connector states ride the same cadence as the agent list — chips stay in
+  // sync with connects/disconnects done anywhere (this page, console, overview)
+  useEffect(() => {
+    let alive = true
+    async function loadConnectors() {
+      try {
+        const res = await authFetch(`${API}/connectors/status`)
+        if (res.ok && alive) setConnectorRows(await res.json())
+      } catch { /* keep last known */ }
+    }
+    loadConnectors()
+    const t = setInterval(loadConnectors, 5000)
+    return () => { alive = false; clearInterval(t) }
+  }, [connRefresh])
 
   useEffect(() => {
     load()
@@ -131,6 +150,16 @@ export default function TeamPage() {
 
             <div className="text-[12px] leading-relaxed text-muted-foreground/80">{a.expertise}</div>
 
+            {/* Live connector state per AI — click a chip to connect/disconnect
+                without leaving the team page */}
+            {a.container && (
+              <ConnectorChips
+                containerName={a.container.name}
+                connectors={connectorRows?.find(r => r.name === a.container.name)?.connectors}
+                onOpen={ctype => setFlow({ container: a.container.name, ctype })}
+              />
+            )}
+
             <div className="mt-auto flex items-center gap-2">
               {!a.container ? (
                 <Button size="sm" data-testid={`agent-start-${a.role}`} disabled={busy === a.role} onClick={() => start(a.role)}>
@@ -170,6 +199,13 @@ export default function TeamPage() {
       </div>
 
       <PersonaEditor agent={editingAgent} open={editorOpen} onOpenChange={setEditorOpen} onSaved={load} />
+
+      <ConnectorDialogs
+        containerId={flow?.container || null}
+        ctype={flow?.ctype || null}
+        onClose={() => setFlow(null)}
+        onChanged={() => setConnRefresh(t => t + 1)}
+      />
     </>
   )
 }

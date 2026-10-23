@@ -62,7 +62,7 @@ const PROBED_TOOLS: &[(&str, &str)] = &[
     ("pip3", "install Python packages"),
     ("node", "Node.js runtime"),
     ("npm", "JS packages / npx one-off tools"),
-    ("chromium", "real browser — headless screenshot: chromium --headless --no-sandbox --screenshot=/workspace/shot.png --window-size=1280,800 <url>"),
+    ("chromium", "real browser — VISIBLE on this machine's VNC screen (the user watches you work): chromium --no-sandbox --no-first-run --disable-dev-shm-usage <url> opens a window on DISPLAY=:1; quick screenshot without a window: chromium --headless --no-sandbox --screenshot=/workspace/shot.png --window-size=1280,800 <url>"),
     ("rg", "ripgrep — fast code search"),
     ("zip", "create zip archives"),
     ("unzip", "extract zip archives"),
@@ -799,39 +799,21 @@ impl App {
     }
 
     async fn exec_in(&self, container_id: &str, command: &str) -> Result<(i64, String), ApiError> {
-        let exec = self.docker()?
-            .create_exec(container_id, CreateExecOptions::<&str> {
-                cmd: Some(vec!["sh", "-c", command]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-
-        let mut bytes: Vec<u8> = Vec::new();
-        let started = self.docker()?
-            .start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: false, ..Default::default() }))
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        if let StartExecResults::Attached { mut output, .. } = started {
-            while let Some(Ok(frame)) = output.next().await {
-                bytes.extend_from_slice(&frame.into_bytes());
-            }
-        }
-        let exit_code = self.docker()?
-            .inspect_exec(&exec.id)
-            .await
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-            .exit_code
-            .unwrap_or(-1);
-        Ok((exit_code, String::from_utf8_lossy(&bytes).into_owned()))
+        self.exec_in_env(container_id, command, Vec::new()).await
     }
 
     /// exec_in with extra environment variables — the only safe way to pass
     /// secrets (tokens, git identity) into a container: they never appear in
     /// the command string (visible via ps) nor in `docker inspect`.
-    async fn exec_in_env(&self, container_id: &str, command: &str, env: Vec<String>) -> Result<(i64, String), ApiError> {
+    ///
+    /// DISPLAY=:1 is appended to every exec: agent-base runs Xvnc on :1, but
+    /// `docker exec` does NOT inherit the env of the running start.sh —
+    /// without this any GUI app an agent/user launches dies with
+    /// "cannot open display". With it, browser windows land on the VNC
+    /// desktop where the user can watch the agent work. A caller-supplied
+    /// DISPLAY (appended later) still wins; headless boxes ignore it.
+    async fn exec_in_env(&self, container_id: &str, command: &str, mut env: Vec<String>) -> Result<(i64, String), ApiError> {
+        env.push("DISPLAY=:1".to_string());
         let exec = self.docker()?
             .create_exec(container_id, CreateExecOptions::<String> {
                 cmd: Some(vec!["sh".into(), "-c".into(), command.into()]),
@@ -879,9 +861,13 @@ impl App {
         }
         let dir = repo_dir_name(repo_url);
         let path = format!("/workspace/{dir}");
-        // private repos: inject the configured token into the clone URL only
-        // (x-access-token is what GitHub PATs authenticate as over HTTPS).
-        // The token never appears in error text — errors quote the clean URL.
+        // private repos: the configured platform token rides the clone URL for
+        // the INITIAL clone only (x-access-token is what GitHub PATs
+        // authenticate as over HTTPS) — read access, never a per-machine
+        // identity. The token never appears in error text — errors quote the
+        // clean URL — and the origin URL is normalized back to the clean form
+        // right after, so later fetch/push authenticate as the machine's own
+        // connector login (gh credential helper), not as the platform token.
         let git_token = self.store.lock().unwrap().config.git_token.trim().to_string();
         let clone_url = if !git_token.is_empty() && repo_url.starts_with("https://") {
             if !git_token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
@@ -895,7 +881,9 @@ impl App {
             "command -v git >/dev/null 2>&1 || apk add --no-cache git >/dev/null 2>&1 || {{ apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git >/dev/null 2>&1; }}; \
              command -v git >/dev/null 2>&1 || {{ echo 'git is not available in this image — use the agent-base image'; exit 3; }}; \
              mkdir -p /workspace; \
-             if [ ! -d '{path}/.git' ]; then git clone --depth 1 '{clone_url}' '{path}' || exit 4; else echo 'repo already cloned at {path}'; fi"
+             if [ ! -d '{path}/.git' ]; then git clone --depth 1 '{clone_url}' '{path}' || exit 4; else echo 'repo already cloned at {path}'; fi; \
+             origin=$(git -C '{path}' remote get-url origin 2>/dev/null || true); \
+             case \"$origin\" in *x-access-token:*) git -C '{path}' remote set-url origin '{repo_url}' >/dev/null 2>&1 || true;; esac"
         );
         let (code, out) = self.exec_in(container_id, &script).await?;
         match code {
@@ -907,19 +895,15 @@ impl App {
 
     /// Make sure the default tool belt works in this container (the "every
     /// Linux box has the same defaults" rule): install the small core set when
-    /// missing (apk/apt, best-effort), register the configured GitHub PAT with
-    /// `gh` AND git's URL rewrite so private repos just work — but only when gh
-    /// is not already logged in: a per-container connector login (GitHub
-    /// connector) wins over the platform PAT, and a leftover PAT URL rewrite is
-    /// cleared so gh's credential helper governs push/pull. Also sets a git
-    /// identity so commits never fail. Best-effort and silent — the manifest
-    /// probe right after reports what the box really has.
+    /// missing (apk/apt, best-effort) and set a git identity so commits never
+    /// fail. GitHub auth is deliberately NOT touched here — per-machine rule:
+    /// the platform PAT is clone-only (see ensure_repo) and a box gets its
+    /// GitHub identity solely from its own connector login (browser device
+    /// flow primary, pasted token backup). Any legacy `x-access-token`
+    /// insteadOf rewrite from the old shared-PAT era is stripped so push/pull
+    /// go through that machine's own gh credential helper. Best-effort and
+    /// silent — the manifest probe right after reports what the box really has.
     async fn ensure_tools(&self, container_id: &str) {
-        let git_token = {
-            let t = self.store.lock().unwrap().config.git_token.trim().to_string();
-            // same charset gate as ensure_repo: the token is interpolated into sh
-            if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) { t } else { String::new() }
-        };
         let apt = INSTALLABLE_TOOLS.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(" ");
         let apk = INSTALLABLE_TOOLS.iter().map(|(_, a)| *a).collect::<Vec<_>>().join(" ");
         let script = format!(
@@ -928,14 +912,7 @@ impl App {
                  command -v apk >/dev/null 2>&1 && apk add --no-cache {apk} >/dev/null 2>&1; \
                  command -v apt-get >/dev/null 2>&1 && apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq {apt} >/dev/null 2>&1; \
              fi; \
-             if [ -n '{git_token}' ]; then \
-                 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then \
-                     git config --global --unset-all url.\"https://x-access-token:{git_token}@github.com/\".insteadOf >/dev/null 2>&1; \
-                 else \
-                     command -v gh >/dev/null 2>&1 && printf '%s' '{git_token}' | gh auth login --with-token >/dev/null 2>&1; \
-                     command -v git >/dev/null 2>&1 && git config --global url.\"https://x-access-token:{git_token}@github.com/\".insteadOf https://github.com/ >/dev/null 2>&1; \
-                 fi; \
-             fi; \
+             command -v git >/dev/null 2>&1 && {{ git config --global --get-regexp '^url\\..*\\.insteadof$' 2>/dev/null | while IFS=' ' read -r k _v; do case \"$k\" in *x-access-token*) git config --global --unset-all \"$k\" >/dev/null 2>&1 || true;; esac; done; true; }}; \
              command -v git >/dev/null 2>&1 && {{ git config --global user.name >/dev/null 2>&1 || git config --global user.name 'AI Agent'; \
                  git config --global user.email >/dev/null 2>&1 || git config --global user.email 'agent@ai-agent-platform.local'; }}; \
              if [ -S /var/run/docker.sock ] && ! command -v docker >/dev/null 2>&1; then \
@@ -1255,7 +1232,8 @@ struct ListQuery {
     all: bool,
 }
 
-async fn list_containers(State(app): State<App>, Query(q): Query<ListQuery>) -> ApiResult {
+async fn list_containers(State(app): State<App>, headers: axum::http::HeaderMap, Query(q): Query<ListQuery>) -> ApiResult {
+    app.require_auth(&headers)?;
     // Default: only containers managed by this platform. ?all=true returns everything on the host.
     let mut builder = ListContainersOptionsBuilder::new().all(true);
     if !q.all {
@@ -1501,7 +1479,9 @@ async fn terminal_session(app: App, socket: WebSocket, container_id: String, con
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         tty: Some(true),
-        env: Some(vec!["TERM=xterm-256color"]),
+        // DISPLAY=:1 — GUI apps typed into the web terminal (e.g. chromium)
+        // open on the container's VNC desktop instead of dying displayless.
+        env: Some(vec!["TERM=xterm-256color", "DISPLAY=:1"]),
         ..Default::default()
     }).await {
         Ok(e) => e,
@@ -1716,12 +1696,13 @@ async fn container_files(State(app): State<App>, headers: axum::http::HeaderMap,
 /// Static catalog of available connectors. Each connector lists the auth
 /// methods it supports (device = browser device flow, token = paste a
 /// personal access token); the UI renders one flow per method.
-async fn connectors_catalog() -> ApiResult {
+async fn connectors_catalog(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
     Ok(json_ok(json!([
         {
             "type": "github",
             "name": "GitHub",
-            "description": "gh CLI + git push/pull ใน container — ใช้ private repo, issue และ PR ได้จากในเครื่องนั้นโดยตรง (login แยกทีละเครื่อง)",
+            "description": "gh CLI + git push/pull ใน container — ใช้ private repo, issue และ PR ได้จากในเครื่องนั้นโดยตรง (login แยกทีละเครื่อง — หลักคือ browser device flow, วาง token เป็นทางสำรอง)",
             "auth_methods": [
                 { "id": "device", "name": "Browser (device flow)" },
                 { "id": "token", "name": "Personal access token" },
@@ -2275,7 +2256,7 @@ async fn github_open_browser(State(app): State<App>, headers: axum::http::Header
     // chromium as root needs --no-sandbox; launched detached (&) so the exec
     // returns immediately instead of waiting for the browser to exit.
     let script = format!(
-        r#"command -v chromium >/dev/null 2>&1 || exit 127; (chromium --no-sandbox --disable-dev-shm-usage '{url}' >/dev/null 2>&1 &)"#
+        r#"command -v chromium >/dev/null 2>&1 || exit 127; (chromium --no-sandbox --no-first-run --disable-dev-shm-usage '{url}' >/dev/null 2>&1 &)"#
     );
     let (code, _) = app.exec_in_env(&container_id, &script, vec!["DISPLAY=:1".to_string()]).await?;
     if code != 0 {
@@ -2338,7 +2319,7 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
         None => String::new(),
     };
     let system = format!(
-        "{base_prompt}\n\nYou are operating inside a Linux container (Ubuntu/Alpine, sh shell) as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe sh command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo).{tools_md}{repo_rules}"
+        "{base_prompt}\n\nYou are operating inside a Linux container (Ubuntu/Alpine, sh shell) as an autonomous agent. The user gives a request in any language. Answer with EXACTLY ONE line containing ONE safe sh command that accomplishes the request using your expertise. Output the bare command only — no markdown, no backticks, no explanation. If the request is a question, answer it with a command that prints the answer (e.g. echo). GUI apps you launch (browser, editors) open on this machine's VNC desktop (DISPLAY=:1) — the user watches them live in the VNC view, so prefer a visible browser window over headless whenever the point is to show or verify something.{tools_md}{repo_rules}"
     );
     let reply = app.llm(&model, &system, &req.command).await?;
     let command = reply.trim().trim_matches('`').lines().last().unwrap_or("").trim().to_string();
@@ -2362,7 +2343,8 @@ async fn agent_command(State(app): State<App>, headers: axum::http::HeaderMap, P
 // Handlers — personas (AI team, editable via UI with markdown rules)
 // ---------------------------------------------------------------------------
 
-async fn list_agents(State(app): State<App>) -> ApiResult {
+async fn list_agents(State(app): State<App>, headers: axum::http::HeaderMap) -> ApiResult {
+    app.require_auth(&headers)?;
     let (personas, provider_id, default_model) = {
         let store = app.store.lock().unwrap();
         let pid = store.config.ai_provider.clone();
@@ -2504,8 +2486,9 @@ async fn start_agent(State(app): State<App>, headers: axum::http::HeaderMap, Pat
 // Handlers — tasks
 // ---------------------------------------------------------------------------
 
-async fn list_tasks(State(app): State<App>) -> Json<Vec<Task>> {
-    Json(app.store.lock().unwrap().tasks.clone())
+async fn list_tasks(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Task>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().tasks.clone()))
 }
 
 async fn create_task(State(app): State<App>, Json(req): Json<TaskCreate>) -> ApiResult {
@@ -2595,8 +2578,9 @@ async fn update_config(State(app): State<App>, Json(req): Json<ConfigUpdate>) ->
     Ok(json_ok(config_json(&cfg)))
 }
 
-async fn list_skills(State(app): State<App>) -> Json<Vec<Skill>> {
-    Json(app.store.lock().unwrap().skills.clone())
+async fn list_skills(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Skill>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().skills.clone()))
 }
 
 async fn create_skill(State(app): State<App>, Json(req): Json<SkillCreate>) -> ApiResult {
@@ -2644,8 +2628,9 @@ async fn delete_skill(State(app): State<App>, Path(skill_id): Path<String>) -> A
 // Handlers — projects (team builder with react flow graphs)
 // ---------------------------------------------------------------------------
 
-async fn list_projects(State(app): State<App>) -> Json<Vec<Project>> {
-    Json(app.store.lock().unwrap().projects.clone())
+async fn list_projects(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Project>>, ApiError> {
+    app.require_auth(&headers)?;
+    Ok(Json(app.store.lock().unwrap().projects.clone()))
 }
 
 async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) -> ApiResult {
@@ -2665,7 +2650,8 @@ async fn create_project(State(app): State<App>, Json(req): Json<ProjectCreate>) 
     Ok(json_ok(serde_json::to_value(project).unwrap()))
 }
 
-async fn get_project(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+async fn get_project(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let store = app.store.lock().unwrap();
     let p = store.projects.iter().find(|p| p.id == id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Project '{id}' not found")))?;
@@ -2799,12 +2785,28 @@ fn load_runs(store: &mut Store) {
                 });
             }
         }
+        // A closed run (whatever closed it — restart, Stop, an older build with
+        // the finish gap) must not carry steps stuck at "working": nobody will
+        // ever advance them, and the UI would show a busy spinner forever.
+        for step in run.steps.iter_mut().filter(|s| s.status == "working") {
+            step.status = "stopped".into();
+            step.output = "stopped mid-work — the run already ended while this step was in flight".into();
+            if step.finished_at == 0 { step.finished_at = now; }
+        }
         run.stop_requested = false;
     }
     let max_id = runs.iter()
         .filter_map(|r| r.id.strip_prefix("run-").and_then(|n| n.parse::<usize>().ok()))
         .max().unwrap_or(0);
     store.run_counter = store.run_counter.max(parsed.run_counter).max(max_id);
+    // Runs outlive projects (they ARE the work history), so a fresh boot must
+    // not hand out a p-NNN id that a restored run still references — the board
+    // would graft that orphan history onto the brand-new project.
+    let max_pid = runs.iter()
+        .filter_map(|r| r.project_id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok()))
+        .chain(store.projects.iter().filter_map(|p| p.id.strip_prefix("p-").and_then(|n| n.parse::<usize>().ok())))
+        .max().unwrap_or(0);
+    store.project_counter = store.project_counter.max(max_pid);
     println!("restored {} run(s) from {}", runs.len(), runs_file().display());
     store.runs = runs;
 }
@@ -2883,6 +2885,52 @@ async fn write_deliverable(app: &App, container_id: &str, run_id: &str, role: &s
     Ok(path)
 }
 
+/// Write FILES-block entries into the repo working tree inside the agent's
+/// container (mkdir -p + quoted heredoc — same pattern as write_deliverable;
+/// paths were charset-guarded by parse_files). Returns how many files landed.
+async fn apply_files_to_repo(app: &App, container_id: &str, repo_path: &str, files: &[(String, String)]) -> Result<usize, String> {
+    let mut applied = 0usize;
+    for (path, content) in files {
+        let dir = match path.rsplit_once('/').map(|(d, _)| d) {
+            Some(d) if !d.is_empty() => d,
+            _ => ".",
+        };
+        let script = format!(
+            "mkdir -p '{repo_path}/{dir}' && cat > '{repo_path}/{path}' << 'AAP_EOF_9Z'\n{}\nAAP_EOF_9Z\n",
+            content.replace('\r', ""),
+        );
+        let (code, out) = app.exec_in(container_id, &script).await.map_err(|e| e.1)?;
+        if code != 0 {
+            return Err(format!("writing {path} failed (exit {code}): {out}"));
+        }
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Design/code delivery shared by the relay and meeting-revision paths: when a
+/// dev/UX agent's reply carries a FILES block (and the project has a repo),
+/// write those files into the repo working tree in the agent's container and
+/// append an honest note to the stored deliverable (applied / failed / no
+/// container). The FILES section itself stays in the stored output so the UI
+/// shows the actual code.
+async fn apply_files_note(app: &App, repo_path: Option<&str>, role: &str, output: &mut String) {
+    let Some(rp) = repo_path else { return };
+    if !(role.starts_with("dev") || role.starts_with("ux")) { return; }
+    let files = parse_files(output);
+    if files.is_empty() { return; }
+    match app.agent_container(role).await {
+        Some((cid, _)) => match apply_files_to_repo(app, &cid, rp, &files).await {
+            Ok(n) => output.push_str(&format!(
+                "\n\n*(applied {n} file(s) to the repo working tree — they ride the mission PR: {})*",
+                files.iter().map(|(p, _)| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+            )),
+            Err(e) => output.push_str(&format!("\n\n*(FAILED to apply files to the repo: {e})*")),
+        },
+        None => output.push_str("\n\n*(files NOT applied — no running container for this role)*"),
+    }
+}
+
 /// Meeting loop bound — after this many meeting rounds, still-open questions are
 /// escalated to the human (need-human) and then closed; the PO decides in the summary.
 const MAX_MEETING_ROUNDS: u32 = 2;
@@ -2941,6 +2989,66 @@ fn strip_ask(output: &str) -> String {
     }
 }
 
+/// Design+code delivery: dev/UX agents may end their reply with a section
+/// exactly titled `## FILES` — every entry is `### <repo-relative-path>`
+/// followed by ONE fenced block holding the COMPLETE file content (full file,
+/// never a diff). The orchestrator writes these into the repo working tree in
+/// the agent's container and the PR stage commits whatever changed — this is
+/// how missions ship real code and design artifacts instead of prose about
+/// them. Line index where that section starts (None = absent).
+fn find_files(output: &str) -> Option<usize> {
+    output.lines().position(|l| l.trim().eq_ignore_ascii_case("## FILES"))
+}
+
+/// (path, full content) pairs from the FILES section. Guarded on purpose:
+/// paths are interpolated into a quoted sh script, so they must be relative
+/// with a conservative charset and no `..`; counts/sizes are bounded; content
+/// may not contain the heredoc terminator.
+fn parse_files(output: &str) -> Vec<(String, String)> {
+    let Some(start) = find_files(output) else { return Vec::new() };
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut path: Option<String> = None;
+    let mut in_fence = false;
+    let mut body = String::new();
+    for line in output.lines().skip(start + 1) {
+        let t = line.trim_end();
+        if in_fence {
+            if t.trim_start().starts_with("```") {
+                if let Some(p) = path.take() {
+                    if !body.contains("AAP_EOF_9Z") {
+                        files.push((p, std::mem::take(&mut body)));
+                    }
+                }
+                in_fence = false;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        } else if let Some(rest) = t.strip_prefix("### ") {
+            path = Some(rest.trim().to_string()); // replaces an entry that never got a block
+        } else if t.trim_start().starts_with("```") {
+            if path.is_some() { in_fence = true; }
+        }
+    }
+    files.retain(|(p, c)| {
+        !p.is_empty() && p.len() <= 200
+            && !p.starts_with('/') && !p.split('/').any(|seg| seg == "..")
+            && p.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+            && !c.is_empty() && c.len() <= 65_536
+    });
+    files.truncate(12);
+    files
+}
+
+/// Deliverable text without the FILES section — full-file listings would drown
+/// the handoff summary later teammates read.
+fn strip_files(output: &str) -> String {
+    match find_files(output) {
+        Some(start) => output.lines().take(start).collect::<Vec<_>>().join("\n").trim_end().to_string(),
+        None => output.to_string(),
+    }
+}
+
 /// Keep only teammates that exist in this team (minus the asker), in team order;
 /// "all" expands to everyone. "human" is passed through and sorted last so a
 /// need-human escalation only fires after the teammates had their say.
@@ -2994,6 +3102,13 @@ fn finish_run(app: &App, run_id: &str, status: &str) {
         if run.status != "running" && run.status != "waiting_human" { return; }
         for step in run.steps.iter_mut().filter(|s| s.status == "pending") {
             step.status = "skipped".into();
+        }
+        // The step that was mid-flight when the run ended would otherwise show
+        // "working" forever — nothing will ever move it forward again. Close it.
+        for step in run.steps.iter_mut().filter(|s| s.status == "working") {
+            step.status = "stopped".into();
+            step.output = format!("stopped mid-work — the run closed as {status} while this step was in flight");
+            if step.finished_at == 0 { step.finished_at = now_secs(); }
         }
         run.status = status.into();
         run.phase = "done".into();
@@ -3413,7 +3528,10 @@ async fn run_pr_stage(
     // gh auth + git identity for THIS container (idempotent, best-effort)
     app.ensure_tools(&cid).await;
 
-    // Branch + commit: copy the run's deliverable markdown into the repo
+    // Branch + commit: everything that changed in the team's shared working
+    // tree rides the mission branch — deliverable markdown copied under
+    // missions/, PLUS any real code/design files the dev/UX agents applied
+    // via their FILES blocks during the relay.
     let commit_msg = format!("mission {run_id}: team deliverables");
     let script = format!(
         "cd '{repo_path}' || exit 10; \
@@ -3422,7 +3540,8 @@ async fn run_pr_stage(
          git checkout -q -B '{branch}' \"$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main)\"; \
          mkdir -p 'missions/{run_id}'; \
          cp /workspace/{run_id}-*.md 'missions/{run_id}/' 2>/dev/null || true; \
-         git add 'missions/{run_id}'; \
+         git add -A; \
+         git status --porcelain | head -30; \
          git commit -q -m '{commit_msg}' 2>/dev/null || echo NOTHING_TO_COMMIT; \
          git log -1 --format=%h 2>/dev/null"
     );
@@ -3440,7 +3559,7 @@ async fn run_pr_stage(
     }
     let committed = !out.contains("NOTHING_TO_COMMIT");
     if !committed {
-        let n = "nothing to commit — no deliverable files landed under /workspace for this run (agents without containers write text-only deliverables)".to_string();
+        let n = "nothing to commit — no deliverable files landed under /workspace and no code/design changes were applied to the repo this run (agents without containers write text-only deliverables; FILES blocks only apply for dev/UX roles with a repo)".to_string();
         step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
         return skip(n);
     }
@@ -3488,12 +3607,12 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
                 return skip(n);
             }
             GhAuthOutcome::RepliedUnauthed => {
-                let n = format!("gh still not authenticated after your chat reply — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page (branch '{branch}' with the mission commit exists locally in the container)");
+                let n = format!("gh still not authenticated after your chat reply — เชื่อม GitHub ให้เครื่องนี้ที่หน้า Containers/Team → connector (login ผ่าน browser หรือวาง token เป็นทางสำรอง) แล้ว re-run (branch '{branch}' with the mission commit exists locally in the container)");
                 step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
                 return skip(n);
             }
             GhAuthOutcome::Ended => {
-                let n = format!("GitHub authorization did not complete in time — set a GitHub PAT in Settings → Git Access or connect the GitHub connector on the container page, then re-run (branch '{branch}' with the mission commit exists locally in the container)");
+                let n = format!("GitHub authorization did not complete in time — เชื่อม GitHub ให้เครื่องนี้ที่หน้า Containers/Team → connector แล้ว re-run (branch '{branch}' with the mission commit exists locally in the container)");
                 step_transition(app, run_id, dev_role, "pr", "skipped", &n).await;
                 return skip(n);
             }
@@ -3512,7 +3631,8 @@ BODY:\n<markdown ≤180 words: what the mission delivered, what is added under m
     let url = extract_pr_url(&out);
     if let Some(u) = url.filter(|_| code == 0) {
         let report = format!(
-            "✅ Pull request opened: {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Files: `missions/{run_id}/*.md` — the team's deliverables for this mission\n- Repo: {repo_url}\n\n---\n{body}"
+            "✅ Pull request opened: {u}\n\n- Branch `{branch}` (commit `{sha}`)\n- Contents: everything the team changed — `missions/{run_id}/*.md` deliverables + any code/design files applied via FILES blocks\n- Changed paths:\n```\n{}\n```\n- Repo: {repo_url}\n\n---\n{body}",
+            out.lines().filter(|l| l.starts_with("??") || (l.len() > 2 && l.as_bytes()[1] == b' ')).take(15).collect::<Vec<_>>().join("\n"),
         );
         step_transition(app, run_id, dev_role, "pr", "done", &report).await;
         return PrOutcome { status: "done".into(), url: u, branch, note: report };
@@ -3824,7 +3944,11 @@ Write the checks in the same language as the mission."
 async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -> Result<String, ApiError> {
     let mut budget = max;
     let mut last_err: Option<ApiError> = None;
-    for attempt in 0..3u32 {
+    // 5 attempts with growing backoff (~20s of waiting total) — provider blips
+    // (5xx, rate limits, even transient auth flaps that surface as 401) must
+    // not kill a whole mission step by step. Hard misconfiguration still fails
+    // fast on the first attempt below.
+    for attempt in 0..5u32 {
         if attempt > 0 { tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await; }
         match app.llm_max(model, system, user, budget).await {
             Ok(t) if !t.trim().is_empty() => return Ok(t),
@@ -3841,6 +3965,59 @@ async fn llm_retry(app: &App, model: &str, system: &str, user: &str, max: u32) -
         }
     }
     Err(last_err.unwrap_or_else(|| err(StatusCode::BAD_GATEWAY, format!("model '{model}' returned an empty answer after 3 attempts"))))
+}
+
+/// (name, title, rules, model) for a role, straight from the persona store —
+/// shared by the relay engine and single-step retry.
+fn persona_of(app: &App, role: &str) -> (String, String, String, Option<String>) {
+    let p = { app.store.lock().unwrap().personas.iter().find(|p| p.role == role).cloned() };
+    match p {
+        Some(p) => {
+            let model = app.model_for_persona(Some(&p));
+            (p.name, p.title, p.rules_md, model)
+        }
+        None => (role.to_string(), String::new(), String::new(), None),
+    }
+}
+
+/// Clone/refresh the project repo into the shared /workspace volume through the
+/// FIRST running agent container. None = no agent container is running at all
+/// (the run proceeds text-only); Some(Err) = a container was there but the
+/// clone failed. Shared by the relay engine and single-step retry.
+async fn ensure_team_repo(app: &App, roles: &[String], repo_url: &str) -> Option<Result<String, ApiError>> {
+    for role in roles {
+        if let Some((cid, _)) = app.agent_container(role).await {
+            return Some(app.ensure_repo(&cid, repo_url).await);
+        }
+    }
+    None
+}
+
+/// The repo line injected into every work prompt when the team workspace has
+/// the project repo checked out.
+fn team_repo_line(repo_path: &Option<String>) -> String {
+    repo_path.as_deref()
+        .map(|p| format!(" The project repository is already cloned in the team workspace at {p} — when your part involves code or files, work against that repo's real files (cite real paths from it); all file changes go through this repo only."))
+        .unwrap_or_default()
+}
+
+/// Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
+/// `files` = this teammate ships real repo artifacts (dev/UX with a repo) —
+/// their reply must end with a FILES block the orchestrator applies.
+fn work_system(rules: &str, name: &str, title: &str, files: bool, project_name: &str, repo_line: &str, run_id: &str) -> String {
+    let files_line = if files {
+        format!("\nYou work on the REAL repository (already checked out in your container). IMPLEMENT, don't just describe: end your reply with a section exactly titled \"## FILES\" listing every new or changed file as `### <repo-relative-path>` followed by ONE fenced code block with the COMPLETE file content (full file, never a diff — keep the change small and focused, max ~6 files, matching the repo's existing style and framework; UX design artifacts go under `design/{run_id}/`, e.g. tokens.json / wireframe.html / style.md). Anything not listed in ## FILES will NOT reach the repository. Keep the prose part of your reply as the rationale.\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
+The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request and deploys an isolated staging stack, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line} \
+Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
+Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies).{files_line} \
+Answer in the same language the task is written in. Keep it under ~450 words (the ## FILES section does not count toward the limit). \
+If something genuinely blocks your part or is unclear, you may end your reply with a section exactly titled \"## ASK\" containing a line \"to: role1, role2\" (teammates who must answer — \"all\" for the whole team, \"human\" for the user) and 1-3 concise questions. Use it sparingly: only when you cannot do your part correctly without the answer. Address \"human\" ONLY when the missing piece is information or a decision that neither you nor any teammate can produce (credentials, business intent, external approval) — the whole team pauses until the user replies."
+    )
 }
 
 /// Team run engine with a meeting loop.
@@ -3878,45 +4055,16 @@ async fn execute_run(app: App, run_id: String) {
     let (repo_path, repo_error) = if repo_url.is_empty() {
         (None, None)
     } else {
-        let mut outcome: Option<Result<String, ApiError>> = None;
-        for (role, _, _) in &roles {
-            if let Some((cid, _)) = app.agent_container(role).await {
-                outcome = Some(app.ensure_repo(&cid, &repo_url).await);
-                break;
-            }
-        }
-        match outcome {
+        let team: Vec<String> = roles.iter().map(|(r, _, _)| r.clone()).collect();
+        match ensure_team_repo(&app, &team, &repo_url).await {
             Some(Ok(path)) => (Some(path), None),
             Some(Err(e)) => (None, Some(e.1)),
             // no agent container running — the run proceeds text-only, as before
             None => (None, None),
         }
     };
-    let repo_line = repo_path.as_deref()
-        .map(|p| format!(" The project repository is already cloned in the team workspace at {p} — when your part involves code or files, work against that repo's real files (cite real paths from it); all file changes go through this repo only."))
-        .unwrap_or_default();
+    let repo_line = team_repo_line(&repo_path);
     let repo_note = repo_error.map(|e| format!("\n\n## Note from the orchestrator\nThe project repo could not be cloned into the team workspace ({e}) — deliver text deliverables only this run."));
-
-    // (name, title, rules, model) for a role, straight from the persona store
-    let persona_of = |role: &str| -> (String, String, String, Option<String>) {
-        let p = { app.store.lock().unwrap().personas.iter().find(|p| p.role == role).cloned() };
-        match p {
-            Some(p) => (p.name.clone(), p.title.clone(), p.rules_md.clone(), app.model_for_persona(Some(&p))),
-            None => (role.to_string(), String::new(), String::new(), None),
-        }
-    };
-
-    // Shared work prompt: deliver YOUR part; ASK only when genuinely blocked.
-    let work_system = |rules: &str, name: &str, title: &str| {
-        format!(
-            "{rules}\n\nYou are {name}, {title}, one member of an AI agent team on project '{project_name}'. \
-The user gave the team ONE task. The team works together like a real software team: the PO opens the mission, the BA analyzes the business side, the SA turns it into the system spec that briefs UX/UI, Dev and QA each directly, then every specialist delivers their part against that spec; after QA verifies, the team ships for real — the first Dev opens a pull request and deploys an isolated staging stack, then the PO runs an acceptance demo against the mission's acceptance criteria and issues the final VERDICT.{repo_line} \
-Treat earlier teammates' output as your input — do YOUR part only, do not repeat or redo teammates' work; build on it, fill the gaps your expertise covers. \
-Reply with your concrete work deliverable in markdown (tight headings, lists, tables or code where useful — no filler, no apologies). \
-Answer in the same language the task is written in. Keep it under ~450 words. \
-If something genuinely blocks your part or is unclear, you may end your reply with a section exactly titled \"## ASK\" containing a line \"to: role1, role2\" (teammates who must answer — \"all\" for the whole team, \"human\" for the user) and 1-3 concise questions. Use it sparingly: only when you cannot do your part correctly without the answer. Address \"human\" ONLY when the missing piece is information or a decision that neither you nor any teammate can produce (credentials, business intent, external approval) — the whole team pauses until the user replies."
-        )
-    };
 
     // Register (or re-register) an ASK as a discussion; returns false when it targets no one.
     let raise_discussion = |from: &str, to: &[String], topic: &str, round: u32| -> bool {
@@ -3952,7 +4100,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             return;
         }
         let (role, name, title) = (role.clone(), name.clone(), title.clone());
-        let (pname, _ptitle, rules, model) = persona_of(&role);
+        let (pname, _ptitle, rules, model) = persona_of(&app, &role);
 
         // step → working (records the model this step will run with, even if it later errors)
         {
@@ -3972,14 +4120,19 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
                 for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
                     if s.status == "done" && !s.output.is_empty() {
-                        let brief: String = s.output.chars().take(1400).collect();
+                        // FILES listings are stripped — teammates need the summary,
+                        // not full file bodies (the repo tree has the real files)
+                        let brief: String = strip_files(&s.output).chars().take(1400).collect();
                         handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
                     }
                 }
             }
         }
 
-        let system = work_system(&rules, &pname, &title);
+        // dev/UX teammates with a repo ship real files — their reply may carry a
+        // FILES block, which needs a far larger completion budget than prose
+        let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
+        let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &run_id);
         let first_note = repo_note.as_deref().unwrap_or("");
         let user = if handoff.is_empty() {
             format!("## Task from the user\n{task}{first_note}\n\nYou are the first teammate to answer. Deliver your part.")
@@ -3987,13 +4140,15 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
             format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
         };
 
+        let cap = if ships_files { 6000 } else { 1400 };
         let result = match model.as_deref() {
-            Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
+            Some(m) => llm_retry(&app, m, &system, &user, cap).await,
             None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
         };
         match result {
             Ok(output) if !output.is_empty() => {
-                let clean = strip_ask(&output);
+                let mut clean = strip_ask(&output);
+                apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
                 deliver_and_close(&app, &run_id, &role, &clean, None).await;
                 if let Some((to, topic)) = parse_ask(&output) {
                     raise_discussion(&role, &to, &topic, 1);
@@ -4081,7 +4236,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
                 finish_run(&app, &run_id, "stopped");
                 return;
             }
-            let (fname, ftitle, ..) = persona_of(&d.from);
+            let (fname, ftitle, ..) = persona_of(&app, &d.from);
             {
                 let mut store = app.store.lock().unwrap();
                 if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.discussions.iter_mut().find(|x| x.id == d.id)) {
@@ -4104,7 +4259,7 @@ If something genuinely blocks your part or is unclear, you may end your reply wi
                     }
                     continue;
                 }
-                let (tname, ttitle, trules, tmodel) = persona_of(target);
+                let (tname, ttitle, trules, tmodel) = persona_of(&app, target);
                 {
                     let mut store = app.store.lock().unwrap();
                     if let Some(disc) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.discussions.iter_mut().find(|x| x.id == d.id)) {
@@ -4144,7 +4299,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             }
 
             // The asker revises their deliverable with the answers
-            let (aname, atitle, arules, amodel) = persona_of(&d.from);
+            let (aname, atitle, arules, amodel) = persona_of(&app, &d.from);
             let (prev, msgs) = {
                 let store = app.store.lock().unwrap();
                 let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
@@ -4154,7 +4309,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
             };
             let answers = msgs.iter()
                 .map(|m| {
-                    let speaker = if m.from == "human" { "the user".to_string() } else if m.from == "orchestrator" { "orchestrator".to_string() } else { persona_of(&m.from).0 };
+                    let speaker = if m.from == "human" { "the user".to_string() } else if m.from == "orchestrator" { "orchestrator".to_string() } else { persona_of(&app, &m.from).0 };
                     format!("- **{}** ({}): {}", speaker, m.from, m.text)
                 })
                 .collect::<Vec<_>>().join("\n");
@@ -4166,18 +4321,21 @@ A teammate raised a blocking question that needs your expertise. Answer directly
                 }
                 save_runs(&store);
             }
-            let system = work_system(&arules, &aname, &atitle);
+            // a dev/UX asker may re-emit their FILES block with fixes applied
+            let rev_files = repo_path.is_some() && (d.from.starts_with("dev") || d.from.starts_with("ux"));
+            let system = work_system(&arules, &aname, &atitle, rev_files, &project_name, &repo_line, &run_id);
             let user = format!(
-                "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words). If you are still blocked you may end with another \"## ASK\" section.",
+                "## Task from the user\n{task}\n\n## Your earlier deliverable\n{prev}\n\n## Your question to the team\n{}\n\n## Answers from the team\n{answers}\n\nRevise and resend YOUR full deliverable (same format rules, ≤450 words — re-emit the full \"## FILES\" section too if your files changed). If you are still blocked you may end with another \"## ASK\" section.",
                 d.topic,
             );
             let result = match amodel.as_deref() {
-                Some(m) => llm_retry(&app, m, &system, &user, 1400).await,
+                Some(m) => llm_retry(&app, m, &system, &user, if rev_files { 6000 } else { 1400 }).await,
                 None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
             };
             match result {
                 Ok(output) if !output.is_empty() => {
-                    let clean = strip_ask(&output);
+                    let mut clean = strip_ask(&output);
+                    apply_files_note(&app, repo_path.as_deref(), &d.from, &mut clean).await;
                     deliver_and_close(&app, &run_id, &d.from, &clean, Some(meeting_round + 1)).await;
                     // The question as asked is answered either way; a still-blocked asker raises a NEW discussion.
                     match parse_ask(&output) {
@@ -4223,13 +4381,13 @@ A teammate raised a blocking question that needs your expertise. Answer directly
         // first dev role owns both PR and deploy — one branch, one working tree
         let dev_role = roles.iter().find(|(r, _, _)| r.starts_with("dev")).map(|(r, _, _)| r.clone()).unwrap();
         append_tail_steps(&app, &run_id, &dev_role, "po").await;
-        let dev_persona = persona_of(&dev_role);
+        let dev_persona = persona_of(&app, &dev_role);
         let pr = run_pr_stage(&app, &run_id, &dev_role, &repo_url, &task, &project_name, &dev_persona).await;
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
         let deploy = run_deploy_stage(&app, &run_id, &dev_role, &repo_url, &pr.branch).await;
         if stop_requested(&app, &run_id) { finish_run(&app, &run_id, "stopped"); return; }
-        let qa_persona = persona_of("qa");
-        let po_persona = persona_of("po");
+        let qa_persona = persona_of(&app, "qa");
+        let po_persona = persona_of(&app, "po");
         let acceptance = run_demo_session(&app, &run_id, &task, &project_name, &dev_role,
             &qa_persona, &dev_persona, &po_persona, &pr, &deploy).await;
         tail = Some((pr, deploy, acceptance));
@@ -4237,7 +4395,7 @@ A teammate raised a blocking question that needs your expertise. Answer directly
 
     // ---- PO closes the mission with one summary ----
     if roles.iter().any(|(r, _, _)| r == "po") {
-        let (pname, ptitle, prules, pmodel) = persona_of("po");
+        let (pname, ptitle, prules, pmodel) = persona_of(&app, "po");
         let (deliverables, meetings) = {
             let store = app.store.lock().unwrap();
             let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
@@ -4301,7 +4459,7 @@ Write ONE tight summary (≤200 words) of what the team produced and what the me
         store.runs.iter().find(|r| r.id == run_id).map(|r| (r.loop_mode, r.iteration)).unwrap_or((false, 1))
     };
     if loop_mode && !all_error && !stop_requested(&app, &run_id) && iteration < MAX_LOOP_ITERATIONS {
-        let (pname, _ptitle, prules, pmodel) = persona_of("po");
+        let (pname, _ptitle, prules, pmodel) = persona_of(&app, "po");
         if let Some(model) = pmodel {
             let (chain, acc_text) = {
                 let store = app.store.lock().unwrap();
@@ -4337,6 +4495,164 @@ Reply with EITHER the concrete task for the next iteration (one sentence, same l
             }
         }
     }
+}
+
+/// Re-run ONE step of a closed run in place — the per-item retry path
+/// (POST /runs/{id}/steps/{role}/{kind}/retry). Everything else the mission
+/// produced stays exactly as it is: teammates' done deliverables, meetings,
+/// tail outcomes. Only the failed step's own work is redone, against the
+/// CURRENT state (persona/model config, containers, repo).
+async fn retry_step_engine(app: App, run_id: String, role: String, kind: String) {
+    let (project_name, project_id, task) = {
+        let store = app.store.lock().unwrap();
+        match store.runs.iter().find(|r| r.id == run_id) {
+            Some(r) => (r.project_name.clone(), r.project_id.clone(), r.task.clone()),
+            None => return,
+        }
+    };
+    let repo_url = {
+        let store = app.store.lock().unwrap();
+        store.projects.iter().find(|p| p.id == project_id)
+            .or_else(|| store.projects.iter().find(|p| p.name == project_name))
+            .map(|p| p.repo_url.clone())
+            .unwrap_or_default()
+    };
+    let team: Vec<String> = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .map(|r| r.steps.iter().filter(|s| s.kind == "work").map(|s| s.role.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    // Same shared-workspace rule as the relay: the repo rides the first running
+    // agent container; without one the step stays text-only.
+    let repo_path: Option<String> = if repo_url.is_empty() { None } else {
+        match ensure_team_repo(&app, &team, &repo_url).await {
+            Some(Ok(p)) => Some(p),
+            _ => None,
+        }
+    };
+    let repo_line = team_repo_line(&repo_path);
+
+    match kind.as_str() {
+        // One teammate's relay deliverable, rebuilt with the same handoff the
+        // original relay pass gave them (done outputs of the steps before them).
+        "work" => {
+            let (pname, title, rules, model) = persona_of(&app, &role);
+            let mut handoff = String::new();
+            {
+                let store = app.store.lock().unwrap();
+                if let Some(run) = store.runs.iter().find(|r| r.id == run_id) {
+                    for s in run.steps.iter().take_while(|s| !(s.role == role && s.kind == "work")) {
+                        if s.status == "done" && !s.output.is_empty() {
+                            let brief: String = strip_files(&s.output).chars().take(1400).collect();
+                            handoff.push_str(&format!("\n### {} — {} (done)\n{}\n", s.name, s.title, brief));
+                        }
+                    }
+                }
+            }
+            {
+                // record the model this retry runs with (as the relay does)
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
+                    step.model = model.clone();
+                }
+                save_runs(&store);
+            }
+            let ships_files = repo_path.is_some() && (role.starts_with("dev") || role.starts_with("ux"));
+            let system = work_system(&rules, &pname, &title, ships_files, &project_name, &repo_line, &run_id);
+            let user = if handoff.is_empty() {
+                format!("## Task from the user\n{task}\n\nYou are the first teammate to answer. Deliver your part.")
+            } else {
+                format!("## Task from the user\n{task}\n\n## What teammates before you already produced\n{handoff}\n\nNow deliver YOUR part ({title}).")
+            };
+            let cap = if ships_files { 6000 } else { 1400 };
+            let result = match model.as_deref() {
+                Some(m) => llm_retry(&app, m, &system, &user, cap).await,
+                None => Err(err(StatusCode::BAD_REQUEST, "No model configured for this agent — set one in AI Team")),
+            };
+            // No ASK raising on retry: no meeting engine is attached to a
+            // reopened run, so a fresh question could never be answered — the
+            // block is stripped, the deliverable itself is kept.
+            let error_outcome = |msg: String| {
+                let mut store = app.store.lock().unwrap();
+                if let Some(step) = store.runs.iter_mut().find(|r| r.id == run_id).and_then(|r| r.steps.iter_mut().find(|s| s.role == role && s.kind == "work")) {
+                    step.status = "error".into();
+                    step.output = msg;
+                    step.finished_at = now_secs();
+                }
+                save_runs(&store);
+            };
+            match result {
+                Ok(output) if !output.is_empty() => {
+                    let mut clean = strip_ask(&output);
+                    apply_files_note(&app, repo_path.as_deref(), &role, &mut clean).await;
+                    deliver_and_close(&app, &run_id, &role, &clean, None).await;
+                }
+                Ok(_) => error_outcome("Model returned an empty answer".into()),
+                Err(e) => error_outcome(e.1),
+            }
+        }
+        // The three tail stages are self-contained: re-running one redoes the
+        // real git/docker/LLM work against the current workspace state.
+        "pr" => {
+            let dev = persona_of(&app, &role);
+            let _ = run_pr_stage(&app, &run_id, &role, &repo_url, &task, &project_name, &dev).await;
+        }
+        "deploy" => {
+            // the mission branch IS the run id (see run_pr_stage)
+            let _ = run_deploy_stage(&app, &run_id, &role, &repo_url, &run_id).await;
+        }
+        "demo" => {
+            // Rebuild the PR/deploy facts of record from the stored steps,
+            // then rerun the scripted demo session against them.
+            let (pr, deploy, dev_role) = {
+                let store = app.store.lock().unwrap();
+                let run = match store.runs.iter().find(|r| r.id == run_id) { Some(r) => r, None => return };
+                let dev_role = run.steps.iter().find(|s| s.kind == "pr" || (s.kind == "work" && s.role.starts_with("dev")))
+                    .map(|s| s.role.clone()).unwrap_or_default();
+                let pr_step = run.steps.iter().find(|s| s.kind == "pr");
+                let deploy_step = run.steps.iter().find(|s| s.kind == "deploy");
+                let pr = PrOutcome {
+                    status: pr_step.map(|s| if s.status == "done" { "done".to_string() } else { s.status.clone() })
+                        .unwrap_or_else(|| "skipped".into()),
+                    url: pr_step.and_then(|s| extract_pr_url(&s.output)).unwrap_or_default(),
+                    branch: run_id.clone(),
+                    note: pr_step.filter(|s| s.status != "done").map(|s| one_line(&s.output, 160)).unwrap_or_default(),
+                };
+                let deploy = DeployOutcome {
+                    status: deploy_step.map(|s| if s.status == "done" { "done".to_string() } else { s.status.clone() })
+                        .unwrap_or_else(|| "skipped".into()),
+                    url: if deploy_step.map(|s| s.status == "done").unwrap_or(false) {
+                        format!("http://localhost:{STAGING_WEB_PORT}")
+                    } else { String::new() },
+                    note: deploy_step.filter(|s| s.status != "done").map(|s| one_line(&s.output, 160)).unwrap_or_default(),
+                };
+                (pr, deploy, dev_role)
+            };
+            if dev_role.is_empty() {
+                step_transition(&app, &run_id, "po", "demo", "error", "no dev role found in this run — cannot rerun the acceptance demo").await;
+            } else {
+                let qa = persona_of(&app, "qa");
+                let dev = persona_of(&app, &dev_role);
+                let po = persona_of(&app, "po");
+                let _ = run_demo_session(&app, &run_id, &task, &project_name, &dev_role, &qa, &dev, &po, &pr, &deploy).await;
+            }
+        }
+        _ => {}
+    }
+
+    // Close the run again — same rule as the relay engine (all-error ⇒ error),
+    // and a Stop pressed while the retry was in flight wins.
+    let stopped = stop_requested(&app, &run_id);
+    let all_error = {
+        let store = app.store.lock().unwrap();
+        store.runs.iter().find(|r| r.id == run_id)
+            .map(|r| r.steps.iter().all(|s| s.status == "error"))
+            .unwrap_or(false)
+    };
+    let final_status = if stopped { "stopped" } else if all_error { "error" } else { "done" };
+    finish_run(&app, &run_id, final_status);
 }
 
 /// Create a run for the project's current team, store it and start
@@ -4405,13 +4721,15 @@ async fn run_project(State(app): State<App>, headers: axum::http::HeaderMap, Pat
     Ok(json_ok(serde_json::to_value(run).unwrap()))
 }
 
-async fn list_runs(State(app): State<App>) -> Json<Vec<Run>> {
+async fn list_runs(State(app): State<App>, headers: axum::http::HeaderMap) -> Result<Json<Vec<Run>>, ApiError> {
+    app.require_auth(&headers)?;
     let mut runs = app.store.lock().unwrap().runs.clone();
     runs.reverse();
-    Json(runs)
+    Ok(Json(runs))
 }
 
-async fn get_run(State(app): State<App>, Path(run_id): Path<String>) -> ApiResult {
+async fn get_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(run_id): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let run = app.store.lock().unwrap().runs.iter().find(|r| r.id == run_id).cloned();
     match run {
         Some(r) => Ok(json_ok(serde_json::to_value(r).unwrap())),
@@ -4476,10 +4794,49 @@ async fn stop_run(State(app): State<App>, headers: axum::http::HeaderMap, Path(r
     Ok(json_ok(json!({ "ok": true, "status": status })))
 }
 
+/// Per-item retry: re-run ONE failed/skipped/stopped step of a CLOSED run in place.
+/// Failures are per-step, so recovery is per-step too — the rest of the mission
+/// (every other step's output, the meetings, the tail outcomes) is kept as-is
+/// and no new run is created. The step flips to working, the run reopens as
+/// running, and `retry_step_engine` closes it again when the step lands.
+async fn retry_step(
+    State(app): State<App>,
+    headers: axum::http::HeaderMap,
+    Path((run_id, role, kind)): Path<(String, String, String)>,
+) -> ApiResult {
+    app.require_auth(&headers)?;
+    let mut store = app.store.lock().unwrap();
+    let run = store.runs.iter_mut().find(|r| r.id == run_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Run '{run_id}' not found")))?;
+    if run.status == "running" || run.status == "waiting_human" {
+        return Err(err(StatusCode::BAD_REQUEST, format!("Run is still {} — wait for it to finish first", run.status)));
+    }
+    let step = run.steps.iter_mut().find(|s| s.role == role && s.kind == kind)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("Step '{role}/{kind}' not found in run '{run_id}'")))?;
+    if step.status != "error" && step.status != "skipped" && step.status != "stopped" {
+        return Err(err(StatusCode::BAD_REQUEST, format!("Step '{role}/{kind}' is '{}' — only failed, skipped or stopped steps can be retried", step.status)));
+    }
+    step.status = "working".into();
+    step.output = String::new();
+    step.started_at = now_secs();
+    step.finished_at = 0;
+    run.status = "running".into();
+    run.phase = "working".into();
+    // an old Stop flag must not kill the retry the moment it starts
+    run.stop_requested = false;
+    let out = run.clone();
+    save_runs(&store);
+    drop(store);
+    let bg = app.clone();
+    tokio::spawn(async move { retry_step_engine(bg, run_id, role, kind).await });
+    Ok(json_ok(serde_json::to_value(out).unwrap()))
+}
+
 /// What one agent is doing right now + everything it has done, across all runs —
 /// powers the agent detail dialog on the flow chart. History survives restarts
 /// because runs are persisted to /data/runs.json.
-async fn agent_activity(State(app): State<App>, Path(role): Path<String>) -> ApiResult {
+async fn agent_activity(State(app): State<App>, headers: axum::http::HeaderMap, Path(role): Path<String>) -> ApiResult {
+    app.require_auth(&headers)?;
     let runs = app.store.lock().unwrap().runs.clone();
 
     // Live state: the newest run that is still in flight (running or paused on a human).
@@ -4789,6 +5146,7 @@ async fn main() {
         .route("/runs", get(list_runs))
         .route("/runs/{run_id}", get(get_run))
         .route("/runs/{run_id}/stop", post(stop_run))
+        .route("/runs/{run_id}/steps/{role}/{kind}/retry", post(retry_step))
         .route("/runs/{run_id}/discussions/{disc_id}/reply", post(reply_discussion))
         .route("/config", get(get_config).put(update_config))
         .route("/skills", get(list_skills).post(create_skill))

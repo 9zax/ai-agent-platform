@@ -24,11 +24,16 @@ test.describe('AI Agent (ZAI GLM)', () => {
     await expect(log).toContainText('exit code 0', { timeout: 10_000 })
     await expect(log).toContainText('hello-from-glm', { timeout: 10_000 })
 
-    // Verify the file really exists via shell mode
+    // Verify the file really exists via the interactive shell (xterm ⇄ WebSocket ⇄ PTY).
+    // The repo-aware agent cd's into the detected repo before executing, so the
+    // file lands somewhere under /workspace — locate it instead of guessing cwd.
     await page.getByRole('button', { name: 'Shell', exact: true }).click()
-    await page.getByPlaceholder(/shell command/).fill('cat demo.txt')
-    await page.getByRole('button', { name: /Send Command/ }).click()
-    await expect(page.locator('pre').filter({ hasText: 'hello-from-glm' })).toBeVisible({ timeout: 20000 })
+    const term = page.getByTestId('terminal')
+    await expect(page.getByTestId('terminal-panel')).toBeVisible()
+    await expect(page.locator('[data-testid="terminal-panel"] >> text=bash — interactive session')).toBeVisible({ timeout: 20000 })
+    await term.click()
+    await page.keyboard.type('find /workspace -maxdepth 2 -name demo.txt | head -1 | xargs cat\r')
+    await expect(term).toContainText('hello-from-glm', { timeout: 20000 })
 
     // Cleanup
     await page.getByRole('button', { name: /Delete/ }).click()

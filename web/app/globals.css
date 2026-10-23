@@ -33,6 +33,21 @@
   body {
     @apply bg-background text-foreground font-sans antialiased;
   }
+
+  /* Slim dark scrollbar for the sidebar's scrollable nav region */
+  aside ::-webkit-scrollbar,
+  aside::-webkit-scrollbar {
+    width: 4px;
+  }
+  aside ::-webkit-scrollbar-thumb,
+  aside::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: hsl(var(--muted));
+  }
+  aside ::-webkit-scrollbar-track,
+  aside::-webkit-scrollbar-track {
+    background: transparent;
+  }
 }
 
 /* A step bounced back from a meeting — soft rose pulse while the deliverable

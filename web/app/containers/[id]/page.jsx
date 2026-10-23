@@ -5,18 +5,15 @@ import { useParams, useRouter } from 'next/navigation'
 import dynamic from 'next/dynamic'
 import { useEffect, useRef, useState } from 'react'
 import {
-  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, ExternalLink, Monitor, Loader2, Figma, KeyRound, PauseCircle, PlayCircle,
+  Bot, Play, Square, RotateCw, Terminal, Trash2, Send, Globe, Code, BarChart3, FileText, Plug, Image as ImageIcon, MonitorUp, Lock, Lightbulb, TriangleAlert, Github, Copy, Figma, PauseCircle, PlayCircle,
 } from 'lucide-react'
+import { ConnectorDialogs, connectorDisconnect } from '@/components/connector-flows'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { Progress } from '@/components/ui/progress'
-import { Input } from '@/components/ui/input'
-import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
-} from '@/components/ui/dialog'
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 const VNC_URL = process.env.NEXT_PUBLIC_VNC_URL || 'http://localhost:6080'
@@ -46,8 +43,9 @@ function fmtBytes(bytes) {
 }
 
 // One connector tile — state/badge/buttons are identical for every connector;
-// only the copy (name, hint, status text) and the connect flow differ
-function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, busyKey, connectLabel, connectDisabled, connectTitle, onConnect, onDisconnect }) {
+// only the copy (name, hint, status text) and the connect flow differ. Connect
+// opens the shared dialog (it owns the spinner); disconnect runs inline.
+function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, connectLabel, connectDisabled, connectTitle, onConnect, onDisconnect }) {
   const state = conn?.state
   return (
     <div className="rounded-[10px] border bg-[#0d1420] p-3.5" data-testid={`connector-card-${ctype}`}>
@@ -78,7 +76,7 @@ function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, 
             onClick={onDisconnect}
             data-testid={`connector-disconnect-${ctype}`}
           >
-            {busy === `${ctype}-disconnect` || busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}
+            {busy === `${ctype}-disconnect` ? 'Disconnecting…' : 'Disconnect'}
           </Button>
         ) : (
           <Button
@@ -88,8 +86,8 @@ function ConnectorTile({ ctype, name, hint, icon: Icon, conn, statusText, busy, 
             onClick={onConnect}
             data-testid={`connector-connect-${ctype}`}
           >
-            {busy === busyKey ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Icon className="h-3.5 w-3.5" />}
-            {busy === busyKey ? 'Connecting…' : connectLabel}
+            <Icon className="h-3.5 w-3.5" />
+            {connectLabel}
           </Button>
         )}
       </div>
@@ -117,13 +115,9 @@ export default function ContainerDetail() {
   const [agentModel, setAgentModel] = useState('')
   const [authRequired, setAuthRequired] = useState(false) // true = must be logged in to touch containers
   const [connectors, setConnectors] = useState(null) // [{ type, state, login?, reason?, user_code? }] — null = loading
-  const [flowDialog, setFlowDialog] = useState(false) // GitHub connect dialog (device flow | token)
-  const [flowTab, setFlowTab] = useState('device') // 'device' = browser flow, 'token' = paste a PAT
-  const [ghToken, setGhToken] = useState('')
-  const [figmaDialog, setFigmaDialog] = useState(false) // Figma connect dialog (token only)
-  const [figmaToken, setFigmaToken] = useState('')
-  const [flowError, setFlowError] = useState('') // error shown inside the connect dialogs
-  const [flowBusy, setFlowBusy] = useState('')
+  const [flowCtype, setFlowCtype] = useState(null) // 'github' | 'figma' — opens the shared connect dialog
+  const [connBusy, setConnBusy] = useState('') // `${ctype}-disconnect` while a tile disconnect runs
+  const [connRefresh, setConnRefresh] = useState(0) // bumped when the dialog reports a change → repoll now
   const cmdBoxRef = useRef(null)
 
   // GitHub connector state — polled every 3s (the orchestrator caches its probe
@@ -141,118 +135,30 @@ export default function ContainerDetail() {
     load()
     const t = setInterval(load, 3000)
     return () => { alive = false; clearInterval(t) }
-  }, [id])
+  }, [id, connRefresh])
 
   const github = connectors?.find(c => c.type === 'github') || null
   const figma = connectors?.find(c => c.type === 'figma') || null
 
-  // GitHub auth method #1 — browser device flow
-  async function connectGithub() {
+  // The connect flows (GitHub device/token, Figma token) live in the shared
+  // ConnectorDialogs — the same one the connectors overview and AI Team cards
+  // open. Tiles here only open it and handle their own disconnect.
+  function openFlow(ctype) {
     if (authRequired && !getToken()) return router.push('/login')
-    setFlowBusy('connect')
-    setError('')
-    setFlowError('')
-    try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/connect`, { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setFlowTab('device')
-      setFlowDialog(true)
-      setConnectors(list => (list || []).some(c => c.type === 'github')
-        ? list.map(c => (c.type === 'github' ? { ...c, state: 'pending', user_code: data.user_code, verification_url: data.verification_url } : c))
-        : [...(list || []), { type: 'github', state: 'pending', user_code: data.user_code, verification_url: data.verification_url }])
-    } catch (err) {
-      setError(err.message)
-      setFlowError(err.message)
-    }
-    setFlowBusy('')
+    setFlowCtype(ctype)
   }
 
-  // GitHub auth method #2 — paste a personal access token (classic or
-  // fine-grained; repo scope is what git push needs)
-  async function connectGithubToken() {
-    if (!ghToken.trim()) return
-    setFlowBusy('gh-token')
-    setFlowError('')
-    try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/connect-token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: ghToken.trim() }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setGhToken('')
-      setFlowDialog(false)
-      setConnectors(list => (list || []).map(c => (c.type === 'github' ? { ...c, state: 'connected', login: data.login, user_code: undefined } : c)))
-    } catch (err) {
-      setFlowError(err.message)
-    }
-    setFlowBusy('')
-  }
-
-  async function disconnectGithub() {
+  async function disconnectConnector(ctype) {
     if (authRequired && !getToken()) return router.push('/login')
-    setFlowBusy('disconnect')
+    setConnBusy(`${ctype}-disconnect`)
     setError('')
     try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/disconnect`, { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setConnectors(list => (list || []).map(c => (c.type === 'github' ? { ...c, state: 'disconnected', login: null } : c)))
+      await connectorDisconnect(id, ctype)
+      setConnectors(list => (list || []).map(c => (c.type === ctype ? { ...c, state: 'disconnected', login: null } : c)))
     } catch (err) {
       setError(err.message)
     }
-    setFlowBusy('')
-  }
-
-  // Figma — token-only connector (Figma has no device flow)
-  async function connectFigma() {
-    if (!figmaToken.trim()) return
-    setFlowBusy('figma-token')
-    setFlowError('')
-    try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/figma/connect-token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: figmaToken.trim() }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setFigmaToken('')
-      setFigmaDialog(false)
-      setConnectors(list => {
-        const item = { type: 'figma', state: 'connected', login: data.login }
-        return (list || []).some(c => c.type === 'figma')
-          ? (list || []).map(c => (c.type === 'figma' ? item : c))
-          : [...(list || []), item]
-      })
-    } catch (err) {
-      setFlowError(err.message)
-    }
-    setFlowBusy('')
-  }
-
-  async function disconnectFigma() {
-    if (authRequired && !getToken()) return router.push('/login')
-    setFlowBusy('figma-disconnect')
-    setError('')
-    try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/figma/disconnect`, { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-      setConnectors(list => (list || []).map(c => (c.type === 'figma' ? { ...c, state: 'disconnected', login: null } : c)))
-    } catch (err) {
-      setError(err.message)
-    }
-    setFlowBusy('')
-  }
-
-  async function openBrowserInContainer() {
-    try {
-      const res = await authFetch(`${API}/containers/${encodeURIComponent(id)}/connectors/github/open-browser`, { method: 'POST' })
-      if (!res.ok) throw new Error()
-    } catch { /* desktop browser optional — the URL works on any browser */ }
+    setConnBusy('')
   }
 
   useEffect(() => {
@@ -726,13 +632,12 @@ export default function ContainerDetail() {
                   hint="gh + git push/pull ในเครื่องนี้"
                   icon={Github}
                   conn={github}
-                  busy={flowBusy}
-                  busyKey="connect"
+                  busy={connBusy}
                   connectLabel="Connect GitHub"
                   connectDisabled={github?.state === 'unavailable'}
                   connectTitle={github?.state === 'unavailable' ? github?.reason : undefined}
-                  onConnect={connectGithub}
-                  onDisconnect={disconnectGithub}
+                  onConnect={() => openFlow('github')}
+                  onDisconnect={() => disconnectConnector('github')}
                   statusText={
                     <>
                       {github?.state === 'connected' && github?.login && <span className="font-semibold text-emerald-400">@{github.login}</span>}
@@ -749,13 +654,12 @@ export default function ContainerDetail() {
                   hint="Figma REST API — อ่าน design file ในเครื่องนี้"
                   icon={Figma}
                   conn={figma}
-                  busy={flowBusy}
-                  busyKey="figma-token"
+                  busy={connBusy}
                   connectLabel="Connect Figma"
                   connectDisabled={figma?.state === 'unavailable'}
                   connectTitle={figma?.state === 'unavailable' ? figma?.reason : undefined}
-                  onConnect={() => { setFlowError(''); setFigmaDialog(true) }}
-                  onDisconnect={disconnectFigma}
+                  onConnect={() => openFlow('figma')}
+                  onDisconnect={() => disconnectConnector('figma')}
                   statusText={
                     <>
                       {figma?.state === 'connected' && figma?.login && <span className="font-semibold text-emerald-400">@{figma.login}</span>}
@@ -782,126 +686,15 @@ export default function ContainerDetail() {
         </div>
       </div>
 
-      {/* GitHub connect — two auth methods: the browser device flow (code
-          approved in ANY browser — the user's or the container's own desktop —
-          one machine at a time) or pasting a personal access token */}
-      <Dialog open={flowDialog} onOpenChange={open => { setFlowDialog(open); if (!open) setGhToken('') }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Github className="h-4 w-4" /> Connect GitHub</DialogTitle>
-            <DialogDescription>เลือกวิธี login ให้เครื่องนี้ — ผ่าน browser หรือวาง personal access token</DialogDescription>
-          </DialogHeader>
-          <Tabs value={flowTab} onValueChange={setFlowTab} className="pt-1">
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="device"><Globe className="mr-1.5 h-3.5 w-3.5" />Browser</TabsTrigger>
-              <TabsTrigger value="token"><KeyRound className="mr-1.5 h-3.5 w-3.5" />Token</TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="device" className="grid gap-4 pt-4">
-              {github?.state === 'pending' ? (
-                <>
-                  <div className="text-[12.5px] text-muted-foreground">เปิด GitHub ใน browser แล้วกรอกรหัสนี้เพื่อ login ให้เครื่องนี้ (github.com/login/device)</div>
-                  <button
-                    type="button"
-                    className="mx-auto rounded-xl border border-primary/40 bg-primary/10 px-8 py-4 font-mono text-[28px] font-bold tracking-[0.12em] text-primary transition-colors hover:bg-primary/20"
-                    data-testid="connector-user-code"
-                    title="คลิกเพื่อคัดลอกรหัส"
-                    onClick={e => {
-                      navigator.clipboard?.writeText(github?.user_code || '')
-                      e.currentTarget.textContent = 'Copied ✓'
-                      setTimeout(() => { e.currentTarget.textContent = github?.user_code || '' }, 1200)
-                    }}
-                  >
-                    {github?.user_code || '····-····'}
-                  </button>
-                  <div className="flex items-center justify-center gap-2 text-[12.5px]">
-                    <a href={github?.verification_url || 'https://github.com/login/device'} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-semibold text-primary hover:underline">
-                      {github?.verification_url || 'https://github.com/login/device'} <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
-                  </div>
-                  <div className="flex items-center justify-center gap-2 rounded-md bg-secondary px-3 py-2 text-[12.5px] text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                    Waiting for authorization… ระบบเชื่อมต่ออัตโนมัติเมื่ออนุมัติแล้ว
-                  </div>
-                  <DialogFooter className="items-center sm:justify-between">
-                    <Button type="button" variant="outline" onClick={openBrowserInContainer}>
-                      <Monitor className="h-3.5 w-3.5" /> เปิด browser ในเดสก์ท็อป container
-                    </Button>
-                    <Button type="button" variant="ghost" onClick={() => setFlowDialog(false)}>Close</Button>
-                  </DialogFooter>
-                </>
-              ) : (
-                <div className="grid gap-3 py-2">
-                  <div className="text-[12.5px] text-muted-foreground">ขั้นตอน browser ยังไม่เริ่ม หรือหมดอายุไปแล้ว</div>
-                  <Button type="button" onClick={connectGithub} disabled={flowBusy !== ''}>
-                    {flowBusy === 'connect' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Globe className="h-3.5 w-3.5" />}
-                    ขอรหัสใหม่
-                  </Button>
-                </div>
-              )}
-            </TabsContent>
-
-            <TabsContent value="token" className="grid gap-3 pt-4">
-              <div className="text-[12.5px] leading-relaxed text-muted-foreground">
-                วาง GitHub personal access token (classic หรือ fine-grained — scope <span className="font-mono">repo</span> เพื่อ push ได้)
-                สร้างได้ที่ Settings → Developer settings → Personal access tokens
-              </div>
-              <Input
-                type="password" autoComplete="off" placeholder="ghp_… หรือ github_pat_…"
-                value={ghToken} onChange={e => setGhToken(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') connectGithubToken() }}
-                data-testid="connector-token-input-github"
-              />
-              {flowError && (
-                <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-400" data-testid="connector-flow-error">
-                  {flowError}
-                </div>
-              )}
-              <DialogFooter>
-                <Button type="button" variant="ghost" onClick={() => setFlowDialog(false)}>Cancel</Button>
-                <Button type="button" onClick={connectGithubToken} disabled={flowBusy !== '' || !ghToken.trim()} data-testid="connector-token-submit-github">
-                  {flowBusy === 'gh-token' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
-                  Connect ด้วย token
-                </Button>
-              </DialogFooter>
-            </TabsContent>
-          </Tabs>
-        </DialogContent>
-      </Dialog>
-
-      {/* Figma connect — token-only (Figma has no device flow). The platform
-          validates the token once, then it lives only inside the container */}
-      <Dialog open={figmaDialog} onOpenChange={open => { setFigmaDialog(open); if (!open) setFigmaToken('') }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Figma className="h-4 w-4" /> Connect Figma</DialogTitle>
-            <DialogDescription>วาง Figma personal access token — สร้างได้ที่ Figma → Settings → Security → Personal access tokens</DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-3 pt-2">
-            <div className="text-[12.5px] leading-relaxed text-muted-foreground">
-              token จะถูกเก็บในเครื่องนี้ที่ <span className="font-mono">~/.config/figma/token</span> พร้อม export <span className="font-mono">FIGMA_TOKEN</span> ให้ shell เรียก Figma REST API ได้ทันที
-            </div>
-            <Input
-              type="password" autoComplete="off" placeholder="figd_…"
-              value={figmaToken} onChange={e => setFigmaToken(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') connectFigma() }}
-              data-testid="connector-token-input-figma"
-            />
-            {flowError && (
-              <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-400" data-testid="connector-flow-error">
-                {flowError}
-              </div>
-            )}
-            <DialogFooter>
-              <Button type="button" variant="ghost" onClick={() => setFigmaDialog(false)}>Cancel</Button>
-              <Button type="button" onClick={connectFigma} disabled={flowBusy !== '' || !figmaToken.trim()} data-testid="connector-token-submit-figma">
-                {flowBusy === 'figma-token' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}
-                Connect ด้วย token
-              </Button>
-            </DialogFooter>
-          </div>
-        </DialogContent>
-      </Dialog>
+      {/* Shared connect dialogs — GitHub (browser device flow | token) and
+          Figma (token), the same component the connectors overview and the AI
+          Team cards open */}
+      <ConnectorDialogs
+        containerId={id}
+        ctype={flowCtype}
+        onClose={() => setFlowCtype(null)}
+        onChanged={() => setConnRefresh(t => t + 1)}
+      />
     </>
   )
 }

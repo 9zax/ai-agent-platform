@@ -172,7 +172,7 @@ export default function SettingsPage() {
             <GitBranch className="h-4 w-4 text-primary" /> Git Access
           </div>
           <div className="mb-3 text-[12.5px] leading-relaxed text-muted-foreground/80">
-            GitHub token สำหรับให้ agent <b>clone private repo</b> ลง container ได้ (แบบเดียวกับ bot ที่มี credential บนเครื่อง Linux ของตัวเอง) — clone ใช้สิทธิ์อ่าน (Contents: Read-only) ก็พอ แต่ถ้าต้องการให้ Dev <b>push branch และเปิด Pull Request จริง</b> ตอนจบ mission ต้องใช้ PAT สิทธิ์ <b>Contents: Read and write</b> (Fine-grained เฉพาะ repo นั้นก็ได้) — token นี้ถูกลงทะเบียนกับ <code>gh</code> ใน container อัตโนมัติ
+            GitHub token สำหรับให้ platform <b>clone private repo</b> ลง container ได้ — ใช้เฉพาะตอน clone <b>สิทธิ์อ่าน (Contents: Read-only)</b> เท่านั้น และ <b>ไม่ถูกลงทะเบียนกับ <code>gh</code></b> ใน container ของ agent ใดๆ ทั้งสิ้น (clone เสร็จ origin URL จะถูกล้างกลับเป็น URL ปกติด้วย) — การ <b>push branch / เปิด Pull Request</b> เป็นสิทธิ์ระดับเครื่อง: ต้อง login GitHub ให้ container นั้นๆ ทีละเครื่องผ่าน connector (หน้า Containers หรือ AI Team → GitHub → login ผ่าน browser เป็นหลัก หรือวาง token เป็นทางสำรอง)
           </div>
           <div className="mb-3">
             <Badge variant={config?.git_token_set ? 'green' : 'gray'} data-testid="git-token-status">
